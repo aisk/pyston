@@ -380,44 +380,87 @@ extern "C" Box* ord(Box* arg) {
 
 Box* range(Box* start, Box* stop, Box* step) {
     i64 istart, istop, istep;
+    mpz_t lstart, lstop, lstep;
     if (stop == NULL) {
-        RELEASE_ASSERT(isSubclass(start->cls, int_cls), "%s", getTypeName(start)->c_str());
+        RELEASE_ASSERT(isSubclass(start->cls, int_cls) || isSubclass(start->cls, long_cls), "%s", getTypeName(start)->c_str());
 
-        istart = 0;
-        istop = static_cast<BoxedInt*>(start)->n;
-        istep = 1;
+        if (isSubclass(start->cls, int_cls)) {
+            istart = 0;
+            istop = static_cast<BoxedInt*>(start)->n;
+            istep = 1;
+
+            BoxedList* rtn = new BoxedList();
+            rtn->ensure(std::max(0l, 1 + (istop - istart) / istep));
+            if (istep > 0) {
+                for (i64 i = istart; i < istop; i += istep) {
+                    Box* bi = boxInt(i);
+                    listAppendInternal(rtn, bi);
+                }
+            } else {
+                for (i64 i = istart; i > istop; i += istep) {
+                    Box* bi = boxInt(i);
+                    listAppendInternal(rtn, bi);
+                }
+            }
+            return rtn;
+        } else {
+            return NULL;
+        }
     } else if (step == NULL) {
-        RELEASE_ASSERT(isSubclass(start->cls, int_cls), "%s", getTypeName(start)->c_str());
-        RELEASE_ASSERT(isSubclass(stop->cls, int_cls), "%s", getTypeName(stop)->c_str());
+        RELEASE_ASSERT(isSubclass(start->cls, int_cls) || isSubclass(start->cls, long_cls), "%s", getTypeName(start)->c_str());
+        RELEASE_ASSERT(isSubclass(stop->cls, int_cls) || isSubclass(stop->cls, long_cls), "%s", getTypeName(stop)->c_str());
 
-        istart = static_cast<BoxedInt*>(start)->n;
-        istop = static_cast<BoxedInt*>(stop)->n;
-        istep = 1;
-    } else {
-        RELEASE_ASSERT(isSubclass(start->cls, int_cls), "%s", getTypeName(start)->c_str());
-        RELEASE_ASSERT(isSubclass(stop->cls, int_cls), "%s", getTypeName(stop)->c_str());
-        RELEASE_ASSERT(isSubclass(step->cls, int_cls), "%s", getTypeName(step)->c_str());
+        if (isSubclass(start->cls, int_cls)) {
+            istart = static_cast<BoxedInt*>(start)->n;
+            istop = static_cast<BoxedInt*>(stop)->n;
+            istep = 1;
 
-        istart = static_cast<BoxedInt*>(start)->n;
-        istop = static_cast<BoxedInt*>(stop)->n;
-        istep = static_cast<BoxedInt*>(step)->n;
-        RELEASE_ASSERT(istep != 0, "step can't be 0");
-    }
-
-    BoxedList* rtn = new BoxedList();
-    rtn->ensure(std::max(0l, 1 + (istop - istart) / istep));
-    if (istep > 0) {
-        for (i64 i = istart; i < istop; i += istep) {
-            Box* bi = boxInt(i);
-            listAppendInternal(rtn, bi);
+            BoxedList* rtn = new BoxedList();
+            rtn->ensure(std::max(0l, 1 + (istop - istart) / istep));
+            if (istep > 0) {
+                for (i64 i = istart; i < istop; i += istep) {
+                    Box* bi = boxInt(i);
+                    listAppendInternal(rtn, bi);
+                }
+            } else {
+                for (i64 i = istart; i > istop; i += istep) {
+                    Box* bi = boxInt(i);
+                    listAppendInternal(rtn, bi);
+                }
+            }
+            return rtn;
+        } else {
+            return NULL;
         }
     } else {
-        for (i64 i = istart; i > istop; i += istep) {
-            Box* bi = boxInt(i);
-            listAppendInternal(rtn, bi);
+        RELEASE_ASSERT(isSubclass(start->cls, int_cls) || isSubclass(start->cls, long_cls), "%s", getTypeName(start)->c_str());
+        RELEASE_ASSERT(isSubclass(stop->cls, int_cls) || isSubclass(stop->cls, long_cls), "%s", getTypeName(stop)->c_str());
+        RELEASE_ASSERT(isSubclass(step->cls, int_cls) || isSubclass(step->cls, long_cls), "%s", getTypeName(step)->c_str());
+
+        if (isSubclass(start->cls, int_cls)) {
+            istart = static_cast<BoxedInt*>(start)->n;
+            istop = static_cast<BoxedInt*>(stop)->n;
+            istep = static_cast<BoxedInt*>(step)->n;
+            RELEASE_ASSERT(istep != 0, "step can't be 0");
+
+            BoxedList* rtn = new BoxedList();
+            rtn->ensure(std::max(0l, 1 + (istop - istart) / istep));
+            if (istep > 0) {
+                for (i64 i = istart; i < istop; i += istep) {
+                    Box* bi = boxInt(i);
+                    listAppendInternal(rtn, bi);
+                }
+            } else {
+                for (i64 i = istart; i > istop; i += istep) {
+                    Box* bi = boxInt(i);
+                    listAppendInternal(rtn, bi);
+                }
+            }
+            return rtn;
+        } else {
+            return NULL;
         }
     }
-    return rtn;
 }
 
 Box* notimplementedRepr(Box* self) {
