@@ -8,24 +8,12 @@ We use a Makefile as a sort of "lite development environment"; it helps manage m
 
 ### Prerequisites
 
-**Ubuntu 12.04**
-```
-sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test
-sudo add-apt-repository --yes ppa:kubuntu-ppa/backports
-sudo apt-get -qq update
+The build is tested on Debian testing with clang 21, GCC 16, CMake 4 and OpenSSL 3.  Any recent clang should work.
 
-sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev libmpfr-dev autoconf libtool python-dev clang-3.4 libstdc++-4.8-dev libssl-dev libsqlite3-dev pkg-config libbz2-dev
+**Debian/Ubuntu**
 ```
-
-
-**Ubuntu 14.04/14.10/15.04**
-```
-sudo apt-get install -yq automake git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev libmpfr-dev autoconf libtool python-dev clang libssl-dev libsqlite3-dev pkg-config libbz2-dev
-```
-
-**Fedora 21**
-```
-sudo yum install git make cmake clang gcc gcc-c++ ccache ninja-build xz-devel automake libtool gmp-devel mpfr-devel readline-devel openssl-devel sqlite-devel python-devel zlib-devel bzip2-devel ncurses-devel libffi-devel
+sudo apt-get install -yq git cmake ninja-build ccache clang autoconf automake libtool pkg-config curl \
+    libncurses-dev liblzma-dev libreadline-dev libgmp-dev libmpfr-dev libssl-dev libsqlite3-dev libbz2-dev libffi-dev zlib1g-dev
 ```
 
 ### Additional prerequisites for running the integration tests
@@ -35,23 +23,26 @@ sudo apt-get install libgeoip-dev
 ```
 
 ### Building and testing
+
+Pyston is pinned to an old LLVM revision (see `llvm_revision.txt`) that is built together with Pyston.  `tools/setup_deps.sh` downloads it, applies our patches, and prepares the other things the build and the tests need in `~/pyston_deps`:
+
+- the LLVM and clang sources, patched (`llvm_patches/`, `clang_patches/`)
+- libstdc++ headers from GCC 5, used by the bundled clang to compile the runtime bitcode, since it can't parse a modern libstdc++
+- CPython 2.7.8, which the tests compare Pyston's output against (`reference_python_patches/`)
+
 ```
 git clone https://github.com/dropbox/pyston.git ~/pyston
-
-git clone https://github.com/llvm-mirror/llvm.git ~/pyston_deps/llvm-trunk
-git clone https://github.com/llvm-mirror/clang.git ~/pyston_deps/llvm-trunk/tools/clang
-
-git config --global user.email "you@example.com"
-git config --global user.name "Your Name"
-
 cd ~/pyston
-git submodule update --init --recursive build_deps
-make llvm_up
-make
-make check
+git submodule update --init build_deps
+tools/setup_deps.sh
+
+mkdir -p build/Release && cd build/Release
+CC=clang CXX=clang++ cmake ~/pyston -GNinja -DCMAKE_BUILD_TYPE=Release
+ninja check-deps
+ctest --output-on-failure
 ```
 
-If the final `make check` doesn't pass, please let us know!
+If your clang is installed with a version suffix (e.g. `clang-21`), use that for `CC` and `CXX`.  The `Makefile` wraps these steps for development, but expects `clang` and `clang++` on the `PATH`.
 
 See the main README for more information about available make targets and options.
 
@@ -61,6 +52,7 @@ See the main README for more information about available make targets and option
 - `-DCMAKE_BUILD_TYPE=Debug` (defaults to Release)
 - `-DENABLE_LLVM_DEBUG=1` for full LLVM debug
 - `-DENABLE_CCACHE=0` to disable ccache
+- `-DREFERENCE_PYTHON=/path/to/python2.7` to use a different CPython 2.7 for the tests
 
 # Optional dependencies
 
