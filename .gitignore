@@ -48,7 +48,6 @@ perf.data.old
 perf_map
 gmon.out
 
-find_problem.status
 *.expected_cache
 
 plugins/clang_capi

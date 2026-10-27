@@ -8,13 +8,15 @@ We use a Makefile as a sort of "lite development environment"; it helps manage m
 
 ### Prerequisites
 
-The build is tested on Debian testing with clang 21, GCC 16, CMake 4 and OpenSSL 3.  Any recent clang should work.
+The build is tested on Debian testing with clang 21, LLVM 21, GCC 16, CMake 4 and OpenSSL 3.  Pyston links against the system LLVM, which has to be version 21, and uses the matching clang to compile the runtime bitcode.
 
 **Debian/Ubuntu**
 ```
-sudo apt-get install -yq git cmake ninja-build ccache clang autoconf automake libtool pkg-config curl \
+sudo apt-get install -yq git cmake ninja-build ccache clang-21 llvm-21-dev clang-format-21 autoconf automake libtool pkg-config curl \
     libncurses-dev liblzma-dev libreadline-dev libgmp-dev libmpfr-dev libssl-dev libsqlite3-dev libbz2-dev libffi-dev zlib1g-dev
 ```
+
+`libgtest-dev` is needed for the unit tests and is optional.
 
 ### Additional prerequisites for running the integration tests
 **Ubuntu**
@@ -24,11 +26,7 @@ sudo apt-get install libgeoip-dev
 
 ### Building and testing
 
-Pyston is pinned to an old LLVM revision (see `llvm_revision.txt`) that is built together with Pyston.  `tools/setup_deps.sh` downloads it, applies our patches, and prepares the other things the build and the tests need in `~/pyston_deps`:
-
-- the LLVM and clang sources, patched (`llvm_patches/`, `clang_patches/`)
-- libstdc++ headers from GCC 5, used by the bundled clang to compile the runtime bitcode, since it can't parse a modern libstdc++
-- CPython 2.7.8, which the tests compare Pyston's output against (`reference_python_patches/`)
+`tools/setup_deps.sh` builds CPython 2.7.8 into `~/pyston_deps`, which the tests compare Pyston's output against (with the patches in `reference_python_patches/`).
 
 ```
 git clone https://github.com/dropbox/pyston.git ~/pyston
@@ -37,12 +35,12 @@ git submodule update --init build_deps
 tools/setup_deps.sh
 
 mkdir -p build/Release && cd build/Release
-CC=clang CXX=clang++ cmake ~/pyston -GNinja -DCMAKE_BUILD_TYPE=Release
+CC=clang-21 CXX=clang++-21 cmake ~/pyston -GNinja -DCMAKE_BUILD_TYPE=Release
 ninja check-deps
 ctest --output-on-failure
 ```
 
-If your clang is installed with a version suffix (e.g. `clang-21`), use that for `CC` and `CXX`.  The `Makefile` wraps these steps for development, but expects `clang` and `clang++` on the `PATH`.
+If LLVM 21 isn't installed under `/usr/lib/llvm-21`, point CMake at it with `-DLLVM_DIR=/path/to/lib/cmake/llvm`.  The `Makefile` wraps these steps for development, but expects `clang` and `clang++` on the `PATH`.
 
 See the main README for more information about available make targets and options.
 
