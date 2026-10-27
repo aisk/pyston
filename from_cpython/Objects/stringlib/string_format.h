@@ -610,8 +610,7 @@ render_field(PyObject *fieldobj, SubString *format_spec, OutputString *output)
         goto done;
 
 #if PY_VERSION_HEX >= 0x03000000
-    // py3updating: Temparary disable it.
-    // assert(PyUnicode_Check(result));
+    assert(PyUnicode_Check(result));
 #else
     assert(PyString_Check(result) || PyUnicode_Check(result));
 

@@ -330,10 +330,10 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${NO_PUSH_ARGS_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${NO_PUSH_ARGS_FLAGS}")
 
 add_definitions(${LLVM_DEFINITIONS})
-add_definitions(-DDEFAULT_PYTHON_MAJOR_VERSION=3 -DDEFAULT_PYTHON_MINOR_VERSION=5 -DDEFAULT_PYTHON_MICRO_VERSION=2) # Python 3.5.2
+add_definitions(-DDEFAULT_PYTHON_MAJOR_VERSION=2 -DDEFAULT_PYTHON_MINOR_VERSION=7 -DDEFAULT_PYTHON_MICRO_VERSION=8) # Python 2.7.8
 add_definitions(-DLLVMREV=${LLVMREV})
 
-include_directories(${CMAKE_BINARY_DIR}/include/python3.5)
+include_directories(${CMAKE_BINARY_DIR}/include/python2.7)
 include_directories(${LLVM_INCLUDE_DIRS})
 
 find_package(LibLZMA REQUIRED)
@@ -359,7 +359,7 @@ add_subdirectory(tools)
 add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/linkdeps_dummy.c COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR}/linkdeps_dummy.c DEPENDS ${CMAKE_SOURCE_DIR}/section_ordering.txt)
 
 add_executable(pyston $<TARGET_OBJECTS:PYSTON_MAIN_OBJECT> $<TARGET_OBJECTS:PYSTON_OBJECTS> $<TARGET_OBJECTS:FROM_CPYTHON> linkdeps_dummy.c)
-add_custom_command(TARGET pyston POST_BUILD COMMAND ${CMAKE_COMMAND} -E create_symlink ${CMAKE_BINARY_DIR}/pyston ${CMAKE_BINARY_DIR}/python3 DEPENDS pyston)
+add_custom_command(TARGET pyston POST_BUILD COMMAND ${CMAKE_COMMAND} -E create_symlink ${CMAKE_BINARY_DIR}/pyston ${CMAKE_BINARY_DIR}/python DEPENDS pyston)
 
 # Wrap the stdlib in --whole-archive to force all the symbols to be included and eventually exported
 target_link_libraries(pyston -Wl,--whole-archive stdlib -Wl,--no-whole-archive pthread m z readline sqlite3 gmp mpfr ssl crypto liblz4 util ${LLVM_LIBS} ${LIBLZMA_LIBRARIES} ${OPTIONAL_LIBRARIES} ${CMAKE_BINARY_DIR}/jemalloc/lib/libjemalloc.a unwind)

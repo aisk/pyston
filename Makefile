@@ -830,9 +830,9 @@ $(call make_target,_gcc)
 $(call make_target,_release_gcc)
 
 nosearch_runpy_% nosearch_pyrun_%: %.py ext_python
-	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-3.5:$${PYTHONPATH} zsh -c 'time $(CPYTHON) $<'
+	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7:$${PYTHONPATH} zsh -c 'time $(CPYTHON) $<'
 nosearch_pypyrun_%: %.py ext_python
-	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-3.5:$${PYTHONPATH} zsh -c 'time $(PYPY) $<'
+	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7:$${PYTHONPATH} zsh -c 'time $(PYPY) $<'
 $(call make_search,runpy_%)
 $(call make_search,pyrun_%)
 $(call make_search,pypyrun_%)
@@ -842,12 +842,12 @@ nosearch_check_%: %.py pyston_dbg check-deps
 $(call make_search,check_%)
 
 nosearch_dbgpy_% nosearch_pydbg_%: %.py ext_pythondbg
-	export PYTHON_VERSION=$$(python3.5-dbg -V 2>&1 | awk '{print $$2}'); PYTHONPATH=test/test_extension/build/lib.linux-x86_64-3.5-pydebug $(GDB) --ex "dir $(DEPS_DIR)/python-src/python3.5-$$PYTHON_VERSION/debian" $(GDB_CMDS) --args python3.5-dbg $(ARGS) $<
+	export PYTHON_VERSION=$$(python2.7-dbg -V 2>&1 | awk '{print $$2}'); PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7-pydebug $(GDB) --ex "dir $(DEPS_DIR)/python-src/python2.7-$$PYTHON_VERSION/debian" $(GDB_CMDS) --args python2.7-dbg $(ARGS) $<
 $(call make_search,dbgpy_%)
 $(call make_search,pydbg_%)
 
 pydbg: ext_pythondbg
-	export PYTHON_VERSION=$$(python3.5-dbg -V 2>&1 | awk '{print $$2}'); PYTHONPATH=test/test_extension/build/lib.linux-x86_64-3.5-pydebug $(GDB) --ex "dir $(DEPS_DIR)/python-src/python3.5-$$PYTHON_VERSION/debian" $(GDB_CMDS) --args python3.5-dbg
+	export PYTHON_VERSION=$$(python2.7-dbg -V 2>&1 | awk '{print $$2}'); PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7-pydebug $(GDB) --ex "dir $(DEPS_DIR)/python-src/python2.7-$$PYTHON_VERSION/debian" $(GDB_CMDS) --args python2.7-dbg
 
 # "kill valgrind":
 kv:
@@ -996,7 +996,7 @@ endif
 # depend on the first one.
 $(firstword $(TEST_EXT_MODULE_OBJS)): $(TEST_EXT_MODULE_SRCS) | $(BUILD_PY)
 	$(VERB) cd $(TEST_DIR)/test_extension; time ../../$(BUILD_PY) setup.py build
-	$(VERB) cd $(TEST_DIR)/test_extension; ln -sf $(TEST_EXT_MODULE_NAMES:%=build/lib.linux-x86_64-3.5/%.pyston.so) .
+	$(VERB) cd $(TEST_DIR)/test_extension; ln -sf $(TEST_EXT_MODULE_NAMES:%=build/lib.linux-x86_64-2.7/%.pyston.so) .
 	$(VERB) touch -c $(TEST_EXT_MODULE_OBJS)
 $(wordlist 2,9999,$(TEST_EXT_MODULE_OBJS)): $(firstword $(TEST_EXT_MODULE_OBJS))
 $(firstword $(SHAREDMODS_OBJS)): $(SHAREDMODS_SRCS) | $(BUILD_PY)
@@ -1008,7 +1008,7 @@ $(wordlist 2,9999,$(SHAREDMODS_OBJS)): $(firstword $(SHAREDMODS_OBJS))
 ext_python: $(TEST_EXT_MODULE_SRCS)
 	cd $(TEST_DIR)/test_extension; $(CPYTHON) setup.py build
 ext_pythondbg: $(TEST_EXT_MODULE_SRCS)
-	cd $(TEST_DIR)/test_extension; python3.5-dbg setup.py build
+	cd $(TEST_DIR)/test_extension; python2.7-dbg setup.py build
 
 $(FROM_CPYTHON_SRCS:.c=.o): %.o: %.c $(BUILD_SYSTEM_DEPS)
 	$(ECHO) Compiling C file to $@

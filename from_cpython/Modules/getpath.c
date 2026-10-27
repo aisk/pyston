@@ -93,7 +93,7 @@
 
 // Pyston change:
 // In CPython, these are passed via commandline flags:
-#define VERSION "3.5"
+#define VERSION "2.7"
 #define PREFIX ""
 #define EXEC_PREFIX ""
 #define VPATH ""
