@@ -318,6 +318,17 @@ if(CXX_SUPPORTS_NO_PIE)
   set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -no-pie")
 endif()
 
+# Our custom C++ unwinder (src/runtime/cxx_unwind.cpp) doesn't apply
+# DW_CFA_GNU_args_size when jumping to a landing pad, so make sure the compiler
+# never passes stack arguments with push instructions, which is what produces it.
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+  set(NO_PUSH_ARGS_FLAGS "-mllvm -no-x86-call-frame-opt")
+elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+  set(NO_PUSH_ARGS_FLAGS "-maccumulate-outgoing-args")
+endif()
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${NO_PUSH_ARGS_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${NO_PUSH_ARGS_FLAGS}")
+
 add_definitions(${LLVM_DEFINITIONS})
 add_definitions(-DDEFAULT_PYTHON_MAJOR_VERSION=3 -DDEFAULT_PYTHON_MINOR_VERSION=5 -DDEFAULT_PYTHON_MICRO_VERSION=2) # Python 3.5.2
 add_definitions(-DLLVMREV=${LLVMREV})
@@ -332,6 +343,10 @@ link_directories(${LLVM_LIBRARY_DIRS})
 ADD_PROFILE_FLAGS()
 
 include(sysconfigdata)
+
+# The JIT resolves runtime symbols through dlsym, and C extensions link against
+# the executable, so export all symbols (CMake < 3.4 did this by default).
+set(CMAKE_ENABLE_EXPORTS ON)
 
 add_subdirectory(from_cpython)
 add_subdirectory(src)

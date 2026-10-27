@@ -1164,6 +1164,15 @@ void Assembler::set_cond(Register reg, ConditionCode condition) {
     emitByte(0x0f);
     emitByte(0x90 + condition);
     emitModRM(0b11, 0, reg_idx);
+
+    // setcc only writes the low byte, but the result often gets passed straight to a C++ function taking a
+    // bool.  Clang-compiled callees assume bool arguments are zero-extended to 32 bits, so clear the rest
+    // of the register with a "movzbl %reg8, %reg32".
+    if (reg_idx >= 4 || rex)
+        emitRex(rex);
+    emitByte(0x0f);
+    emitByte(0xb6);
+    emitModRM(0b11, reg_idx, reg_idx);
 }
 
 void Assembler::sete(Register reg) {
