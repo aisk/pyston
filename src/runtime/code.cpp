@@ -81,7 +81,7 @@ Box* BoxedCode::varnames(Box* b, void*) noexcept {
     std::vector<Box*> elts;
     for (auto sr : param_names.allArgsAsStr())
         elts.push_back(boxString(sr));
-    auto rtn = BoxedTuple::create(elts.size(), &elts[0]);
+    auto rtn = BoxedTuple::create(elts.size(), elts.data());
     for (auto e : elts)
         Py_DECREF(e);
     return rtn;

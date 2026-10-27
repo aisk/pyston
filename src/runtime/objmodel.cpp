@@ -7004,7 +7004,7 @@ Box* _typeNew(BoxedClass* metatype, BoxedString* name, BoxedTuple* bases, BoxedD
             }
             Py_DECREF(tuple);
         }
-        AUTO_DECREF_ARRAY(&slots[0], slots.size());
+        AUTO_DECREF_ARRAY(slots.data(), slots.size());
 
         // Check that slots are allowed
         if (slots.size() > 0 && base->tp_itemsize != 0) {
