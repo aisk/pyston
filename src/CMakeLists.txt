@@ -47,14 +47,7 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		codegen/irgen/refcounts.cpp
 		codegen/irgen/util.cpp
 		codegen/memmgr.cpp
-		codegen/opt/aa.cpp
-		codegen/opt/boxing_passes.cpp
-		codegen/opt/const_classes.cpp
-		codegen/opt/dead_allocs.cpp
-		codegen/opt/escape_analysis.cpp
 		codegen/opt/inliner.cpp
-		codegen/opt/mallocs_nonnull.cpp
-		codegen/opt/util.cpp
 		codegen/parser.cpp
 		codegen/patchpoints.cpp
 		codegen/profiling/dumprof.cpp

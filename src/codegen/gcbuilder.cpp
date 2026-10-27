@@ -24,7 +24,7 @@ class ConservativeGCBuilder : public GCBuilder {
 private:
     virtual llvm::Value* readPointer(IREmitter& emitter, llvm::Value* ptr_ptr) {
         assert(ptr_ptr->getType() == g.llvm_value_type_ptr);
-        return emitter.getBuilder()->CreateLoad(ptr_ptr);
+        return emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, ptr_ptr);
     }
     virtual void writePointer(IREmitter& emitter, llvm::Value* ptr_ptr, llvm::Value* ptr_value,
                               bool ignore_existing_value) {

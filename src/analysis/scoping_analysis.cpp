@@ -947,7 +947,7 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
 
         switch (node->type) {
             case AST_TYPE::ClassDef: {
-                this->scopes[node] = llvm::make_unique<ScopeInfoBase>(parent_info, usage, usage->node,
+                this->scopes[node] = std::make_unique<ScopeInfoBase>(parent_info, usage, usage->node,
                                                                       NameLookupUsage::ALL, globals_from_module);
                 break;
             }
@@ -956,7 +956,7 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
             case AST_TYPE::GeneratorExp:
             case AST_TYPE::DictComp:
             case AST_TYPE::SetComp: {
-                this->scopes[node] = llvm::make_unique<ScopeInfoBase>(parent_info, usage, usage->node,
+                this->scopes[node] = std::make_unique<ScopeInfoBase>(parent_info, usage, usage->node,
                                                                       usage->getNameLookupUsage(), globals_from_module);
                 break;
             }
@@ -1007,10 +1007,10 @@ ScopingAnalysis::ScopingAnalysis(AST* ast, bool globals_from_module)
 
     if (globals_from_module) {
         assert(ast->type == AST_TYPE::Module);
-        scopes[ast] = llvm::make_unique<ModuleScopeInfo>();
+        scopes[ast] = std::make_unique<ModuleScopeInfo>();
         parent_module = static_cast<AST_Module*>(ast);
     } else {
-        scopes[ast] = llvm::make_unique<EvalExprScopeInfo>(ast, globals_from_module);
+        scopes[ast] = std::make_unique<EvalExprScopeInfo>(ast, globals_from_module);
     }
 }
 }

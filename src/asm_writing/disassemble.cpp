@@ -19,7 +19,7 @@
 #include "llvm/IR/Mangler.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
-#include "llvm/MC/MCDisassembler.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
 
 #ifdef __clang__
 #pragma clang diagnostic push
@@ -41,8 +41,8 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/FormattedStream.h"
-#include "llvm/Support/MemoryObject.h"
-#include "llvm/Support/TargetRegistry.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 
@@ -74,29 +74,29 @@ void AssemblyLogger::append_comments(llvm::raw_string_ostream& stream, size_t po
 std::string AssemblyLogger::finalize_log(uint8_t const* start_addr, uint8_t const* end_addr) const {
     static __thread llvm::MCDisassembler* DisAsm = NULL;
     static __thread llvm::MCInstPrinter* IP = NULL;
+    static __thread const llvm::MCSubtargetInfo* STI_for_printing = NULL;
 
     if (!DisAsm) {
-        const llvm::StringRef triple = g.tm->getTargetTriple();
+        const llvm::Triple& triple = g.tm->getTargetTriple();
         std::string err;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
         assert(target);
-        const llvm::MCRegisterInfo* MRI = target->createMCRegInfo(triple);
+        const llvm::MCRegisterInfo* MRI = target->createMCRegInfo(triple.str());
         assert(MRI);
-        const llvm::MCAsmInfo* MAI = target->createMCAsmInfo(*MRI, triple);
+        const llvm::MCAsmInfo* MAI = target->createMCAsmInfo(*MRI, triple.str(), llvm::MCTargetOptions());
         assert(MAI);
         const llvm::MCInstrInfo* MII = target->createMCInstrInfo();
         assert(MII);
         std::string FeaturesStr;
         const llvm::StringRef CPU = "";
-        const llvm::MCSubtargetInfo* STI = target->createMCSubtargetInfo(triple, CPU, FeaturesStr);
+        const llvm::MCSubtargetInfo* STI = target->createMCSubtargetInfo(triple.str(), CPU, FeaturesStr);
         assert(STI);
+        STI_for_printing = STI;
         int AsmPrinterVariant = MAI->getAssemblerDialect(); // 0 is ATT, 1 is Intel
-        IP = target->createMCInstPrinter(AsmPrinterVariant, *MAI, *MII, *MRI, *STI);
+        IP = target->createMCInstPrinter(triple, AsmPrinterVariant, *MAI, *MII, *MRI);
         assert(IP);
         IP->setPrintImmHex(true);
-        llvm::MCObjectFileInfo* MOFI = new llvm::MCObjectFileInfo();
-        assert(MOFI);
-        llvm::MCContext* Ctx = new llvm::MCContext(MAI, MRI, MOFI);
+        llvm::MCContext* Ctx = new llvm::MCContext(triple, MAI, MRI, STI);
         assert(Ctx);
         DisAsm = target->createMCDisassembler(*STI, *Ctx);
         assert(DisAsm);
@@ -129,12 +129,11 @@ std::string AssemblyLogger::finalize_log(uint8_t const* start_addr, uint8_t cons
             print_nops();
         }
         llvm::MCDisassembler::DecodeStatus s = DisAsm->getInstruction(
-            inst /* out */, size /* out */, llvm::ArrayRef<uint8_t>(start_addr + pos, end_addr), 0, llvm::nulls(),
-            llvm::nulls());
+            inst /* out */, size /* out */, llvm::ArrayRef<uint8_t>(start_addr + pos, end_addr), 0, llvm::nulls());
         assert(s == llvm::MCDisassembler::Success);
 
         stream << start_addr + pos;
-        IP->printInst(&inst, stream, "");
+        IP->printInst(&inst, 0, "", *STI_for_printing, stream);
         stream << "\n";
 
         pos += size;

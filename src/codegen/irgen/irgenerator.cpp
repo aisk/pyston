@@ -14,6 +14,8 @@
 
 #include "codegen/irgen/irgenerator.h"
 
+#include "llvm/IR/DebugInfoMetadata.h"
+
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -116,11 +118,13 @@ llvm::Value* IRGenState::getScratchSpace(int min_bytes) {
     }
 
     llvm::AllocaInst* new_scratch_space;
+    // The ICs assume the scratch area is at least 8-byte aligned.
     // If the entry block is currently empty, we have to be more careful:
     if (entry_block.begin() == entry_block.end()) {
-        new_scratch_space = new llvm::AllocaInst(g.i8, getConstantInt(min_bytes, g.i64), "scratch", &entry_block);
+        new_scratch_space = new llvm::AllocaInst(g.i8, 0, getConstantInt(min_bytes, g.i64), llvm::Align(16), "scratch",
+                                                 &entry_block);
     } else {
-        new_scratch_space = new llvm::AllocaInst(g.i8, getConstantInt(min_bytes, g.i64), "scratch",
+        new_scratch_space = new llvm::AllocaInst(g.i8, 0, getConstantInt(min_bytes, g.i64), llvm::Align(16), "scratch",
                                                  entry_block.getFirstInsertionPt());
     }
 
@@ -158,28 +162,27 @@ ExceptionStyle UnwindInfo::preferredExceptionStyle() const {
 static llvm::Value* getClosureParentGep(IREmitter& emitter, llvm::Value* closure) {
     static_assert(sizeof(Box) == offsetof(BoxedClosure, parent), "");
     static_assert(offsetof(BoxedClosure, parent) + sizeof(BoxedClosure*) == offsetof(BoxedClosure, nelts), "");
-    return emitter.getBuilder()->CreateConstInBoundsGEP2_32(closure, 0, 1);
+    return emitter.getBuilder()->CreateConstInBoundsGEP1_64(g.i8, closure, offsetof(BoxedClosure, parent));
 }
 
 static llvm::Value* getClosureElementGep(IREmitter& emitter, llvm::Value* closure, size_t index) {
     static_assert(sizeof(Box) == offsetof(BoxedClosure, parent), "");
     static_assert(offsetof(BoxedClosure, parent) + sizeof(BoxedClosure*) == offsetof(BoxedClosure, nelts), "");
     static_assert(offsetof(BoxedClosure, nelts) + sizeof(size_t) == offsetof(BoxedClosure, elts), "");
-    return emitter.getBuilder()->CreateGEP(
-        closure,
-        { llvm::ConstantInt::get(g.i32, 0), llvm::ConstantInt::get(g.i32, 3), llvm::ConstantInt::get(g.i32, index) });
+    return emitter.getBuilder()->CreateConstInBoundsGEP1_64(g.i8, closure,
+                                                            offsetof(BoxedClosure, elts) + index * sizeof(Box*));
 }
 
-static llvm::Value* getBoxedLocalsGep(llvm::IRBuilder<true>& builder, llvm::Value* v) {
+static llvm::Value* getBoxedLocalsGep(llvm::IRBuilder<>& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, exc) == 0, "");
     static_assert(sizeof(ExcInfo) == 24, "");
     static_assert(offsetof(FrameInfo, boxedLocals) == 24, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 1);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 1);
 }
 
-static llvm::Value* getExcinfoGep(llvm::IRBuilder<true>& builder, llvm::Value* v) {
+static llvm::Value* getExcinfoGep(llvm::IRBuilder<>& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, exc) == 0, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 0);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 0);
 }
 
 template <typename Builder> static llvm::Value* getFrameObjGep(Builder& builder, llvm::Value* v) {
@@ -187,39 +190,39 @@ template <typename Builder> static llvm::Value* getFrameObjGep(Builder& builder,
     static_assert(sizeof(ExcInfo) == 24, "");
     static_assert(sizeof(Box*) == 8, "");
     static_assert(offsetof(FrameInfo, frame_obj) == 32, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 2);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 2);
     // TODO: this could be made more resilient by doing something like
     // gep->accumulateConstantOffset(g.tm->getDataLayout(), ap_offset)
 }
 
 template <typename Builder> static llvm::Value* getPassedClosureGep(Builder& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, passed_closure) == 40, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 3);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 3);
 }
 
 template <typename Builder> static llvm::Value* getVRegsGep(Builder& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, vregs) == 48, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 4);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 4);
 }
 
 template <typename Builder> static llvm::Value* getNumVRegsGep(Builder& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, num_vregs) == 56, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 5);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 5);
 }
 
 template <typename Builder> static llvm::Value* getStmtGep(Builder& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, stmt_offset) == 60, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 6);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 6);
 }
 
 template <typename Builder> static llvm::Value* getGlobalsGep(Builder& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, globals) == 64, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 7);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 7);
 }
 
 template <typename Builder> static llvm::Value* getCodeGep(Builder& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, code) == 64 + 16, "");
-    return builder.CreateConstInBoundsGEP2_32(v, 0, 9);
+    return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 9);
 }
 
 void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* passed_globals,
@@ -244,7 +247,7 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
     assert(!frame_info);
     llvm::BasicBlock& entry_block = getLLVMFunction()->getEntryBlock();
 
-    llvm::IRBuilder<true> builder(&entry_block);
+    llvm::IRBuilder<> builder(&entry_block);
 
     if (entry_block.begin() != entry_block.end())
         builder.SetInsertPoint(&entry_block, entry_block.getFirstInsertionPt());
@@ -265,18 +268,18 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
         this->frame_info = frame_info_arg;
 
         // use vrags array from the interpreter
-        vregs = builder.CreateLoad(getVRegsGep(builder, frame_info_arg));
-        this->globals = builder.CreateLoad(getGlobalsGep(builder, frame_info_arg));
+        vregs = builder.CreateLoad(g.llvm_value_type_ptr, getVRegsGep(builder, frame_info_arg));
+        this->globals = builder.CreateLoad(g.llvm_value_type_ptr, getGlobalsGep(builder, frame_info_arg));
         getRefcounts()->setType(this->globals, RefType::BORROWED);
 
         if (getScopeInfo().usesNameLookup()) {
             // load frame_info.boxedLocals
-            this->boxed_locals = builder.CreateLoad(getBoxedLocalsGep(builder, this->frame_info));
+            this->boxed_locals = builder.CreateLoad(g.llvm_value_type_ptr, getBoxedLocalsGep(builder, this->frame_info));
             getRefcounts()->setType(this->boxed_locals, RefType::BORROWED);
         }
 
         if (getScopeInfo().takesClosure()) {
-            passed_closure = builder.CreateLoad(getPassedClosureGep(builder, frame_info_arg));
+            passed_closure = builder.CreateLoad(g.llvm_value_type_ptr, getPassedClosureGep(builder, frame_info_arg));
             getRefcounts()->setType(passed_closure, RefType::BORROWED);
             this->setPassedClosure(passed_closure);
         }
@@ -292,7 +295,7 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
                 = builder.CreateAlloca(g.llvm_value_type_ptr, getConstantInt(num_user_visible_vregs), "vregs");
             // Clear the vregs array because 0 means undefined valued.
             builder.CreateMemSet(vregs_alloca, getConstantInt(0, g.i8),
-                                 getConstantInt(num_user_visible_vregs * sizeof(Box*)), vregs_alloca->getAlignment());
+                                 getConstantInt(num_user_visible_vregs * sizeof(Box*)), vregs_alloca->getAlign());
             vregs = vregs_alloca;
         } else
             vregs = getNullPtr(g.llvm_value_type_ptr_ptr);
@@ -302,8 +305,8 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
         getRefcounts()->setType(null_value, RefType::BORROWED);
         getRefcounts()->setNullable(null_value, true);
         llvm::Value* exc_info = getExcinfoGep(builder, al);
-        builder.CreateStore(null_value,
-                            builder.CreateConstInBoundsGEP2_32(exc_info, 0, offsetof(ExcInfo, type) / sizeof(Box*)));
+        builder.CreateStore(null_value, builder.CreateConstInBoundsGEP2_32(g.llvm_excinfo_type, exc_info, 0,
+                                                                           offsetof(ExcInfo, type) / sizeof(Box*)));
 
         // frame_info.boxedLocals = NULL
         llvm::Value* boxed_locals_gep = getBoxedLocalsGep(builder, al);
@@ -353,7 +356,7 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
     args.push_back(al_pointer_to_frame_info);
     info->setNumFrameArgs(1);
     info->setIsFrameInfoStackmap();
-    builder.CreateCall(llvm::Intrinsic::getDeclaration(g.cur_module, llvm::Intrinsic::experimental_stackmap), args);
+    builder.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(g.cur_module, llvm::Intrinsic::experimental_stackmap), args);
 }
 
 llvm::Value* IRGenState::getFrameInfoVar() {
@@ -415,7 +418,7 @@ private:
             static_assert(sizeof(_stop_thread) == 4, "");
             pendingcalls_to_do_gv = new llvm::GlobalVariable(*g.cur_module, g.i32, false,
                                                              llvm::GlobalValue::ExternalLinkage, 0, "_stop_thread");
-            pendingcalls_to_do_gv->setAlignment(4);
+            pendingcalls_to_do_gv->setAlignment(llvm::Align(4));
         }
 
         llvm::BasicBlock* cur_block = builder.GetInsertBlock();
@@ -425,7 +428,7 @@ private:
         llvm::BasicBlock* join_block = createBasicBlock("continue_after_stopthread_check");
         join_block->moveAfter(pendingcalls_set);
 
-        llvm::Value* pendingcalls_to_do_val = builder.CreateLoad(pendingcalls_to_do_gv, true /* volatile */);
+        llvm::Value* pendingcalls_to_do_val = builder.CreateLoad(g.i32, pendingcalls_to_do_gv, true /* volatile */);
         llvm::Value* is_zero
             = builder.CreateICmpEQ(pendingcalls_to_do_val, getConstantInt(0, pendingcalls_to_do_val->getType()));
 
@@ -478,8 +481,9 @@ private:
         setCurrentBasicBlock(normal_dest);
     }
 
-    llvm::CallSite emitCall(const UnwindInfo& unw_info, llvm::Value* callee, const std::vector<llvm::Value*>& args,
-                            ExceptionStyle target_exception_style, llvm::Value* capi_exc_value) {
+    llvm::CallBase* emitCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee,
+                             const std::vector<llvm::Value*>& args, ExceptionStyle target_exception_style,
+                             llvm::Value* capi_exc_value) {
         emitSetCurrentStmt(unw_info.current_stmt);
 
         if (target_exception_style == CAPI)
@@ -540,7 +544,7 @@ private:
         }
     }
 
-    llvm::CallSite emitPatchpoint(llvm::Type* return_type, std::unique_ptr<const ICSetupInfo> pp, llvm::Value* func,
+    llvm::CallBase* emitPatchpoint(llvm::Type* return_type, std::unique_ptr<const ICSetupInfo> pp, llvm::Value* func,
                                   const std::vector<llvm::Value*>& args,
                                   const std::vector<llvm::Value*>& ic_stackmap_args, const UnwindInfo& unw_info,
                                   ExceptionStyle target_exception_style, llvm::Value* capi_exc_value) {
@@ -592,23 +596,24 @@ private:
 
         irgenerator->addFrameStackmapArgs(info, pp_args);
 
-        llvm::Intrinsic::ID intrinsic_id;
+        llvm::Function* patchpoint;
         if (return_type->isIntegerTy() || return_type->isPointerTy()) {
-            intrinsic_id = llvm::Intrinsic::experimental_patchpoint_i64;
+            patchpoint = llvm::Intrinsic::getOrInsertDeclaration(g.cur_module, llvm::Intrinsic::experimental_patchpoint,
+                                                                 { g.i64 });
 
             if (capi_exc_value && capi_exc_value->getType()->isPointerTy())
                 capi_exc_value = getBuilder()->CreatePtrToInt(capi_exc_value, g.i64);
         } else if (return_type->isVoidTy()) {
-            intrinsic_id = llvm::Intrinsic::experimental_patchpoint_void;
+            patchpoint = this->getIntrinsic(llvm::Intrinsic::experimental_patchpoint_void);
         } else if (return_type->isDoubleTy()) {
-            intrinsic_id = llvm::Intrinsic::experimental_patchpoint_double;
+            patchpoint = llvm::Intrinsic::getOrInsertDeclaration(g.cur_module, llvm::Intrinsic::experimental_patchpoint,
+                                                                 { g.double_ });
         } else {
             return_type->dump();
             abort();
         }
-        llvm::Function* patchpoint = this->getIntrinsic(intrinsic_id);
-        llvm::CallSite rtn = this->emitCall(unw_info, patchpoint, pp_args, target_exception_style, capi_exc_value);
-        rtn.setCallingConv(calling_convention);
+        llvm::CallBase* rtn = this->emitCall(unw_info, patchpoint, pp_args, target_exception_style, capi_exc_value);
+        rtn->setCallingConv(calling_convention);
         return rtn;
     }
 
@@ -619,7 +624,7 @@ public:
         // even though we could allocate it in-line; maybe it's infrequently used enough that it's better
         // to not have it take up cache space.
 
-        builder->setEmitter(this);
+        builder->getInserter().setEmitter(this);
         builder->SetInsertPoint(curblock);
     }
 
@@ -628,7 +633,7 @@ public:
     GCBuilder* getGC() override { return irstate->getGC(); }
 
     llvm::Function* getIntrinsic(llvm::Intrinsic::ID intrinsic_id) override {
-        return llvm::Intrinsic::getDeclaration(g.cur_module, intrinsic_id);
+        return llvm::Intrinsic::getOrInsertDeclaration(g.cur_module, intrinsic_id);
     }
 
     llvm::Value* getScratch(int num_bytes) override { return irstate->getScratchSpace(num_bytes); }
@@ -656,14 +661,13 @@ public:
                                       irstate->getStmtVar());
     }
 
-    llvm::Instruction* createCall(const UnwindInfo& unw_info, llvm::Value* callee,
+    llvm::CallBase* createCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee,
                                   const std::vector<llvm::Value*>& args, ExceptionStyle target_exception_style = CXX,
                                   llvm::Value* capi_exc_value = NULL) override {
 #ifndef NDEBUG
         // Copied the argument-type-checking from CallInst::init, since the patchpoint arguments don't
         // get checked.
-        llvm::FunctionType* FTy
-            = llvm::cast<llvm::FunctionType>(llvm::cast<llvm::PointerType>(callee->getType())->getElementType());
+        llvm::FunctionType* FTy = callee.getFunctionType();
 
         assert((args.size() == FTy->getNumParams() || (FTy->isVarArg() && args.size() > FTy->getNumParams()))
                && "Calling a function with wrong number of args!");
@@ -676,44 +680,42 @@ public:
             }
         }
 #endif
-        return emitCall(unw_info, callee, args, target_exception_style, capi_exc_value).getInstruction();
+        return emitCall(unw_info, callee, args, target_exception_style, capi_exc_value);
     }
 
-    llvm::Instruction* createCall(const UnwindInfo& unw_info, llvm::Value* callee,
+    llvm::CallBase* createCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee,
                                   ExceptionStyle target_exception_style = CXX,
                                   llvm::Value* capi_exc_value = NULL) override {
         return createCall(unw_info, callee, std::vector<llvm::Value*>(), target_exception_style, capi_exc_value);
     }
 
-    llvm::Instruction* createCall(const UnwindInfo& unw_info, llvm::Value* callee, llvm::Value* arg1,
+    llvm::CallBase* createCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee, llvm::Value* arg1,
                                   ExceptionStyle target_exception_style = CXX,
                                   llvm::Value* capi_exc_value = NULL) override {
         return createCall(unw_info, callee, std::vector<llvm::Value*>({ arg1 }), target_exception_style,
                           capi_exc_value);
     }
 
-    llvm::Instruction* createCall2(const UnwindInfo& unw_info, llvm::Value* callee, llvm::Value* arg1,
+    llvm::CallBase* createCall2(const UnwindInfo& unw_info, llvm::FunctionCallee callee, llvm::Value* arg1,
                                    llvm::Value* arg2, ExceptionStyle target_exception_style = CXX,
                                    llvm::Value* capi_exc_value = NULL) override {
         return createCall(unw_info, callee, { arg1, arg2 }, target_exception_style, capi_exc_value);
     }
 
-    llvm::Instruction* createCall3(const UnwindInfo& unw_info, llvm::Value* callee, llvm::Value* arg1,
+    llvm::CallBase* createCall3(const UnwindInfo& unw_info, llvm::FunctionCallee callee, llvm::Value* arg1,
                                    llvm::Value* arg2, llvm::Value* arg3, ExceptionStyle target_exception_style = CXX,
                                    llvm::Value* capi_exc_value = NULL) override {
         return createCall(unw_info, callee, { arg1, arg2, arg3 }, target_exception_style, capi_exc_value);
     }
 
-    llvm::Instruction* createIC(std::unique_ptr<const ICSetupInfo> pp, void* func_addr,
+    llvm::CallBase* createIC(std::unique_ptr<const ICSetupInfo> pp, void* func_addr,
                                 const std::vector<llvm::Value*>& args, const UnwindInfo& unw_info,
                                 ExceptionStyle target_exception_style = CXX,
                                 llvm::Value* capi_exc_value = NULL) override {
         std::vector<llvm::Value*> stackmap_args;
         auto return_type = pp->hasReturnValue() ? g.i64 : g.void_;
-        llvm::CallSite rtn
-            = emitPatchpoint(return_type, std::move(pp), embedConstantPtr(func_addr, g.i8->getPointerTo()), args,
-                             stackmap_args, unw_info, target_exception_style, capi_exc_value);
-        return rtn.getInstruction();
+        return emitPatchpoint(return_type, std::move(pp), embedConstantPtr(func_addr, g.i8_ptr), args, stackmap_args,
+                              unw_info, target_exception_style, capi_exc_value);
     }
 
     llvm::Value* createDeopt(BST_stmt* current_stmt, llvm::Value* node_value) override {
@@ -1159,7 +1161,7 @@ private:
 
     void _addAnnotation(const char* message) {
         llvm::Instruction* inst = emitter.getBuilder()->CreateCall(
-            llvm::Intrinsic::getDeclaration(g.cur_module, llvm::Intrinsic::donothing));
+            llvm::Intrinsic::getOrInsertDeclaration(g.cur_module, llvm::Intrinsic::donothing));
         llvm::Metadata* md_vals[] = { llvm::ConstantAsMetadata::get(getConstantInt(0)) };
         llvm::MDNode* mdnode = llvm::MDNode::get(g.context, md_vals);
         inst->setMetadata(message, mdnode);
@@ -1176,16 +1178,13 @@ private:
         emitter.setType(v, RefType::OWNED);
         ConcreteCompilerVariable* rtn = new ConcreteCompilerVariable(LIST, v);
 
-        llvm::Value* f = g.funcs.listAppendInternal;
-        llvm::Value* bitcast = emitter.getBuilder()->CreateBitCast(
-            v, *llvm::cast<llvm::FunctionType>(llvm::cast<llvm::PointerType>(f->getType())->getElementType())
-                    ->param_begin());
+        llvm::FunctionCallee f = g.funcs.listAppendInternal;
 
         for (int i = 0; i < node->num_elts; i++) {
             CompilerVariable* elt = elts[i];
             ConcreteCompilerVariable* converted = elt->makeConverted(emitter, elt->getBoxType());
 
-            emitter.createCall2(unw_info, f, bitcast, converted->getValue());
+            emitter.createCall2(unw_info, f, v, converted->getValue());
         }
         return rtn;
     }
@@ -1287,11 +1286,11 @@ private:
             llvm::Value* closureValue = irstate->getPassedClosure();
             assert(closureValue);
             for (int i = 0; i < deref_info.num_parents_from_passed_closure; i++) {
-                closureValue = emitter.getBuilder()->CreateLoad(getClosureParentGep(emitter, closureValue));
+                closureValue = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, getClosureParentGep(emitter, closureValue));
                 emitter.setType(closureValue, RefType::BORROWED);
             }
             llvm::Value* lookupResult
-                = emitter.getBuilder()->CreateLoad(getClosureElementGep(emitter, closureValue, deref_info.offset));
+                = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, getClosureElementGep(emitter, closureValue, deref_info.offset));
             emitter.setType(lookupResult, RefType::BORROWED);
 
             // If the value is NULL, the variable is undefined.
@@ -1311,9 +1310,9 @@ private:
             curblock = fail_bb;
             emitter.getBuilder()->SetInsertPoint(curblock);
 
-            llvm::CallSite call = emitter.createCall(unw_info, g.funcs.assertFailDerefNameDefined,
+            llvm::CallBase* call = emitter.createCall(unw_info, g.funcs.assertFailDerefNameDefined,
                                                      embedRelocatablePtr(id.c_str(), g.i8_ptr));
-            call.setDoesNotReturn();
+            call->setDoesNotReturn();
             emitter.getBuilder()->CreateUnreachable();
 
             // Case that it is defined: carry on in with the retrieved value.
@@ -1335,12 +1334,12 @@ private:
             if (!symbol_table[node->vreg]) {
                 // TODO should mark as DEAD here, though we won't end up setting all the names appropriately
                 // state = DEAD;
-                llvm::CallSite call = emitter.createCall(
+                llvm::CallBase* call = emitter.createCall(
                     unw_info, g.funcs.assertNameDefined,
                     { getConstantInt(0, g.i1), embedRelocatablePtr(id.c_str(), g.i8_ptr),
                       emitter.setType(embedRelocatablePtr(UnboundLocalError, g.llvm_class_type_ptr), RefType::BORROWED),
                       getConstantInt(true, g.i1) });
-                call.setDoesNotReturn();
+                call->setDoesNotReturn();
                 return undefVariable();
             }
 
@@ -1685,9 +1684,9 @@ private:
         if (cfg->getVRegInfo().isUserVisibleVReg(vreg)) {
             // looks like this store don't have to be volatile because llvm knows that the vregs are visible thru the
             // FrameInfo which escapes.
-            auto* gep = emitter.getBuilder()->CreateConstInBoundsGEP1_64(irstate->getVRegsVar(), vreg);
+            auto* gep = emitter.getBuilder()->CreateConstInBoundsGEP1_64(g.llvm_value_type_ptr, irstate->getVRegsVar(), vreg);
             if (prev) {
-                auto* old_value = emitter.getBuilder()->CreateLoad(gep);
+                auto* old_value = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, gep);
                 emitter.setType(old_value, RefType::OWNED);
                 if (potentially_undefined)
                     emitter.setNullable(old_value, true);
@@ -1748,7 +1747,7 @@ private:
                 // This is basically `closure->elts[offset] = val;`
                 llvm::Value* gep = getClosureElementGep(emitter, irstate->getCreatedClosure(), offset);
                 if (prev) {
-                    auto load = emitter.getBuilder()->CreateLoad(gep);
+                    auto load = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, gep);
                     emitter.setType(load, RefType::OWNED);
                     if (maybe_was_undefined)
                         emitter.setNullable(load, true);
@@ -1813,7 +1812,7 @@ private:
                 // This is basically `closure->elts[offset] = val;`
                 llvm::Value* gep = getClosureElementGep(emitter, irstate->getCreatedClosure(), offset);
                 if (prev) {
-                    auto load = emitter.getBuilder()->CreateLoad(gep);
+                    auto load = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, gep);
                     emitter.setType(load, RefType::OWNED);
                     if (maybe_was_undefined)
                         emitter.setNullable(load, true);
@@ -1951,8 +1950,8 @@ private:
         } else {
             llvm_args.push_back(emitter.setType(getNullPtr(g.llvm_value_type_ptr), RefType::BORROWED));
         }
-        llvm::CallSite call = emitter.createCall(unw_info, g.funcs.assertFail, llvm_args);
-        call.setDoesNotReturn();
+        llvm::CallBase* call = emitter.createCall(unw_info, g.funcs.assertFail, llvm_args);
+        call->setDoesNotReturn();
 
         emitter.getBuilder()->CreateUnreachable();
         endBlock(DEAD);
@@ -2043,12 +2042,12 @@ private:
                               (bool)is_defined_var);
 
         if (!symbol_table[target->vreg]) {
-            llvm::CallSite call = emitter.createCall(
+            llvm::CallBase* call = emitter.createCall(
                 unw_info, g.funcs.assertNameDefined,
                 { getConstantInt(0, g.i1), embedConstantPtr(id.c_str(), g.i8_ptr),
                   emitter.setType(embedRelocatablePtr(NameError, g.llvm_class_type_ptr), RefType::BORROWED),
                   getConstantInt(true /*local_error_msg*/, g.i1) });
-            call.setDoesNotReturn();
+            call->setDoesNotReturn();
             return;
         }
 
@@ -2177,7 +2176,7 @@ private:
         // Code to check if we want to do the OSR:
         llvm::GlobalVariable* edgecount_ptr = new llvm::GlobalVariable(
             *g.cur_module, g.i64, false, llvm::GlobalValue::InternalLinkage, getConstantInt(0, g.i64), "edgecount");
-        llvm::Value* curcount = emitter.getBuilder()->CreateLoad(edgecount_ptr);
+        llvm::Value* curcount = emitter.getBuilder()->CreateLoad(g.i64, edgecount_ptr);
         llvm::Value* newcount = emitter.getBuilder()->CreateAdd(curcount, getConstantInt(1, g.i64));
         emitter.getBuilder()->CreateStore(newcount, edgecount_ptr);
 
@@ -2265,7 +2264,7 @@ private:
                 llvm_args.push_back(val);
                 llvm_arg_types.push_back(val->getType());
             } else {
-                llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(arg_array, arg_num - 3);
+                llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(g.llvm_value_type_ptr, arg_array, arg_num - 3);
 
                 if (var->getType() == INT || var->getType() == BOOL) {
                     val = emitter.getBuilder()->CreateIntToPtr(val, g.llvm_value_type_ptr);
@@ -2357,7 +2356,7 @@ private:
             assert(node->vreg_arg1 == VREG_UNDEFINED);
             assert(node->vreg_arg2 == VREG_UNDEFINED);
 
-            llvm::Value* exc_info = emitter.getBuilder()->CreateConstInBoundsGEP2_32(irstate->getFrameInfoVar(), 0, 0);
+            llvm::Value* exc_info = emitter.getBuilder()->CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, irstate->getFrameInfoVar(), 0, 0);
             if (target_exception_style == CAPI) {
                 emitter.createCall(unw_info, g.funcs.raise0_capi, exc_info, CAPI, IREmitter::ALWAYS_THROWS);
                 emitter.getBuilder()->CreateUnreachable();
@@ -2401,7 +2400,7 @@ private:
         // printf("%d stmt: %d\n", node->type, node->lineno);
         if (node->lineno) {
             emitter.getBuilder()->SetCurrentDebugLocation(
-                llvm::DebugLoc::get(node->lineno, 0, irstate->getFuncDbgInfo()));
+                llvm::DILocation::get(g.context, node->lineno, 0, irstate->getFuncDbgInfo()));
         }
 
         switch (node->type()) {
@@ -2844,8 +2843,8 @@ public:
         irstate->setupFrameInfoVar(passed_closure_or_null, globals);
 
         if (scope_info.createsClosure()) {
-            auto created_closure = emitter.getBuilder()->CreateCall2(
-                g.funcs.createClosure, passed_closure_or_null, getConstantInt(scope_info.getClosureSize(), g.i64));
+            auto created_closure = emitter.getBuilder()->CreateCall(
+                g.funcs.createClosure, { passed_closure_or_null, getConstantInt(scope_info.getClosureSize(), g.i64) });
             irstate->setCreatedClosure(created_closure);
             emitter.setType(created_closure, RefType::OWNED);
         }
@@ -2856,8 +2855,8 @@ public:
 
             if (i == 3) {
                 for (int i = 3; i < arg_types.size(); i++) {
-                    llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(AI, i - 3);
-                    llvm::Value* loaded = emitter.getBuilder()->CreateLoad(ptr);
+                    llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(g.llvm_value_type_ptr, &*AI, i - 3);
+                    llvm::Value* loaded = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, ptr);
 
                     if (arg_types[i]->llvmType() == g.i64)
                         loaded = emitter.getBuilder()->CreatePtrToInt(loaded, arg_types[i]->llvmType());
@@ -3009,21 +3008,21 @@ public:
             } else {
                 // Catch the exception and forward to final_dest:
                 llvm::Value* exc_type_ptr
-                    = new llvm::AllocaInst(g.llvm_value_type_ptr, getConstantInt(1, g.i64), "exc_type",
+                    = new llvm::AllocaInst(g.llvm_value_type_ptr, 0, getConstantInt(1, g.i64), "exc_type",
                                            irstate->getLLVMFunction()->getEntryBlock().getFirstInsertionPt());
                 llvm::Value* exc_value_ptr
-                    = new llvm::AllocaInst(g.llvm_value_type_ptr, getConstantInt(1, g.i64), "exc_value",
+                    = new llvm::AllocaInst(g.llvm_value_type_ptr, 0, getConstantInt(1, g.i64), "exc_value",
                                            irstate->getLLVMFunction()->getEntryBlock().getFirstInsertionPt());
                 llvm::Value* exc_traceback_ptr
-                    = new llvm::AllocaInst(g.llvm_value_type_ptr, getConstantInt(1, g.i64), "exc_traceback",
+                    = new llvm::AllocaInst(g.llvm_value_type_ptr, 0, getConstantInt(1, g.i64), "exc_traceback",
                                            irstate->getLLVMFunction()->getEntryBlock().getFirstInsertionPt());
-                emitter.getBuilder()->CreateCall3(g.funcs.PyErr_Fetch, exc_type_ptr, exc_value_ptr, exc_traceback_ptr);
+                emitter.getBuilder()->CreateCall(g.funcs.PyErr_Fetch, { exc_type_ptr, exc_value_ptr, exc_traceback_ptr });
                 // TODO: I think we should be doing this on a python raise() or when we enter a python catch:
-                emitter.getBuilder()->CreateCall3(g.funcs.PyErr_NormalizeException, exc_type_ptr, exc_value_ptr,
-                                                  exc_traceback_ptr);
-                llvm::Value* exc_type = emitter.getBuilder()->CreateLoad(exc_type_ptr);
-                llvm::Value* exc_value = emitter.getBuilder()->CreateLoad(exc_value_ptr);
-                llvm::Value* exc_traceback = emitter.getBuilder()->CreateLoad(exc_traceback_ptr);
+                emitter.getBuilder()->CreateCall(g.funcs.PyErr_NormalizeException, { exc_type_ptr, exc_value_ptr,
+                                                  exc_traceback_ptr });
+                llvm::Value* exc_type = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, exc_type_ptr);
+                llvm::Value* exc_value = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, exc_value_ptr);
+                llvm::Value* exc_traceback = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, exc_traceback_ptr);
 
                 emitter.setType(exc_type, RefType::OWNED);
                 emitter.setType(exc_value, RefType::OWNED);
@@ -3085,7 +3084,7 @@ public:
             emitter.getBuilder()->CreateBr(final_dest);
         } else if (irstate->getExceptionStyle() == CAPI) {
             auto call_inst
-                = emitter.getBuilder()->CreateCall3(g.funcs.PyErr_Restore, exc_type, exc_value, exc_traceback);
+                = emitter.getBuilder()->CreateCall(g.funcs.PyErr_Restore, { exc_type, exc_value, exc_traceback });
             irstate->getRefcounts()->refConsumed(exc_type, call_inst);
             irstate->getRefcounts()->refConsumed(exc_value, call_inst);
             irstate->getRefcounts()->refConsumed(exc_traceback, call_inst);
@@ -3096,7 +3095,7 @@ public:
         } else {
             // auto call_inst = emitter.createCall3(UnwindInfo(unw_info.current_stmt, NO_CXX_INTERCEPTION),
             // g.funcs.rawReraise, exc_type, exc_value, exc_traceback);
-            auto call_inst = emitter.getBuilder()->CreateCall3(g.funcs.rawReraise, exc_type, exc_value, exc_traceback);
+            auto call_inst = emitter.getBuilder()->CreateCall(g.funcs.rawReraise, { exc_type, exc_value, exc_traceback });
             irstate->getRefcounts()->refConsumed(exc_type, call_inst);
             irstate->getRefcounts()->refConsumed(exc_value, call_inst);
             irstate->getRefcounts()->refConsumed(exc_traceback, call_inst);
@@ -3122,15 +3121,16 @@ public:
 std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> createLandingpad(llvm::BasicBlock* bb) {
     assert(bb->begin() == bb->end());
 
-    llvm::IRBuilder<true> builder(bb);
+    llvm::IRBuilder<> builder(bb);
 
     static llvm::Function* _personality_func = g.stdlib_module->getFunction("__gxx_personality_v0");
     assert(_personality_func);
-    llvm::Value* personality_func
+    llvm::FunctionCallee personality_func
         = g.cur_module->getOrInsertFunction(_personality_func->getName(), _personality_func->getFunctionType());
     assert(personality_func);
-    llvm::LandingPadInst* landing_pad = builder.CreateLandingPad(
-        llvm::StructType::create(std::vector<llvm::Type*>{ g.i8_ptr, g.i64 }), personality_func, 1);
+    builder.GetInsertBlock()->getParent()->setPersonalityFn(llvm::cast<llvm::Constant>(personality_func.getCallee()));
+    llvm::LandingPadInst* landing_pad
+        = builder.CreateLandingPad(llvm::StructType::get(g.context, { g.i8_ptr, g.i64 }), 1);
     landing_pad->addClause(getNullPtr(g.i8_ptr));
 
     llvm::Value* cxaexc_pointer = builder.CreateExtractValue(landing_pad, { 0 });
@@ -3141,11 +3141,14 @@ std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> createLandingpad(llvm::Basi
     assert(begin_catch_func);
 
     llvm::Value* excinfo_pointer = builder.CreateCall(begin_catch_func, cxaexc_pointer);
-    llvm::Value* excinfo_pointer_casted = builder.CreateBitCast(excinfo_pointer, g.llvm_excinfo_type->getPointerTo());
 
-    llvm::Value* exc_type = builder.CreateLoad(builder.CreateConstInBoundsGEP2_32(excinfo_pointer_casted, 0, 0));
-    llvm::Value* exc_value = builder.CreateLoad(builder.CreateConstInBoundsGEP2_32(excinfo_pointer_casted, 0, 1));
-    llvm::Value* exc_traceback = builder.CreateLoad(builder.CreateConstInBoundsGEP2_32(excinfo_pointer_casted, 0, 2));
+    auto load_field = [&](int idx) {
+        return builder.CreateLoad(g.llvm_value_type_ptr,
+                                  builder.CreateConstInBoundsGEP2_32(g.llvm_excinfo_type, excinfo_pointer, 0, idx));
+    };
+    llvm::Value* exc_type = load_field(0);
+    llvm::Value* exc_value = load_field(1);
+    llvm::Value* exc_traceback = load_field(2);
 
     return std::make_tuple(exc_type, exc_value, exc_traceback);
 }

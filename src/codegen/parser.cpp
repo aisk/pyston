@@ -79,14 +79,14 @@ public:
     }
 
     BufferedReader(FILE* fp)
-        : start(0), end(0), fp(fp), data(), intern_pool(NULL), ast_allocator(llvm::make_unique<ASTAllocator>()) {}
+        : start(0), end(0), fp(fp), data(), intern_pool(NULL), ast_allocator(std::make_unique<ASTAllocator>()) {}
     BufferedReader(std::vector<char> data, int start_offset = 0)
         : start(start_offset),
           end(data.size()),
           fp(NULL),
           data(std::move(data)),
           intern_pool(NULL),
-          ast_allocator(llvm::make_unique<ASTAllocator>()) {}
+          ast_allocator(std::make_unique<ASTAllocator>()) {}
 
     int bytesBuffered() { return (end - start); }
 

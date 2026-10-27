@@ -966,7 +966,7 @@ std::pair<RewriterVar*, RewriterAction*> JitFragmentWriter::emitPPCall(void* fun
 
     RewriterAction* call_action
         = addAction([this, result, func_addr, ast_node, args_array, args_size, pp_size, num_additional]() {
-            auto all_args = llvm::makeArrayRef(args_array, args_size + num_additional);
+            auto all_args = llvm::ArrayRef(args_array, args_size + num_additional);
             auto args = all_args.slice(0, args_size);
             this->_emitPPCall(result, func_addr, args, pp_size, ast_node, all_args);
         }, args_array_ref, ActionType::NORMAL);

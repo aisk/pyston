@@ -982,7 +982,7 @@ RewriterVar* Rewriter::call(bool has_side_effects, void* func_addr, llvm::ArrayR
         };
 
         llvm::ArrayRef<RewriterVar*> allArgs() const {
-            return llvm::makeArrayRef(args_array, num_args + num_args_xmm + num_additional_uses);
+            return llvm::ArrayRef(args_array, num_args + num_args_xmm + num_additional_uses);
         }
 
         llvm::ArrayRef<RewriterVar*> args() const { return allArgs().slice(0, num_args); }

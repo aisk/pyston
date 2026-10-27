@@ -14,15 +14,16 @@
 
 #include "codegen/codegen.h"
 
-#include <cxxabi.h>
 #include <dlfcn.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/ExecutionEngine/JITEventListener.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Object/SymbolSize.h"
 #include "llvm/Support/FileSystem.h"
 
 #include "analysis/function_analysis.h"
@@ -136,8 +137,7 @@ llvm::Function* FunctionAddressRegistry::getLLVMFuncAtAddress(void* addr) {
 }
 
 static std::string tryDemangle(const char* s) {
-    int status;
-    char* demangled = abi::__cxa_demangle(s, NULL, NULL, &status);
+    char* demangled = llvm::itaniumDemangle(s);
     if (!demangled) {
         return s;
     }
@@ -177,46 +177,42 @@ std::string FunctionAddressRegistry::getFuncNameAtAddress(void* addr, bool deman
 
 class RegistryEventListener : public llvm::JITEventListener {
 public:
-    virtual void NotifyObjectEmitted(const llvm::object::ObjectFile& Obj,
-                                     const llvm::RuntimeDyld::LoadedObjectInfo& L) {
+    void notifyObjectLoaded(ObjectKey key, const llvm::object::ObjectFile& Obj,
+                            const llvm::RuntimeDyld::LoadedObjectInfo& L) override {
         static StatCounter code_bytes("code_bytes");
         code_bytes.log(Obj.getData().size());
 
-        llvm_error_code code;
-        for (const auto& sym : Obj.symbols()) {
-            llvm::object::section_iterator section(Obj.section_end());
-            code = sym.getSection(section);
-            assert(!code);
-            bool is_text;
-#if LLVMREV < 219314
-            code = section->isText(is_text);
-            assert(!code);
-#else
-            is_text = section->isText();
-#endif
-            if (!is_text)
+        // The symbols in the emitted object have the addresses they would have before loading; this gives us a copy
+        // whose sections have been updated to the addresses they ended up at.
+        llvm::object::OwningBinary<llvm::object::ObjectFile> debug_obj = L.getObjectForDebug(Obj);
+        const llvm::object::ObjectFile& loaded = *debug_obj.getBinary();
+
+        for (const auto& p : llvm::object::computeSymbolSizes(loaded)) {
+            const llvm::object::SymbolRef& sym = p.first;
+
+            llvm::Expected<llvm::object::SymbolRef::Type> type = sym.getType();
+            if (!type || *type != llvm::object::SymbolRef::ST_Function) {
+                llvm::consumeError(type.takeError());
                 continue;
+            }
 
-            llvm::StringRef name;
-            code = sym.getName(name);
-            assert(!code);
-            uint64_t size;
-            code = sym.getSize(size);
-            assert(!code);
+            llvm::Expected<llvm::StringRef> name = sym.getName();
+            llvm::Expected<uint64_t> sym_addr = sym.getAddress();
+            RELEASE_ASSERT(name && sym_addr, "");
+            assert(*sym_addr);
 
-            if (name == ".text")
-                continue;
-
-
-            uint64_t sym_addr = L.getSymbolLoadAddress(name);
-            assert(sym_addr);
-
-            g.func_addr_registry.registerFunction(name.data(), (void*)sym_addr, size, NULL);
+            g.func_addr_registry.registerFunction(name->str(), (void*)*sym_addr, p.second, NULL);
         }
     }
 };
 
-GlobalState::GlobalState() : context(llvm::getGlobalContext()), cur_module(NULL), cur_cf(NULL){};
+llvm::LLVMContext& getGlobalLLVMContext() {
+    // A function-level static so that it is constructed before any static initializer that needs it.
+    static llvm::LLVMContext context;
+    return context;
+}
+
+GlobalState::GlobalState() : context(getGlobalLLVMContext()), cur_module(NULL), cur_cf(NULL){};
 
 llvm::JITEventListener* makeRegistryListener() {
     return new RegistryEventListener();

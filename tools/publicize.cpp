@@ -16,30 +16,15 @@
 #include <iostream>
 #include <unordered_map>
 
-#include "llvm/ADT/Triple.h"
-#include "llvm/Analysis/Passes.h"
-#include "llvm/Bitcode/ReaderWriter.h"
-#include "llvm/ExecutionEngine/ExecutionEngine.h"
-#include "llvm/ExecutionEngine/MCJIT.h"
-#include "llvm/ExecutionEngine/ObjectCache.h"
-#include "llvm/IR/InstIterator.h"
-#include "llvm/IR/IRBuilder.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/FormattedStream.h"
-#include "llvm/Support/ManagedStatic.h"
-#include "llvm/Support/Path.h"
-#include "llvm/Support/PrettyStackTrace.h"
-#include "llvm/Support/Signals.h"
+#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/SystemUtils.h"
-#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Utils/Cloning.h"
 
 using namespace llvm;
 
@@ -89,11 +74,10 @@ bool makeVisible(llvm::GlobalValue* gv) {
     if (visibility == llvm::GlobalValue::HiddenVisibility) {
         gv->setVisibility(llvm::GlobalValue::ProtectedVisibility);
         //gv->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
-        std::string old_name = gv->getName();
+        std::string old_name = gv->getName().str();
         std::string new_name = (gv->getName() + "_protected").str();
         gv->setName(new_name);
 
-#if LLVMREV >= 225705
         // If this symbol has comdat set we have to remove the comdat for the old name
         // and create a new comdat with the new name
         if (gv->hasComdat() && isa<llvm::GlobalObject>(gv)) {
@@ -105,7 +89,6 @@ bool makeVisible(llvm::GlobalValue* gv) {
             auto& Comdats = mod->getComdatSymbolTable();
             Comdats.erase(Comdats.find(old_name));
         }
-#endif
 
         changed = true;
     }
@@ -113,124 +96,42 @@ bool makeVisible(llvm::GlobalValue* gv) {
     return changed;
 }
 
-bool isConstant(MDNode* parent_type, int offset) {
-    MDString *s = cast<MDString>(parent_type->getOperand(0));
-
-    // TODO: these were somewhat helpful, but this code is broken since
-    // it hard-codes the attribute offsets.
-    /*
-    if (s->getString() == "_ZTSN6pyston19BoxedXrangeIteratorE") {
-        return (offset == 16);
-    }
-
-    if (s->getString() == "_ZTSN6pyston8BoxedIntE") {
-        return (offset == 16);
-    }
-
-    if (s->getString() == "_ZTSN6pyston10BoxedFloatE") {
-        return (offset == 16);
-    }
-
-    if (s->getString() == "_ZTSN6pyston11BoxedXrangeE") {
-        return offset == 16 || offset == 24 || offset == 32;
-    }
-    */
-
-    return false;
-}
-
-bool updateTBAA(Function* f) {
-    bool changed = false;
-
-    LLVMContext &c = f->getContext();
-
-    for (auto it = inst_begin(f), end = inst_end(f); it != end; ++it) {
-#if LLVMREV < 221024 || LLVMREV >= 221711
-        MDNode *tbaa = it->getMetadata(LLVMContext::MD_tbaa);
-#else
-        MDNode *tbaa = it->getMDNode(LLVMContext::MD_tbaa);
-#endif
-        if (!tbaa)
-            continue;
-        //tbaa->dump();
-
-        assert(tbaa->getNumOperands() == 3);
-
-        if (!isConstant(llvm::cast<MDNode>(tbaa->getOperand(0)), llvm::cast<ConstantInt>(llvm::cast<ConstantAsMetadata>(tbaa->getOperand(2))->getValue())->getSExtValue())) {
-            continue;
-        }
-
-        std::vector<Metadata*> operands;
-
-        for (int i = 0; i < tbaa->getNumOperands(); i++) {
-            operands.push_back(tbaa->getOperand(i));
-        }
-        operands.push_back(ConstantAsMetadata::get(ConstantInt::get(Type::getInt64Ty(c), 1)));
-
-        MDNode *new_tbaa = MDNode::get(c, operands);
-        it->setMetadata(LLVMContext::MD_tbaa, new_tbaa);
-        //new_tbaa->dump();
-    }
-
-    return changed;
-}
-
 int main(int argc, char **argv) {
-    sys::PrintStackTraceOnErrorSignal();
-    PrettyStackTraceProgram X(argc, argv);
+    InitLLVM X(argc, argv);
 
-    LLVMContext &Context = getGlobalContext();
-    llvm_shutdown_obj Y;
+    LLVMContext Context;
     cl::ParseCommandLineOptions(argc, argv, "mcjit pre-cacher");
 
     SMDiagnostic Err;
 
-#if LLVMREV < 216466
-    std::unique_ptr<Module> M(ParseIRFile(InputFilename, Err, Context));
-#else
     std::unique_ptr<Module> M(parseIRFile(InputFilename, Err, Context));
-#endif
 
     if (M.get() == 0) {
         Err.print(argv[0], errs());
         return 1;
     }
 
-    for (Module::iterator I = M->begin(), E = M->end(); I != E; ++I) {
-        makeVisible(I);
+    for (Function& F : *M) {
+        makeVisible(&F);
     }
 
-    for (Module::global_iterator I = M->global_begin(), E = M->global_end(); I != E; ++I) {
-        makeVisible(I);
-    }
-
-    for (Module::iterator I = M->begin(), E = M->end(); I != E; ++I) {
-        updateTBAA(I);
+    for (GlobalVariable& GV : M->globals()) {
+        makeVisible(&GV);
     }
 
     if (OutputFilename.empty())
         OutputFilename = "-";
 
-#if LLVMREV < 216393
-    std::string ErrorInfo;
-    tool_output_file out(OutputFilename.c_str(), ErrorInfo, sys::fs::F_None);
-    if (!ErrorInfo.empty()) {
-        errs() << ErrorInfo << '\n';
-        return 1;
-    }
-#else
     std::error_code EC;
-    tool_output_file out(OutputFilename, EC, sys::fs::F_None);
+    ToolOutputFile out(OutputFilename, EC, sys::fs::OF_None);
     if (EC) {
         errs() << "error opening file for writing\n";
         return 1;
     }
-#endif
 
-    WriteBitcodeToFile(M.get(), out.os());
+    WriteBitcodeToFile(*M, out.os());
 
     out.keep();
 
     return 0;
 }
-

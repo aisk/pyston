@@ -253,12 +253,12 @@ struct ParamNames {
 
     llvm::ArrayRef<BST_Name*> argsAsName() const {
         assert(all_args_contains_names);
-        return llvm::makeArrayRef((BST_Name * const*)all_args.data(), numNormalArgs());
+        return llvm::ArrayRef((BST_Name * const*)all_args.data(), numNormalArgs());
     }
 
     llvm::ArrayRef<BST_Name*> allArgsAsName() const {
         assert(all_args_contains_names);
-        return llvm::makeArrayRef((BST_Name * const*)all_args.data(), all_args.size());
+        return llvm::ArrayRef((BST_Name * const*)all_args.data(), all_args.size());
     }
 
     std::vector<const char*> allArgsAsStr() const;

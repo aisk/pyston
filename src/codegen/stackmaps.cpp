@@ -58,13 +58,11 @@ std::unique_ptr<StackMap> parseStackMap() {
     } ptr;
     const int8_t* start_ptr = ptr.i8 = (const int8_t*)stackmap_address;
 
+    // This parses version 3 of the stack map format, see llvm/docs/StackMaps.rst
     cur_map->header = *ptr.u32++; // header
+    RELEASE_ASSERT((cur_map->header & 0xff) == 3, "unsupported stackmap version %d", cur_map->header & 0xff);
 
-#if LLVMREV < 200481
-    int nfunctions = 0;
-#else
     int nfunctions = *ptr.u32++;
-#endif
     int nconstants = *ptr.u32++;
     int nrecords = *ptr.u32++;
 
@@ -72,7 +70,10 @@ std::unique_ptr<StackMap> parseStackMap() {
         printf("%d functions\n", nfunctions);
     cur_map->stack_size_records.reserve(nfunctions);
     for (int i = 0; i < nfunctions; i++) {
-        const StackMap::StackSizeRecord& size_record = *ptr.size_record++;
+        StackMap::StackSizeRecord size_record;
+        size_record.offset = *ptr.u64++;
+        size_record.stack_size = *ptr.u64++;
+        ptr.u64++; // record count
         cur_map->stack_size_records.push_back(size_record);
         if (VERBOSITY() >= 3)
             printf("function %d: offset 0x%lx, stack size 0x%lx\n", i, size_record.offset, size_record.stack_size);
@@ -107,8 +108,16 @@ std::unique_ptr<StackMap> parseStackMap() {
         if (VERBOSITY() >= 3)
             printf("Stackmap record %ld at 0x%x has %d locations:\n", record->id, record->offset, numlocations);
         for (int j = 0; j < numlocations; j++) {
-            assert(sizeof(StackMap::Record::Location) == sizeof(*ptr.u64));
-            const StackMap::Record::Location& r = *ptr.record_loc++;
+            StackMap::Record::Location r;
+            r.type = (StackMap::Record::Location::LocationType)*ptr.u8++;
+            ptr.u8++; // reserved
+            int size = *ptr.u16++;
+            r.regnum = *ptr.u16++;
+            ptr.u16++; // reserved
+            r.offset = *ptr.i32++;
+            // Pyston's Location keeps the size in what used to be the flags byte.
+            assert(size < 256);
+            r.flags = size;
             record->locations.push_back(r);
 
             // from http://lxr.free-electrons.com/source/tools/perf/arch/x86/util/dwarf-regs.c
@@ -127,6 +136,10 @@ std::unique_ptr<StackMap> parseStackMap() {
             }
         }
 
+        // pad to 8-byte boundary
+        if ((ptr.i8 - start_ptr) % 8)
+            ptr.u32++;
+
         ptr.u16++; // padding
         int num_live_outs = *ptr.u16++;
         record->live_outs.reserve(num_live_outs);
@@ -138,8 +151,9 @@ std::unique_ptr<StackMap> parseStackMap() {
                 printf("Live out %d: reg #%d (?), size %d\n", i, r.regnum, r.size);
             }
         }
-        if (num_live_outs % 2 == 0)
-            ptr.u32++; // pad to 8-byte boundary
+        // pad to 8-byte boundary
+        if ((ptr.i8 - start_ptr) % 8)
+            ptr.u32++;
     }
 
     stackmap_address = 0;
@@ -147,9 +161,20 @@ std::unique_ptr<StackMap> parseStackMap() {
 }
 
 class StackmapJITEventListener : public llvm::JITEventListener {
-private:
 public:
-    virtual void NotifyObjectEmitted(const llvm::object::ObjectFile&, const llvm::RuntimeDyld::LoadedObjectInfo& L);
+    void notifyObjectLoaded(ObjectKey key, const llvm::object::ObjectFile& Obj,
+                            const llvm::RuntimeDyld::LoadedObjectInfo& L) override {
+        for (const auto& sec : Obj.sections()) {
+            llvm::Expected<llvm::StringRef> name = sec.getName();
+            RELEASE_ASSERT(name, "");
+
+            if (*name == ".llvm_stackmaps") {
+                assert(stackmap_address == 0);
+                stackmap_address = L.getSectionLoadAddress(sec);
+                assert(stackmap_address > 0);
+            }
+        }
+    }
 };
 
 // LLVM will silently not register the eh frames with libgcc if these functions don't exist;
@@ -161,25 +186,6 @@ extern "C" void __deregister_frame(void*);
 extern void _force_link() {
     __register_frame(nullptr);
     __deregister_frame(nullptr);
-}
-
-void StackmapJITEventListener::NotifyObjectEmitted(const llvm::object::ObjectFile& Obj,
-                                                   const llvm::RuntimeDyld::LoadedObjectInfo& L) {
-    // llvm::outs() << "An object has been emitted:\n";
-
-    llvm_error_code code;
-
-    for (const auto& sec : Obj.sections()) {
-        llvm::StringRef name;
-        code = sec.getName(name);
-        assert(!code);
-
-        if (name == ".llvm_stackmaps") {
-            assert(stackmap_address == 0);
-            stackmap_address = L.getSectionLoadAddress(name);
-            assert(stackmap_address > 0);
-        }
-    }
 }
 
 llvm::JITEventListener* makeStackMapListener() {

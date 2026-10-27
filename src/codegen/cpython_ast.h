@@ -18,6 +18,64 @@
 #include "Python.h"
 #include "Python-ast.h"
 
+// Python-ast.h defines a function-like macro for every AST constructor (Str,
+// Tuple, ...), which breaks LLVM headers that use the same names.  We only read
+// CPython ASTs, so drop them; the _Py_ prefixed functions are still available.
+#undef Module
+#undef Interactive
+#undef Expression
+#undef Suite
+#undef FunctionDef
+#undef ClassDef
+#undef Return
+#undef Delete
+#undef Assign
+#undef AugAssign
+#undef Print
+#undef For
+#undef While
+#undef If
+#undef With
+#undef Raise
+#undef TryExcept
+#undef TryFinally
+#undef Assert
+#undef Import
+#undef ImportFrom
+#undef Exec
+#undef Global
+#undef Expr
+#undef Pass
+#undef Break
+#undef Continue
+#undef BoolOp
+#undef BinOp
+#undef UnaryOp
+#undef Lambda
+#undef IfExp
+#undef Dict
+#undef Set
+#undef ListComp
+#undef SetComp
+#undef DictComp
+#undef GeneratorExp
+#undef Yield
+#undef Compare
+#undef Call
+#undef Repr
+#undef Num
+#undef Str
+#undef Attribute
+#undef Subscript
+#undef Name
+#undef List
+#undef Tuple
+#undef Ellipsis
+#undef Slice
+#undef ExtSlice
+#undef Index
+#undef ExceptHandler
+
 #include "core/ast.h"
 
 namespace pyston {

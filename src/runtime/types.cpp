@@ -478,7 +478,7 @@ std::string BoxedModule::name() {
         return "?";
     } else {
         BoxedString* sname = static_cast<BoxedString*>(name);
-        return sname->s();
+        return sname->s().str();
     }
 }
 

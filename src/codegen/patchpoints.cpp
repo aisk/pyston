@@ -210,7 +210,7 @@ void processStackmap(CompiledFunction* cf, StackMap* stackmap) {
     int nrecords = stackmap ? stackmap->records.size() : 0;
 
     assert(cf->location_map == NULL);
-    cf->location_map = llvm::make_unique<LocationMap>();
+    cf->location_map = std::make_unique<LocationMap>();
     if (stackmap)
         cf->location_map->constants = stackmap->constants;
 

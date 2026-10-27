@@ -180,7 +180,7 @@ private:
             assert(num_bytes_used % alignment == 0);
             assert(numBytesFree() >= num_bytes);
             void* ptr = &data[num_bytes_used];
-            num_bytes_used += llvm::RoundUpToAlignment(num_bytes, alignment);
+            num_bytes_used += llvm::alignTo(num_bytes, alignment);
             return ptr;
         }
     };
@@ -198,7 +198,7 @@ public:
 
     void* allocate(int num_bytes) {
         if (slabs.empty() || slabs.back()->numBytesFree() < num_bytes)
-            slabs.emplace_back(llvm::make_unique<ASTAllocatorSlab<slab_size>>());
+            slabs.emplace_back(std::make_unique<ASTAllocatorSlab<slab_size>>());
         return slabs.back()->alloc(num_bytes);
     }
 };
@@ -246,7 +246,7 @@ template <int slab_size, int alignment> ASTAllocator::ASTAllocatorSlab<slab_size
         AST* node = (AST*)&data[current_pos];
         int node_size = node->getSize();
         node->~AST();
-        current_pos += llvm::RoundUpToAlignment(node_size, alignment);
+        current_pos += llvm::alignTo(node_size, alignment);
     }
 }
 

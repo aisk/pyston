@@ -26,7 +26,9 @@ class ExecutionEngine;
 class JITEventListener;
 class LLVMContext;
 class Module;
+class StructType;
 class TargetMachine;
+class Type;
 }
 
 namespace pyston {
@@ -57,6 +59,8 @@ public:
 llvm::JITEventListener* makeRegistryListener();
 llvm::JITEventListener* makeTracebacksListener();
 
+llvm::LLVMContext& getGlobalLLVMContext();
+
 struct GlobalState {
     // Much of this section is not thread-safe:
     llvm::LLVMContext& context;
@@ -70,14 +74,16 @@ struct GlobalState {
     std::vector<llvm::JITEventListener*> jit_listeners;
 
     FunctionAddressRegistry func_addr_registry;
-    llvm::Type* llvm_value_type, *llvm_value_type_ptr, *llvm_value_type_ptr_ptr;
-    llvm::Type* llvm_class_type, *llvm_class_type_ptr;
-    llvm::Type* llvm_opaque_type;
+    // LLVM pointers are opaque, so all of the *_ptr types are the same "ptr" type.  They are kept
+    // separate to document what the values point to.
+    llvm::Type* llvm_value_type_ptr, *llvm_value_type_ptr_ptr;
+    llvm::Type* llvm_class_type_ptr;
     llvm::Type* llvm_boxedstring_type_ptr, *llvm_dict_type_ptr;
-    llvm::Type* llvm_frame_info_type;
     llvm::Type* llvm_code_type_ptr, *llvm_closure_type_ptr, *llvm_generator_type_ptr;
     llvm::Type* llvm_module_type_ptr, *llvm_bool_type_ptr;
-    llvm::Type* llvm_excinfo_type;
+    // Struct types that mirror the C++ layout of FrameInfo and ExcInfo, checked in initGlobalFuncs.
+    llvm::StructType* llvm_frame_info_type;
+    llvm::StructType* llvm_excinfo_type;
     llvm::Type* i1, *i8, *i8_ptr, *i32, *i64, *void_, *double_;
     llvm::Type* vector_ptr;
 

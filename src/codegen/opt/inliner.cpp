@@ -14,22 +14,20 @@
 
 #include "codegen/opt/inliner.h"
 
+#include <unordered_map>
+
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/InlineCost.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
-#include "llvm/IR/CallSite.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
-#if LLVMREV < 229094
-#include "llvm/PassManager.h"
-#else
-#include "llvm/IR/LegacyPassManager.h"
-#endif
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IPO.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
@@ -43,317 +41,209 @@
 
 namespace pyston {
 
+// The functions we inline come from the stdlib module, so after inlining their bodies refer to functions and
+// globals of that module.  This replaces those references with declarations in the module being compiled.
 class MyMaterializer : public llvm::ValueMaterializer {
 private:
     llvm::Module* new_module;
 
 public:
     MyMaterializer(llvm::Module* new_module) : new_module(new_module) {}
-    virtual llvm::Value* materializeValueFor(llvm::Value* v) {
-        // llvm::errs() << "materializing\n";
-        // v->dump();
+    virtual ~MyMaterializer() {}
 
-        llvm::Value* r = NULL;
+    llvm::Value* materialize(llvm::Value* v) override {
         if (llvm::Function* f = llvm::dyn_cast<llvm::Function>(v)) {
-            // llvm::errs() << "is function\n";
-            r = new_module->getOrInsertFunction(f->getName(), f->getFunctionType());
+            if (f->getParent() == new_module)
+                return nullptr;
+            return new_module->getOrInsertFunction(f->getName(), f->getFunctionType()).getCallee();
         } else if (llvm::GlobalVariable* gv = llvm::dyn_cast<llvm::GlobalVariable>(v)) {
-            // llvm::errs() << " is gv\n";
+            if (gv->getParent() == new_module)
+                return nullptr;
             assert(gv->getLinkage() != llvm::GlobalVariable::PrivateLinkage);
-            llvm::GlobalVariable* new_gv = llvm::cast<llvm::GlobalVariable>(
-                new_module->getOrInsertGlobal(gv->getName(), gv->getType()->getElementType()));
+            llvm::GlobalVariable* new_gv
+                = llvm::cast<llvm::GlobalVariable>(new_module->getOrInsertGlobal(gv->getName(), gv->getValueType()));
             RELEASE_ASSERT(!gv->isThreadLocal(), "I don't think MCJIT supports thread-local variables yet");
             new_gv->setThreadLocalMode(gv->getThreadLocalMode());
-            r = new_gv;
+            return new_gv;
         } else if (llvm::GlobalAlias* alias = llvm::dyn_cast<llvm::GlobalAlias>(v)) {
-#if LLVMREV < 209040
-            llvm::Value* addressee = llvm::cast<llvm::Constant>(materializeValueFor(alias->getAliasedGlobal()));
-#else
-            llvm::Value* addressee = llvm::cast<llvm::Constant>(materializeValueFor(alias->getAliasee()));
-#endif
+            if (alias->getParent() == new_module)
+                return nullptr;
+            llvm::Value* addressee = materialize(alias->getAliasee());
             assert(addressee);
-            assert(alias->getType() == addressee->getType());
-            r = addressee;
-            // r = new llvm::GlobalAlias(alias->getType(), alias->getLinkage(), alias->getName(), addressee,
-            // new_module);
-        } else if (llvm::isa<llvm::Constant>(v)) {
-            // llvm::errs() << " is a constant\n";
-            r = NULL;
+            return addressee;
+        }
+        return nullptr;
+    }
+};
+
+static bool prepareInlining(llvm::CallBase* CS) {
+    if (llvm::isa<llvm::IntrinsicInst>(CS))
+        return false;
+
+    llvm::Value* v = CS->getCalledOperand();
+    llvm::ConstantExpr* ce = llvm::dyn_cast<llvm::ConstantExpr>(v);
+    if (!ce)
+        return false;
+
+    assert(ce->isCast());
+    llvm::ConstantInt* l_addr = llvm::cast<llvm::ConstantInt>(ce->getOperand(0));
+    int64_t addr = l_addr->getSExtValue();
+
+    if (addr == (int64_t)printf)
+        return false;
+    llvm::Function* f = g.func_addr_registry.getLLVMFuncAtAddress((void*)addr);
+    if (f == NULL) {
+        if (VERBOSITY() >= 3) {
+            printf("Giving up on inlining %s:\n", g.func_addr_registry.getFuncNameAtAddress((void*)addr, true).c_str());
+            CS->dump();
+        }
+        return false;
+    }
+
+    // We load the bitcode lazily, so check if we haven't yet fully loaded the function:
+    if (f->isMaterializable()) {
+        llvm::Error err = f->materialize();
+        RELEASE_ASSERT(!err, "");
+
+        // The stdlib is compiled for the generic target, while the functions we generate don't specify one.
+        // Drop the target attributes so that the inline cost analysis considers them compatible.
+        f->removeFnAttr("target-cpu");
+        f->removeFnAttr("target-features");
+        f->removeFnAttr("tune-cpu");
+    }
+
+    // It could still be a declaration, though I think the code won't generate this case any more:
+    if (f->isDeclaration())
+        return false;
+
+    if (CS->getFunctionType() != f->getFunctionType())
+        return false;
+
+    if (f->getName() == "allowGLReadPreemption")
+        return false;
+
+    assert(!f->isDeclaration());
+    CS->setCalledFunction(f);
+    return true;
+}
+
+static bool _inlineRuntimeCalls(llvm::Function& f, int threshold) {
+    Timer _t2("(sum)");
+    Timer _t("collecting calls");
+
+    llvm::Module* cur_module = f.getParent();
+
+    // Calls whose callee we pointed at the stdlib function but then decided not to inline.  They have to be pointed
+    // back at the original address, since the stdlib module is not part of the JIT.
+    std::vector<std::pair<llvm::CallBase*, llvm::Value*>> calls;
+    for (llvm::inst_iterator I = llvm::inst_begin(f), E = llvm::inst_end(f); I != E; ++I) {
+        if (auto* call = llvm::dyn_cast<llvm::CallBase>(&(*I))) {
+            llvm::Value* orig_callee = call->getCalledOperand();
+            if (prepareInlining(call))
+                calls.push_back(std::make_pair(call, orig_callee));
+        }
+    }
+
+    std::unordered_map<llvm::Function*, std::unique_ptr<llvm::AssumptionCache>> assumption_caches;
+    auto get_assumption_cache = [&](llvm::Function& func) -> llvm::AssumptionCache& {
+        auto& ac = assumption_caches[&func];
+        if (!ac)
+            ac.reset(new llvm::AssumptionCache(func));
+        return *ac;
+    };
+    llvm::TargetLibraryInfoImpl tlii(g.tm->getTargetTriple());
+    std::unordered_map<llvm::Function*, std::unique_ptr<llvm::TargetLibraryInfo>> tlis;
+    auto get_tli = [&](llvm::Function& func) -> const llvm::TargetLibraryInfo& {
+        auto& tli = tlis[&func];
+        if (!tli)
+            tli.reset(new llvm::TargetLibraryInfo(tlii, &func));
+        return *tli;
+    };
+
+    bool did_any_inlining = false;
+
+    _t.split("doing inlining");
+    while (calls.size()) {
+        llvm::CallBase* cs = calls.back().first;
+        llvm::Value* orig_callee = calls.back().second;
+        calls.pop_back();
+
+        llvm::Function* callee = cs->getCalledFunction();
+        llvm::TargetTransformInfo tti = g.tm->getTargetTransformInfo(*callee);
+        llvm::InlineCost IC = llvm::getInlineCost(*cs, llvm::getInlineParams(threshold), tti, get_assumption_cache,
+                                                  get_tli);
+        bool do_inline = (bool)IC;
+
+        if (VERBOSITY("irgen.inlining") >= 2) {
+            if (!do_inline)
+                llvm::outs() << "not ";
+            llvm::outs() << "inlining ";
+            cs->dump();
+        }
+
+        bool inlined = false;
+        if (do_inline) {
+            static StatCounter num_inlines("num_inlines");
+            num_inlines.log();
+
+            llvm::InlineFunctionInfo InlineInfo;
+            inlined = llvm::InlineFunction(*cs, InlineInfo).isSuccess();
+            did_any_inlining = did_any_inlining || inlined;
+        }
+
+        if (!inlined)
+            cs->setCalledOperand(orig_callee);
+    }
+
+    if (!did_any_inlining)
+        return false;
+
+    _t.split("remapping");
+
+    llvm::ValueToValueMapTy VMap;
+    MyMaterializer materializer(cur_module);
+    for (llvm::inst_iterator I = llvm::inst_begin(f), E = llvm::inst_end(f); I != E; ++I) {
+        RemapInstruction(&(*I), VMap, llvm::RF_IgnoreMissingLocals | llvm::RF_NoModuleLevelChanges, NULL,
+                         &materializer);
+    }
+
+    _t.split("cleaning up");
+
+    std::vector<llvm::GlobalValue*> to_remove;
+    for (llvm::GlobalVariable& gv : cur_module->globals()) {
+        if (gv.use_empty())
+            to_remove.push_back(&gv);
+    }
+
+    for (int i = 0; i < to_remove.size(); i++) {
+        to_remove[i]->eraseFromParent();
+    }
+
+    for (llvm::Module::iterator I = cur_module->begin(), E = cur_module->end(); I != E;) {
+        if (!I->isDeclaration()) {
+            ++I;
+            continue;
+        }
+
+        if (I->use_empty()) {
+            I = cur_module->getFunctionList().erase(I);
         } else {
-            r = v;
-        }
-
-        // if (r)
-        // r->dump();
-        // llvm::errs() << "---\n";
-        return r;
-    }
-};
-
-class MyInliningPass : public llvm::FunctionPass {
-public:
-    static char ID;
-    static bool initialized;
-    static llvm::Module* fake_module;
-
-    int threshold;
-    MyInliningPass(int threshold = 275) : FunctionPass(ID), threshold(threshold) {}
-
-    static void initialize() {
-        if (!initialized) {
-            llvm::initializeInlineCostAnalysisPass(*llvm::PassRegistry::getPassRegistry());
-            llvm::initializeSimpleInlinerPass(*llvm::PassRegistry::getPassRegistry());
-#if LLVMREV < 227669
-            llvm::initializeTargetTransformInfoAnalysisGroup(*llvm::PassRegistry::getPassRegistry());
-#else
-            llvm::initializeTargetTransformInfoWrapperPassPass(*llvm::PassRegistry::getPassRegistry());
-#endif
-            fake_module = new llvm::Module("fake", g.context);
-
-            initialized = true;
+            ++I;
         }
     }
 
-    virtual const char* getPassName() const { return "Pyston inlining pass"; }
+    return did_any_inlining;
+}
 
-    bool prepareInlining(llvm::CallSite CS) {
-        if (llvm::isa<llvm::IntrinsicInst>(CS.getInstruction()))
-            return false;
+bool inlineRuntimeCalls(llvm::Function& f, int threshold) {
+    Timer _t("inlining");
 
-        llvm::Value* v = CS.getCalledValue();
-        llvm::ConstantExpr* ce = llvm::dyn_cast<llvm::ConstantExpr>(v);
-        if (!ce)
-            return false;
+    bool rtn = _inlineRuntimeCalls(f, threshold);
 
-        assert(ce->isCast());
-        llvm::ConstantInt* l_addr = llvm::cast<llvm::ConstantInt>(ce->getOperand(0));
-        int64_t addr = l_addr->getSExtValue();
+    static StatCounter us_inlining("us_compiling_optimizing_inlining");
+    long us = _t.end();
+    us_inlining.log(us);
 
-        if (addr == (int64_t)printf)
-            return false;
-        llvm::Function* f = g.func_addr_registry.getLLVMFuncAtAddress((void*)addr);
-        if (f == NULL) {
-            if (VERBOSITY() >= 3) {
-                printf("Giving up on inlining %s:\n",
-                       g.func_addr_registry.getFuncNameAtAddress((void*)addr, true).c_str());
-                CS->dump();
-            }
-            return false;
-        }
-
-        // We load the bitcode lazily, so check if we haven't yet fully loaded the function:
-        if (f->isMaterializable()) {
-#if LLVMREV < 220600
-            f->Materialize();
-#else
-            f->materialize();
-#endif
-        }
-
-        // It could still be a declaration, though I think the code won't generate this case any more:
-        if (f->isDeclaration())
-            return false;
-
-        // Keep this section as a release_assert since the code-to-be-inlined, as well as the inlining
-        // decisions, can be different in release mode:
-        int op_idx = -1;
-        for (llvm::Argument& arg : f->args()) {
-            ++op_idx;
-            llvm::Type* op_type = CS->getOperand(op_idx)->getType();
-            if (arg.getType() != op_type) {
-                llvm::errs() << f->getName() << " has arg " << op_idx << " mismatched!\n";
-                llvm::errs() << "Given ";
-                op_type->dump();
-                llvm::errs() << " but underlying function expected ";
-                arg.getType()->dump();
-                llvm::errs() << '\n';
-            }
-            RELEASE_ASSERT(arg.getType() == CS->getOperand(op_idx)->getType(), "");
-        }
-
-        if (f->getName() == "allowGLReadPreemption")
-            return false;
-
-        assert(!f->isDeclaration());
-        CS.setCalledFunction(f);
-        return true;
-    }
-
-    bool _runOnFunction(llvm::Function& f) {
-        Timer _t2("(sum)");
-        Timer _t("initializing");
-        initialize();
-        _t.split("overhead");
-
-        // f.dump();
-
-        llvm::Module* cur_module = f.getParent();
-
-#if LLVMREV < 217548
-        llvm::PassManager fake_pm;
-#else
-        llvm::legacy::PassManager fake_pm;
-#endif
-        llvm::InlineCostAnalysis* cost_analysis = new llvm::InlineCostAnalysis();
-        fake_pm.add(cost_analysis);
-        // llvm::errs() << "doing fake run\n";
-        fake_pm.run(*fake_module);
-        // llvm::errs() << "done with fake run\n";
-
-        bool did_any_inlining = false;
-
-        // TODO I haven't gotten the callgraph-updating part of the inliner to work,
-        // so it's not easy to tell what callsites have been inlined into (ie added to)
-        // the function.
-        // One simple-but-not-great way to handle it is to just iterate over the entire function
-        // multiple times and re-inline things until we don't want to inline any more;
-        // NPASSES controls the maximum number of times to attempt that.
-        // Right now we actually don't need that, since we only inline fully-optimized
-        // functions (from the stdlib), and those will already have had inlining
-        // applied recursively.
-        const int NPASSES = 1;
-        for (int passnum = 0; passnum < NPASSES; passnum++) {
-            _t.split("collecting calls");
-
-            std::vector<llvm::CallSite> calls;
-            for (llvm::inst_iterator I = llvm::inst_begin(f), E = llvm::inst_end(f); I != E; ++I) {
-                if (auto* call = llvm::dyn_cast<llvm::CallInst>(&(*I))) {
-                    llvm::CallSite CS(call);
-                    if (prepareInlining(CS))
-                        calls.push_back(CS);
-                } else if (auto* call = llvm::dyn_cast<llvm::InvokeInst>(&(*I))) {
-                    llvm::CallSite CS(call);
-                    if (prepareInlining(CS))
-                        calls.push_back(CS);
-                }
-            }
-
-            // assert(0 && "TODO");
-            // printf("%ld\n", calls.size());
-
-            bool did_inline = false;
-            _t.split("doing inlining");
-            while (calls.size()) {
-                llvm::CallSite cs = calls.back();
-                calls.pop_back();
-
-                // if (VERBOSITY("irgen.inlining") >= 1) {
-                // llvm::errs() << "Evaluating callsite ";
-                // cs->dump();
-                //}
-                llvm::InlineCost IC = cost_analysis->getInlineCost(cs, threshold);
-                bool do_inline = false;
-                if (IC.isAlways()) {
-                    // if (VERBOSITY("irgen.inlining") >= 2)
-                    // llvm::errs() << "always inline\n";
-                    do_inline = true;
-                } else if (IC.isNever()) {
-                    // if (VERBOSITY("irgen.inlining") >= 2)
-                    // llvm::errs() << "never inline\n";
-                    do_inline = false;
-                } else {
-                    // if (VERBOSITY("irgen.inlining") >= 2)
-                    // llvm::errs() << "Inline cost: " << IC.getCost() << '\n';
-                    do_inline = (bool)IC;
-                }
-
-                if (VERBOSITY("irgen.inlining") >= 2) {
-                    if (!do_inline)
-                        llvm::outs() << "not ";
-                    llvm::outs() << "inlining ";
-                    cs->dump();
-                }
-
-                if (do_inline) {
-                    static StatCounter num_inlines("num_inlines");
-                    num_inlines.log();
-
-                    // llvm::CallGraph cg(*f.getParent());
-                    ////cg.addToCallGraph(cs->getCalledFunction());
-                    // llvm::InlineFunctionInfo InlineInfo(&cg);
-
-                    llvm::InlineFunctionInfo InlineInfo;
-                    bool inlined = llvm::InlineFunction(cs, InlineInfo, false);
-                    did_inline = did_inline || inlined;
-                    did_any_inlining = did_any_inlining || inlined;
-
-                    // if (inlined)
-                    // f.dump();
-                }
-            }
-
-            if (!did_inline) {
-                if (passnum >= NPASSES - 1 && VERBOSITY("irgen.inlining"))
-                    printf("quitting after %d passes\n", passnum + 1);
-                break;
-            }
-        }
-
-        // TODO would be nice to break out here and not have to rematerialize the function;
-        // I think I have to do that even if no inlining happened from the "setCalledFunction" call above.
-        // I thought that'd just change the CS object, but maybe it changes the underlying instruction as well?
-        // if (!did_any_inlining)
-        // return false;
-
-        _t.split("remapping");
-
-        llvm::ValueToValueMapTy VMap;
-        for (llvm::Function::iterator I = f.begin(), E = f.end(); I != E; ++I) {
-            VMap[I] = I;
-        }
-        MyMaterializer materializer(cur_module);
-        for (llvm::inst_iterator I = llvm::inst_begin(f), E = llvm::inst_end(f); I != E; ++I) {
-            RemapInstruction(&(*I), VMap, llvm::RF_None, NULL, &materializer);
-        }
-
-        _t.split("cleaning up");
-
-        std::vector<llvm::GlobalValue*> to_remove;
-        for (llvm::Module::global_iterator I = cur_module->global_begin(), E = cur_module->global_end(); I != E; ++I) {
-            if (I->use_empty()) {
-                to_remove.push_back(I);
-                continue;
-            }
-        }
-
-        for (int i = 0; i < to_remove.size(); i++) {
-            to_remove[i]->eraseFromParent();
-        }
-
-        for (llvm::Module::iterator I = cur_module->begin(), E = cur_module->end(); I != E;) {
-            if (!I->isDeclaration()) {
-                ++I;
-                continue;
-            }
-
-            if (I->use_empty()) {
-                I = cur_module->getFunctionList().erase(I);
-            } else {
-                ++I;
-            }
-        }
-
-        return did_any_inlining;
-    }
-
-    virtual bool runOnFunction(llvm::Function& f) {
-        Timer _t("inlining");
-
-        bool rtn = _runOnFunction(f);
-
-        static StatCounter us_inlining("us_compiling_optimizing_inlining");
-        long us = _t.end();
-        us_inlining.log(us);
-
-        return rtn;
-    }
-};
-char MyInliningPass::ID = 0;
-bool MyInliningPass::initialized = false;
-llvm::Module* MyInliningPass::fake_module = 0;
-static llvm::RegisterPass<MyInliningPass> X("myinliner", "Function-level inliner", false, false);
-
-llvm::FunctionPass* makeFPInliner(int threshold) {
-    return new MyInliningPass(threshold);
+    return rtn;
 }
 }

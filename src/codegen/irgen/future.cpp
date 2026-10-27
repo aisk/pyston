@@ -92,7 +92,7 @@ FutureFlags getFutureFlags(llvm::ArrayRef<AST_stmt*> body, const char* file) {
 
                 for (AST_alias* alias : static_cast<AST_ImportFrom*>(stmt)->names) {
                     auto option_name = alias->name;
-                    auto iter = future_options.find(option_name.s());
+                    auto iter = future_options.find(option_name.s().str());
                     if (iter == future_options.end()) {
                         // If it's not one of the available options, throw an error.
                         // Note: the __future__ module also exposes "all_feature_names",

@@ -84,11 +84,11 @@ public:
 #endif // #else DISABLE_TIMERS
 
 inline bool startswith(llvm::StringRef s, llvm::StringRef pattern) {
-    return s.startswith(pattern);
+    return s.starts_with(pattern);
 }
 
 inline bool endswith(llvm::StringRef s, llvm::StringRef pattern) {
-    return s.endswith(pattern);
+    return s.ends_with(pattern);
 }
 
 void removeDirectoryIfExists(const std::string& path);

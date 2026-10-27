@@ -11,9 +11,6 @@ DEPS_DIR := $(HOME)/pyston_deps
 SRC_DIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR := $(SRC_DIR)/build
 
-LLVM_REVISION_FILE := llvm_revision.txt
-LLVM_REVISION := $(shell cat $(LLVM_REVISION_FILE))
-
 USE_CLANG  := 1
 USE_CCACHE := 1
 USE_DISTCC := 0
@@ -104,11 +101,6 @@ ifneq ($(ENABLE_INTEL_JIT_EVENTS),0)
 LLVM_LINK_LIBS += inteljitevents
 endif
 
-NEED_OLD_JIT := $(shell if [ $(LLVM_REVISION) -le 216982 ]; then echo 1; else echo 0; fi )
-ifeq ($(NEED_OLD_JIT),1)
-	LLVM_LINK_LIBS += jit
-endif
-
 ifneq ($(wildcard /usr/local/include/llvm),)
 # Global include files can screw up the build, since if llvm moves a header file,
 # the compiler will silently fall back to the global one that still exists.
@@ -144,7 +136,7 @@ else
 	CMAKE_VALGRIND := -DENABLE_VALGRIND=ON -DVALGRIND_DIR=$(DEPS_DIR)/valgrind-3.10.0-install/
 endif
 
-COMMON_CXXFLAGS += -DGITREV=$(shell git rev-parse HEAD | head -c 12) -DLLVMREV=$(LLVM_REVISION)
+COMMON_CXXFLAGS += -DGITREV=$(shell git rev-parse HEAD | head -c 12)
 
 # Use our "custom linker" that calls gold if available
 COMMON_LDFLAGS := -B$(TOOLS_DIR)/build_system -L/usr/local/lib -lpthread -lm -lunwind -llzma -L$(DEPS_DIR)/gcc-4.8.2-install/lib64 -lreadline -lgmp -lssl -lcrypto -lsqlite3
@@ -473,10 +465,6 @@ Makefile.local:
 	echo "Creating default Makefile.local"
 	(which ninja-build >/dev/null && echo "NINJA := ninja-build" >> Makefile.local); true
 	touch Makefile.local
-
-llvm_up:
-	$(CPYTHON) $(TOOLS_DIR)/git_svn_gotorev.py $(LLVM_SRC) $(LLVM_REVISION) ./llvm_patches
-	$(CPYTHON) $(TOOLS_DIR)/git_svn_gotorev.py $(LLVM_SRC)/tools/clang $(LLVM_REVISION) ./clang_patches
 
 ## TOOLS:
 
@@ -1063,7 +1051,7 @@ superlint: plugins/clang_linter.so
 .PHONY: lint_%
 lint_%: %.cpp plugins/clang_linter.so
 	$(ECHO) Linting $<
-	$(VERB) $(CLANG_CXX) -Xclang -load -Xclang plugins/clang_linter.so -Xclang -plugin -Xclang pyston-linter src/runtime/float.cpp $< -c -Isrc/ -Ifrom_cpython/Include -Ibuild/Debug/from_cpython/Include $(shell $(LLVM_BIN_DBG)/llvm-config --cxxflags) $(COMMON_CXXFLAGS) -no-pedantic -Wno-unused-variable -DNVALGRIND -Wno-invalid-offsetof -Wno-mismatched-tags -Wno-unused-function -Wno-unused-private-field -Wno-sign-compare -DLLVMREV=$(LLVM_REVISION) -Ibuild_deps/lz4/lib -DBINARY_SUFFIX= -DBINARY_STRIPPED_SUFFIX=_stripped -Ibuild/Debug/libunwind/include -Wno-extern-c-compat -Wno-unused-local-typedef -Wno-inconsistent-missing-override
+	$(VERB) $(CLANG_CXX) -Xclang -load -Xclang plugins/clang_linter.so -Xclang -plugin -Xclang pyston-linter src/runtime/float.cpp $< -c -Isrc/ -Ifrom_cpython/Include -Ibuild/Debug/from_cpython/Include $(shell $(LLVM_BIN_DBG)/llvm-config --cxxflags) $(COMMON_CXXFLAGS) -no-pedantic -Wno-unused-variable -DNVALGRIND -Wno-invalid-offsetof -Wno-mismatched-tags -Wno-unused-function -Wno-unused-private-field -Wno-sign-compare -Ibuild_deps/lz4/lib -DBINARY_SUFFIX= -DBINARY_STRIPPED_SUFFIX=_stripped -Ibuild/Debug/libunwind/include -Wno-extern-c-compat -Wno-unused-local-typedef -Wno-inconsistent-missing-override
 
 REFCOUNT_CHECKER_BUILD_PATH := $(CMAKE_DIR_DBG)/plugins/refcount_checker/llvm/bin/refcount_checker
 REFCOUNT_CHECKER_RUN_PATH := $(CMAKE_DIR_DBG)/llvm/bin/refcount_checker

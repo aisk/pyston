@@ -192,7 +192,7 @@ public:
 #endif
 
     llvm::ArrayRef<InternedString> getVRegSymUserVisibleMap() const {
-        return llvm::makeArrayRef(vreg_sym_map).slice(0, num_vregs_user_visible);
+        return llvm::ArrayRef(vreg_sym_map).slice(0, num_vregs_user_visible);
     }
 
     // Not all vregs correspond to a name; many are our compiler-generated variables.

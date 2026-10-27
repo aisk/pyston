@@ -20,21 +20,20 @@
 #include <openssl/evp.h>
 #include <unordered_map>
 
-#include "llvm/Analysis/Passes.h"
-#include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/JITEventListener.h"
 #include "llvm/ExecutionEngine/MCJIT.h"
+#include "llvm/ExecutionEngine/RTDyldMemoryManager.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Host.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/TargetSelect.h"
-#include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
 #include "codegen/codegen.h"
@@ -101,21 +100,15 @@ static llvm::Module* loadStdlib() {
         data = llvm::StringRef(STRIPPED_STDLIB_BC_START, size);
     }
 
-#if LLVMREV < 216583
-    llvm::MemoryBuffer* buffer = llvm::MemoryBuffer::getMemBuffer(data, "", false);
-#else
-    std::unique_ptr<llvm::MemoryBuffer> buffer = llvm::MemoryBuffer::getMemBuffer(data, "", false);
-#endif
-
-    // llvm::ErrorOr<llvm::Module*> m_or = llvm::parseBitcodeFile(buffer, g.context);
-    llvm::ErrorOr<llvm::Module*> m_or = llvm::getLazyBitcodeModule(std::move(buffer), g.context);
+    llvm::Expected<std::unique_ptr<llvm::Module>> m_or
+        = llvm::getLazyBitcodeModule(llvm::MemoryBufferRef(data, "stdlib"), g.context);
     RELEASE_ASSERT(m_or, "");
-    llvm::Module* m = m_or.get();
+    llvm::Module* m = m_or->release();
     assert(m);
 
-    for (llvm::Module::global_iterator I = m->global_begin(), E = m->global_end(); I != E; ++I) {
-        if (I->getLinkage() == llvm::GlobalVariable::PrivateLinkage)
-            I->setLinkage(llvm::GlobalVariable::ExternalLinkage);
+    for (llvm::GlobalVariable& gv : m->globals()) {
+        if (gv.getLinkage() == llvm::GlobalVariable::PrivateLinkage)
+            gv.setLinkage(llvm::GlobalVariable::ExternalLinkage);
     }
     m->setModuleIdentifier("  stdlib  ");
     return m;
@@ -125,7 +118,7 @@ class CompressedFile {
 public:
     static bool writeFile(llvm::StringRef file_name, llvm::StringRef data) {
         std::error_code error_code;
-        llvm::raw_fd_ostream file(file_name, error_code, llvm::sys::fs::F_RW);
+        llvm::raw_fd_ostream file(file_name, error_code, llvm::sys::fs::OF_None);
         if (error_code)
             return false;
 
@@ -244,11 +237,7 @@ PystonObjectCache::PystonObjectCache() {
     cleanupCacheDirectory();
 }
 
-#if LLVMREV < 216002
-void PystonObjectCache::notifyObjectCompiled(const llvm::Module* M, const llvm::MemoryBuffer* Obj)
-#else
 void PystonObjectCache::notifyObjectCompiled(const llvm::Module* M, llvm::MemoryBufferRef Obj)
-#endif
 {
     RELEASE_ASSERT(module_identifier == M->getModuleIdentifier(), "");
     RELEASE_ASSERT(!hash_before_codegen.empty(), "");
@@ -261,11 +250,7 @@ void PystonObjectCache::notifyObjectCompiled(const llvm::Module* M, llvm::Memory
     CompressedFile::writeFile(cache_file, Obj.getBuffer());
 }
 
-#if LLVMREV < 215566
-llvm::MemoryBuffer* PystonObjectCache::getObject(const llvm::Module* M)
-#else
 std::unique_ptr<llvm::MemoryBuffer> PystonObjectCache::getObject(const llvm::Module* M)
-#endif
 {
     static StatCounter jit_objectcache_hits("num_jit_objectcache_hits");
     static StatCounter jit_objectcache_misses("num_jit_objectcache_misses");
@@ -317,15 +302,15 @@ void PystonObjectCache::cleanupCacheDirectory() {
     // Find all files inside the cache directory, if the number of files is larger than
     // MAX_OBJECT_CACHE_ENTRIES,
     // sort them by last modification time and remove the oldest excessive ones.
-    typedef std::pair<std::string, llvm::sys::TimeValue> CacheFileEntry;
+    typedef std::pair<std::string, llvm::sys::TimePoint<>> CacheFileEntry;
     std::vector<CacheFileEntry> cache_files;
 
     std::error_code ec;
     for (llvm::sys::fs::directory_iterator file(cache_dir.str(), ec), end; !ec && file != end; file.increment(ec)) {
-        llvm::sys::fs::file_status status;
-        if (file->status(status))
+        llvm::ErrorOr<llvm::sys::fs::basic_file_status> status = file->status();
+        if (!status)
             continue; // ignore files where we can't retrieve the file status.
-        cache_files.emplace_back(std::make_pair(file->path(), status.getLastModificationTime()));
+        cache_files.emplace_back(std::make_pair(file->path(), status->getLastModificationTime()));
     }
 
     int num_expired = cache_files.size() - MAX_OBJECT_CACHE_ENTRIES;
@@ -341,7 +326,7 @@ void PystonObjectCache::cleanupCacheDirectory() {
 
 void PystonObjectCache::calculateModuleHash(const llvm::Module* M, EffortLevel effort) {
     HashOStream hash_stream;
-    llvm::WriteBitcodeToFile(M, hash_stream);
+    llvm::WriteBitcodeToFile(*M, hash_stream);
     hash_stream << (int)effort;
     hash_stream << USE_REGALLOC_BASIC;
     hash_before_codegen = hash_stream.getHash();
@@ -385,31 +370,24 @@ extern "C" void Py_Initialize() noexcept {
 
     g.stdlib_module = loadStdlib();
 
-#if LLVMREV < 215967
-    llvm::EngineBuilder eb(new llvm::Module("empty_initial_module", g.context));
-#else
     llvm::EngineBuilder eb(std::unique_ptr<llvm::Module>(new llvm::Module("empty_initial_module", g.context)));
-#endif
 
-#if LLVMREV < 216982
-    eb.setUseMCJIT(true);
-#endif
 
     eb.setEngineKind(llvm::EngineKind::JIT); // specify we only want the JIT, and not the interpreter fallback
-#if LLVMREV < 223183
-    eb.setMCJITMemoryManager(createMemoryManager().release());
-#else
     eb.setMCJITMemoryManager(createMemoryManager());
-#endif
     // eb.setOptLevel(llvm::CodeGenOpt::None); // -O0
     // eb.setOptLevel(llvm::CodeGenOpt::Less); // -O1
     // eb.setOptLevel(llvm::CodeGenOpt::Default); // -O2, -Os
     // eb.setOptLevel(llvm::CodeGenOpt::Aggressive); // -O3
 
+    // Frame pointers are requested per function, see doCompile().
     llvm::TargetOptions target_options;
-    target_options.NoFramePointerElim = true;
     // target_options.EnableFastISel = true;
     eb.setTargetOptions(target_options);
+
+    // The JIT'd code calls into the pyston binary and references its globals; it is not guaranteed to be placed
+    // within 2GB of those.
+    eb.setCodeModel(llvm::CodeModel::Large);
 
     // TODO enable this?  should let us get better code:
     // eb.setMCPU(llvm::sys::getHostCPUName());
@@ -426,7 +404,7 @@ extern "C" void Py_Initialize() noexcept {
 
     g.i1 = llvm::Type::getInt1Ty(g.context);
     g.i8 = llvm::Type::getInt8Ty(g.context);
-    g.i8_ptr = g.i8->getPointerTo();
+    g.i8_ptr = llvm::PointerType::getUnqual(g.context);
     g.i32 = llvm::Type::getInt32Ty(g.context);
     g.i64 = llvm::Type::getInt64Ty(g.context);
     g.void_ = llvm::Type::getVoidTy(g.context);
@@ -457,14 +435,8 @@ extern "C" void Py_Initialize() noexcept {
     g.engine->RegisterJITEventListener(tracebacks_listener);
 
     if (SHOW_DISASM) {
-#if LLVMREV < 216983
-        llvm::JITEventListener* listener = new DisassemblerJITEventListener();
-        g.jit_listeners.push_back(listener);
-        g.engine->RegisterJITEventListener(listener);
-#else
         fprintf(stderr, "The LLVM disassembler has been removed\n");
         abort();
-#endif
     }
 
     initGlobalFuncs(g);
@@ -494,7 +466,13 @@ extern "C" void Py_Initialize() noexcept {
     // so construct a fake argc/argv pair and pass it to the llvm command line machinery:
     std::vector<const char*> llvm_args = { "fake_name" };
 
-    llvm_args.push_back("--enable-patchpoint-liveness");
+    // We only use the C calling convention for patchpoints, and in that case the live outs that LLVM computes are
+    // ignored (see extractLiveOuts()).  Computing them also crashes on registers without a DWARF number, such as
+    // MXCSR, which LLVM now models as being used by SSE instructions.
+    llvm_args.push_back("--enable-patchpoint-liveness=false");
+    // The ICs address their scratch space relative to rsp and assume rsp sits at the bottom of the static frame,
+    // so stack arguments must not be pushed onto the stack around calls.
+    llvm_args.push_back("--no-x86-call-frame-opt");
     if (0) {
         // Enabling and debugging fast-isel:
         // llvm_args.push_back("--fast-isel");

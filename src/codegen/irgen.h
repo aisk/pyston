@@ -18,7 +18,6 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ExecutionEngine/ObjectCache.h"
-#include "llvm/IR/CallSite.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
@@ -58,13 +57,13 @@ public:
 };
 
 // TODO get rid of this
-class MyInserter : public llvm::IRBuilderDefaultInserter<true> {
+class MyInserter : public llvm::IRBuilderDefaultInserter {
 private:
     IREmitter* emitter;
 
-protected:
-    void InsertHelper(llvm::Instruction* I, const llvm::Twine& Name, llvm::BasicBlock* BB,
-                      llvm::BasicBlock::iterator InsertPt) const;
+public:
+    void InsertHelper(llvm::Instruction* I, const llvm::Twine& Name,
+                      llvm::BasicBlock::iterator InsertPt) const override;
 
 public:
     void setEmitter(IREmitter* emitter) { this->emitter = emitter; }
@@ -74,7 +73,7 @@ class ICSetupInfo;
 
 class IREmitter {
 public:
-    typedef llvm::IRBuilder<true, llvm::ConstantFolder, MyInserter> IRBuilder;
+    typedef llvm::IRBuilder<llvm::ConstantFolder, MyInserter> IRBuilder;
 
     virtual ~IREmitter() {}
 
@@ -94,24 +93,24 @@ public:
     // Special value for capi_exc_value that says that the target function always sets a capi exception.
     static llvm::Value* ALWAYS_THROWS;
 
-    virtual llvm::Instruction* createCall(const UnwindInfo& unw_info, llvm::Value* callee,
+    virtual llvm::CallBase* createCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee,
                                           const std::vector<llvm::Value*>& args,
                                           ExceptionStyle target_exception_style = CXX,
                                           llvm::Value* capi_exc_value = NULL) = 0;
-    virtual llvm::Instruction* createCall(const UnwindInfo& unw_info, llvm::Value* callee,
+    virtual llvm::CallBase* createCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee,
                                           ExceptionStyle target_exception_style = CXX,
                                           llvm::Value* capi_exc_value = NULL) = 0;
-    virtual llvm::Instruction* createCall(const UnwindInfo& unw_info, llvm::Value* callee, llvm::Value* arg1,
+    virtual llvm::CallBase* createCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee, llvm::Value* arg1,
                                           ExceptionStyle target_exception_style = CXX,
                                           llvm::Value* capi_exc_value = NULL) = 0;
-    virtual llvm::Instruction* createCall2(const UnwindInfo& unw_info, llvm::Value* callee, llvm::Value* arg1,
+    virtual llvm::CallBase* createCall2(const UnwindInfo& unw_info, llvm::FunctionCallee callee, llvm::Value* arg1,
                                            llvm::Value* arg2, ExceptionStyle target_exception_style = CXX,
                                            llvm::Value* capi_exc_value = NULL) = 0;
-    virtual llvm::Instruction* createCall3(const UnwindInfo& unw_info, llvm::Value* callee, llvm::Value* arg1,
+    virtual llvm::CallBase* createCall3(const UnwindInfo& unw_info, llvm::FunctionCallee callee, llvm::Value* arg1,
                                            llvm::Value* arg2, llvm::Value* arg3,
                                            ExceptionStyle target_exception_style = CXX,
                                            llvm::Value* capi_exc_value = NULL) = 0;
-    virtual llvm::Instruction* createIC(std::unique_ptr<const ICSetupInfo> pp, void* func_addr,
+    virtual llvm::CallBase* createIC(std::unique_ptr<const ICSetupInfo> pp, void* func_addr,
                                         const std::vector<llvm::Value*>& args, const UnwindInfo& unw_info,
                                         ExceptionStyle target_exception_style = CXX, llvm::Value* capi_exc_value = NULL)
         = 0;
@@ -190,17 +189,9 @@ public:
     PystonObjectCache();
 
 
-#if LLVMREV < 216002
-    virtual void notifyObjectCompiled(const llvm::Module* M, const llvm::MemoryBuffer* Obj);
-#else
     virtual void notifyObjectCompiled(const llvm::Module* M, llvm::MemoryBufferRef Obj);
-#endif
 
-#if LLVMREV < 215566
-    virtual llvm::MemoryBuffer* getObject(const llvm::Module* M);
-#else
     virtual std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module* M);
-#endif
 
     void cleanupCacheDirectory();
 

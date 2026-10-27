@@ -20,11 +20,7 @@
 #include "llvm/Analysis/Passes.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/IR/Module.h"
-#if LLVMREV < 229094
-#include "llvm/PassManager.h"
-#else
 #include "llvm/IR/LegacyPassManager.h"
-#endif
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Scalar.h"
@@ -60,110 +56,106 @@ static llvm::Function* lookupFunction(const std::string& name) {
     return r;
 }
 
-static llvm::Value* getFunc(void* func, const char* name) {
+static llvm::FunctionCallee getFunc(void* func, const char* name) {
     llvm::Function* f = lookupFunction(name);
     ASSERT(f, "%s", name);
     g.func_addr_registry.registerFunction(name, func, 0, f);
-    return embedConstantPtr(func, f->getType());
+    llvm::Constant* callee = embedConstantPtr(func, g.i8_ptr);
+    registerRuntimeFunction(callee, f);
+    return llvm::FunctionCallee(f->getFunctionType(), callee);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::ArrayRef<llvm::Type*> arg_types,
-                            bool varargs = false) {
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::ArrayRef<llvm::Type*> arg_types,
+                                    bool varargs = false) {
     llvm::FunctionType* ft = llvm::FunctionType::get(rtn_type, arg_types, varargs);
-    return embedConstantPtr(func, ft->getPointerTo());
+    return llvm::FunctionCallee(ft, embedConstantPtr(func, g.i8_ptr));
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, bool varargs = false) {
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, bool varargs = false) {
     return addFunc(func, rtn_type, llvm::ArrayRef<llvm::Type*>(), varargs);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, bool varargs = false) {
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, bool varargs = false) {
     llvm::Type* array[] = { arg1 };
     return addFunc(func, rtn_type, array, varargs);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2,
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2,
                             bool varargs = false) {
     llvm::Type* array[] = { arg1, arg2 };
     return addFunc(func, rtn_type, array, varargs);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
                             bool varargs = false) {
     llvm::Type* array[] = { arg1, arg2, arg3 };
     return addFunc(func, rtn_type, array, varargs);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
-                            llvm::Type* arg4, bool varargs = false) {
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
+                                    llvm::Type* arg4, bool varargs = false) {
     llvm::Type* array[] = { arg1, arg2, arg3, arg4 };
     return addFunc(func, rtn_type, array, varargs);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
-                            llvm::Type* arg4, llvm::Type* arg5, bool varargs = false) {
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
+                                    llvm::Type* arg4, llvm::Type* arg5, bool varargs = false) {
     llvm::Type* array[] = { arg1, arg2, arg3, arg4, arg5 };
     return addFunc(func, rtn_type, array, varargs);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
-                            llvm::Type* arg4, llvm::Type* arg5, llvm::Type* arg6, bool varargs = false) {
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
+                                    llvm::Type* arg4, llvm::Type* arg5, llvm::Type* arg6, bool varargs = false) {
     llvm::Type* array[] = { arg1, arg2, arg3, arg4, arg5, arg6 };
     return addFunc(func, rtn_type, array, varargs);
 }
 
-static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
-                            llvm::Type* arg4, llvm::Type* arg5, llvm::Type* arg6, llvm::Type* arg7,
+static llvm::FunctionCallee addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, llvm::Type* arg2, llvm::Type* arg3,
+                                    llvm::Type* arg4, llvm::Type* arg5, llvm::Type* arg6, llvm::Type* arg7,
                             bool varargs = false) {
     llvm::Type* array[] = { arg1, arg2, arg3, arg4, arg5, arg6, arg7 };
     return addFunc(func, rtn_type, array, varargs);
 }
 
+// Builds a struct type with the given fields, and checks that LLVM lays it out with the given offsets.
+static llvm::StructType* createCheckedStructType(const char* name, llvm::ArrayRef<llvm::Type*> fields,
+                                                 llvm::ArrayRef<size_t> offsets, size_t size) {
+    llvm::StructType* t = llvm::StructType::create(g.context, fields, name);
+    const llvm::StructLayout* layout = g.tm->createDataLayout().getStructLayout(t);
+    RELEASE_ASSERT(layout->getSizeInBytes() == size, "%s", name);
+    for (int i = 0; i < offsets.size(); i++) {
+        RELEASE_ASSERT(layout->getElementOffset(i) == offsets[i], "%s field %d", name, i);
+    }
+    return t;
+}
+
 void initGlobalFuncs(GlobalState& g) {
-    g.llvm_opaque_type = llvm::StructType::create(g.context, "opaque");
+    llvm::Type* ptr = llvm::PointerType::getUnqual(g.context);
 
-    g.llvm_module_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedModule")->getPointerTo();
-    assert(g.llvm_module_type_ptr);
+    g.llvm_value_type_ptr = ptr;
+    g.llvm_value_type_ptr_ptr = ptr;
+    g.llvm_class_type_ptr = ptr;
+    g.llvm_boxedstring_type_ptr = ptr;
+    g.llvm_dict_type_ptr = ptr;
+    g.llvm_code_type_ptr = ptr;
+    g.llvm_closure_type_ptr = ptr;
+    g.llvm_generator_type_ptr = ptr;
+    g.llvm_module_type_ptr = ptr;
+    g.llvm_bool_type_ptr = ptr;
+    g.vector_ptr = ptr;
 
-    g.llvm_code_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedCode")->getPointerTo();
-    assert(g.llvm_code_type_ptr);
+    g.llvm_excinfo_type = createCheckedStructType(
+        "ExcInfo", { ptr, ptr, ptr }, { offsetof(ExcInfo, type), offsetof(ExcInfo, value), offsetof(ExcInfo, traceback) },
+        sizeof(ExcInfo));
 
-    g.llvm_bool_type_ptr = lookupFunction("boxBool")->getReturnType();
-
-    g.llvm_value_type_ptr = lookupFunction("getattr")->getReturnType();
-    g.llvm_value_type = g.llvm_value_type_ptr->getSequentialElementType();
-    g.llvm_value_type_ptr_ptr = g.llvm_value_type_ptr->getPointerTo();
-    // g.llvm_class_type_ptr = llvm::cast<llvm::StructType>(g.llvm_value_type)->getElementType(0);
-    // g.llvm_class_type = g.llvm_class_type_ptr->getSequentialElementType();
-    g.llvm_class_type = g.stdlib_module->getTypeByName("class.pyston::BoxedClass");
-    assert(g.llvm_class_type);
-    g.llvm_class_type_ptr = g.llvm_class_type->getPointerTo();
-
-    g.llvm_boxedstring_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedString");
-    assert(g.llvm_boxedstring_type_ptr);
-    g.llvm_boxedstring_type_ptr = g.llvm_boxedstring_type_ptr->getPointerTo();
-
-    g.llvm_dict_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedDict");
-    assert(g.llvm_dict_type_ptr);
-    g.llvm_dict_type_ptr = g.llvm_dict_type_ptr->getPointerTo();
-
-    // The LLVM vector type for the arguments that we pass to runtimeCall and related functions.
-    // It will be a pointer to a type named something like class.std::vector or
-    // class.std::vector.##. We can figure out exactly what it is by looking at the last
-    // argument of runtimeCall.
-    g.vector_ptr = (--lookupFunction("runtimeCall")->getArgumentList().end())->getType();
-
-    g.llvm_closure_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedClosure")->getPointerTo();
-    assert(g.llvm_closure_type_ptr);
-
-    g.llvm_generator_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedGenerator")->getPointerTo();
-    assert(g.llvm_generator_type_ptr);
-
-    g.llvm_excinfo_type = g.stdlib_module->getTypeByName("struct.pyston::ExcInfo");
-    assert(g.llvm_excinfo_type);
-
-    g.llvm_frame_info_type = g.stdlib_module->getTypeByName("struct.pyston::FrameInfo");
-    assert(g.llvm_frame_info_type);
+    // The field indices are used by the getXxxGEP() functions in irgenerator.cpp
+    g.llvm_frame_info_type = createCheckedStructType(
+        "FrameInfo", { g.llvm_excinfo_type, ptr, ptr, ptr, ptr, g.i32, g.i32, ptr, ptr, ptr },
+        { offsetof(FrameInfo, exc), offsetof(FrameInfo, boxedLocals), offsetof(FrameInfo, frame_obj),
+          offsetof(FrameInfo, passed_closure), offsetof(FrameInfo, vregs), offsetof(FrameInfo, num_vregs),
+          offsetof(FrameInfo, stmt_offset), offsetof(FrameInfo, globals), offsetof(FrameInfo, back),
+          offsetof(FrameInfo, code) },
+        sizeof(FrameInfo));
 
 #define GET(N) g.funcs.N = getFunc((void*)N, STRINGIFY(N))
 
@@ -257,7 +249,7 @@ void initGlobalFuncs(GlobalState& g) {
                                            g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
     g.funcs.runtimeCallN.cxx_val
         = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32, g.llvm_value_type_ptr,
-                  g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
+                  g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr_ptr);
 
     g.funcs.runtimeCall.capi_val = getFunc((void*)runtimeCallCapi, "runtimeCallCapi");
     g.funcs.runtimeCall0.capi_val
@@ -270,7 +262,7 @@ void initGlobalFuncs(GlobalState& g) {
                                             g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
     g.funcs.runtimeCallN.capi_val
         = addFunc((void*)runtimeCallCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32, g.llvm_value_type_ptr,
-                  g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
+                  g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr_ptr);
 
 
     g.funcs.callattr.cxx_val = getFunc((void*)callattr, "callattr");
@@ -286,7 +278,7 @@ void initGlobalFuncs(GlobalState& g) {
                   g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
     g.funcs.callattrN.cxx_val = addFunc(
         (void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
-        g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
+        g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr_ptr);
 
 
     g.funcs.callattr.capi_val = getFunc((void*)callattrCapi, "callattrCapi");
@@ -302,7 +294,7 @@ void initGlobalFuncs(GlobalState& g) {
                   g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
     g.funcs.callattrN.capi_val = addFunc(
         (void*)callattrCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
-        g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
+        g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr_ptr);
 
     g.funcs.reoptCompiledFunc = addFunc((void*)reoptCompiledFunc, g.i8_ptr, g.i8_ptr);
     g.funcs.compilePartialFunc = addFunc((void*)compilePartialFunc, g.i8_ptr, g.i8_ptr);

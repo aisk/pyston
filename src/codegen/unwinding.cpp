@@ -19,14 +19,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#if LLVMREV < 227586
-#include "llvm/DebugInfo/DIContext.h"
-#else
-#include "llvm/DebugInfo/DWARF/DIContext.h"
-#endif
 #include "llvm/ExecutionEngine/JITEventListener.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Object/SymbolSize.h"
 
 #include "asm_writing/types.h"
 #include "analysis/scoping_analysis.h"
@@ -204,88 +200,69 @@ CompiledFunction* getCFForAddress(uint64_t addr) {
 
 class TracebacksEventListener : public llvm::JITEventListener {
 public:
-    virtual void NotifyObjectEmitted(const llvm::object::ObjectFile& Obj,
-                                     const llvm::RuntimeDyld::LoadedObjectInfo& L) {
-        std::unique_ptr<llvm::DIContext> Context(llvm::DIContext::getDWARFContext(Obj));
-
+    void notifyObjectLoaded(ObjectKey key, const llvm::object::ObjectFile& Obj,
+                            const llvm::RuntimeDyld::LoadedObjectInfo& L) override {
         assert(g.cur_cf);
 
+        // A copy of the object whose symbol and section addresses are the ones they were loaded at.
+        llvm::object::OwningBinary<llvm::object::ObjectFile> debug_obj = L.getObjectForDebug(Obj);
+        const llvm::object::ObjectFile& loaded = *debug_obj.getBinary();
+
         uint64_t func_addr = 0; // remains 0 until we find a function
+        uint64_t text_addr = -1, text_size = -1;
 
         // Search through the symbols to find the function that got JIT'ed.
         // (We only JIT one function at a time.)
-        for (const auto& sym : Obj.symbols()) {
-            llvm::object::SymbolRef::Type SymType;
-            if (sym.getType(SymType) || SymType != llvm::object::SymbolRef::ST_Function)
+        for (const auto& p : llvm::object::computeSymbolSizes(loaded)) {
+            const llvm::object::SymbolRef& sym = p.first;
+            llvm::Expected<llvm::object::SymbolRef::Type> type = sym.getType();
+            if (!type || *type != llvm::object::SymbolRef::ST_Function) {
+                llvm::consumeError(type.takeError());
                 continue;
+            }
 
-            llvm::StringRef Name;
-            uint64_t Size;
-            if (sym.getName(Name) || sym.getSize(Size))
-                continue;
+            llvm::Expected<uint64_t> addr = sym.getAddress();
+            llvm::Expected<llvm::object::section_iterator> section = sym.getSection();
+            RELEASE_ASSERT(addr && section, "");
 
             // Found a function!
             assert(!func_addr);
-            func_addr = L.getSymbolLoadAddress(Name);
+            func_addr = *addr;
             assert(func_addr);
 
-// TODO this should be the Python name, not the C name:
-#if LLVMREV < 208921
-            llvm::DILineInfoTable lines = Context->getLineInfoForAddressRange(
-                func_addr, Size, llvm::DILineInfoSpecifier::FunctionName | llvm::DILineInfoSpecifier::FileLineInfo
-                                     | llvm::DILineInfoSpecifier::AbsoluteFilePath);
-#else
-            llvm::DILineInfoTable lines = Context->getLineInfoForAddressRange(
-                func_addr, Size,
-                llvm::DILineInfoSpecifier(llvm::DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
-                                          llvm::DILineInfoSpecifier::FunctionNameKind::LinkageName));
-#endif
-            if (VERBOSITY() >= 3) {
-                for (int i = 0; i < lines.size(); i++) {
-                    printf("%s:%d, %s: %lx\n", lines[i].second.FileName.c_str(), lines[i].second.Line,
-                           lines[i].second.FunctionName.c_str(), lines[i].first);
-                }
-            }
+            text_addr = (*section)->getAddress();
+            text_size = (*section)->getSize();
 
             assert(g.cur_cf->code_start == 0);
             g.cur_cf->code_start = func_addr;
-            g.cur_cf->code_size = Size;
+            g.cur_cf->code_size = p.second;
             cf_registry.registerCF(g.cur_cf);
         }
 
         assert(func_addr);
 
         // Libunwind support:
-        bool found_text = false, found_eh_frame = false;
-        uint64_t text_addr = -1, text_size = -1;
+        bool found_eh_frame = false;
         uint64_t eh_frame_addr = -1, eh_frame_size = -1;
 
         for (const auto& sec : Obj.sections()) {
-            llvm::StringRef name;
-            llvm_error_code code = sec.getName(name);
-            assert(!code);
+            llvm::Expected<llvm::StringRef> name = sec.getName();
+            RELEASE_ASSERT(name, "");
 
-            uint64_t addr, size;
-            if (name == ".eh_frame") {
+            if (*name == ".eh_frame") {
                 assert(!found_eh_frame);
-                eh_frame_addr = L.getSectionLoadAddress(name);
+                eh_frame_addr = L.getSectionLoadAddress(sec);
                 eh_frame_size = sec.getSize();
 
                 if (VERBOSITY() >= 2)
                     printf("eh_frame: %lx %lx\n", eh_frame_addr, eh_frame_size);
                 found_eh_frame = true;
-            } else if (name == ".text") {
-                assert(!found_text);
-                text_addr = L.getSectionLoadAddress(name);
-                text_size = sec.getSize();
-
-                if (VERBOSITY() >= 2)
-                    printf("text: %lx %lx\n", text_addr, text_size);
-                found_text = true;
             }
         }
 
-        assert(found_text);
+        if (VERBOSITY() >= 2)
+            printf("text: %lx %lx\n", text_addr, text_size);
+
         assert(found_eh_frame);
         assert(text_addr == func_addr);
 

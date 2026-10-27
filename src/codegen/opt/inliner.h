@@ -16,10 +16,11 @@
 #define PYSTON_CODEGEN_OPT_INLINER_H
 
 namespace llvm {
-class FunctionPass;
+class Function;
 }
 namespace pyston {
-llvm::FunctionPass* makeFPInliner(int threshold);
+// Inline calls to runtime functions whose bitcode is available in the stdlib module.
+bool inlineRuntimeCalls(llvm::Function& f, int threshold);
 }
 
 #endif

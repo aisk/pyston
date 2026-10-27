@@ -71,13 +71,10 @@ llvm::Constant* embedRelocatablePtr(const void* addr, llvm::Type* type, llvm::St
 
         relocatable_syms[name] = addr;
 
-        llvm::Type* var_type = type->getPointerElementType();
-        gv = new llvm::GlobalVariable(*g.cur_module, var_type, /* isConstant */ false,
+        // Pointers are opaque, so the value type of the global doesn't matter.
+        gv = new llvm::GlobalVariable(*g.cur_module, g.i8, /* isConstant */ false,
                                       llvm::GlobalVariable::ExternalLinkage, 0, name);
     }
-
-    if (gv->getType() != type)
-        return llvm::ConstantExpr::getPointerCast(gv, type);
 
     return gv;
 }
@@ -88,6 +85,24 @@ llvm::Constant* embedConstantPtr(const void* addr, llvm::Type* type) {
     llvm::Constant* ptr_val = llvm::ConstantExpr::getIntToPtr(int_val, type);
 
     return ptr_val;
+}
+
+static llvm::DenseMap<llvm::Value*, llvm::Function*> runtime_functions;
+
+void registerRuntimeFunction(llvm::Value* callee, llvm::Function* decl) {
+    runtime_functions[callee] = decl;
+}
+
+void applyRuntimeFunctionAttributes(llvm::CallBase* call) {
+    auto it = runtime_functions.find(call->getCalledOperand());
+    if (it == runtime_functions.end())
+        return;
+    llvm::Function* decl = it->second;
+    // The same address can be called with a different signature (ex: runtimeCall with a varying number
+    // of arguments); the attributes only apply to the exact declaration.
+    if (call->getFunctionType() != decl->getFunctionType())
+        return;
+    call->setAttributes(decl->getAttributes());
 }
 
 llvm::Constant* getNullPtr(llvm::Type* t) {
@@ -118,8 +133,9 @@ public:
     PrettifyingMaterializer(llvm::Module* module, llvm::ValueToValueMapTy& VMap, llvm::RemapFlags flags,
                             llvm::ValueMapTypeRemapper* type_remapper)
         : module(module), VMap(VMap), flags(flags), type_remapper(type_remapper) {}
+    virtual ~PrettifyingMaterializer() {}
 
-    virtual llvm::Value* materializeValueFor(llvm::Value* v) {
+    llvm::Value* materialize(llvm::Value* v) override {
         if (llvm::ConstantExpr* ce = llvm::dyn_cast<llvm::ConstantExpr>(v)) {
             llvm::PointerType* pt = llvm::dyn_cast<llvm::PointerType>(ce->getType());
             if (ce->isCast() && ce->getOpcode() == llvm::Instruction::IntToPtr && pt) {
@@ -128,25 +144,25 @@ public:
 
                 bool lookup_success = true;
                 std::string name;
-                if (addr == (void*)None) {
+                if (addr == (void*)Py_None) {
                     name = "None";
                 } else {
                     name = g.func_addr_registry.getFuncNameAtAddress(addr, true, &lookup_success);
                 }
 
                 if (!lookup_success)
-                    return v;
+                    return nullptr;
 
-                return module->getOrInsertGlobal(name, pt->getElementType());
+                return module->getOrInsertGlobal(name, g.i8);
             }
         }
-        return v;
+        return nullptr;
     }
 };
 
 template <typename I> void remapPatchpoint(I* ii) {
     int pp_id = -1;
-    for (int i = 0; i < ii->getNumArgOperands(); i++) {
+    for (int i = 0; i < ii->arg_size(); i++) {
         llvm::Value* op = ii->getArgOperand(i);
         if (i == 0) {
             llvm::ConstantInt* l_pp_id = llvm::cast<llvm::ConstantInt>(op);
@@ -161,7 +177,7 @@ template <typename I> void remapPatchpoint(I* ii) {
 
             bool lookup_success = true;
             std::string name;
-            if (addr == (void*)None) {
+            if (addr == (void*)Py_None) {
                 name = "None";
             } else {
                 name = g.func_addr_registry.getFuncNameAtAddress(addr, true, &lookup_success);
@@ -183,25 +199,24 @@ void dumpPrettyIR(llvm::Function* f) {
     // f->getParent()->dump();
     // return;
 
-    std::unique_ptr<llvm::Module> tmp_module(llvm::CloneModule(f->getParent()));
+    std::unique_ptr<llvm::Module> tmp_module(llvm::CloneModule(*f->getParent()));
     // std::unique_ptr<llvm::Module> tmp_module(new llvm::Module("tmp", g.context));
 
-    llvm::Function* new_f = tmp_module->begin();
+    llvm::Function* new_f = &*tmp_module->begin();
 
     llvm::ValueToValueMapTy VMap;
     llvm::RemapFlags flags = llvm::RF_None;
     llvm::ValueMapTypeRemapper* type_remapper = NULL;
     PrettifyingMaterializer materializer(tmp_module.get(), VMap, flags, type_remapper);
     for (llvm::Function::iterator I = new_f->begin(), E = new_f->end(); I != E; ++I) {
-        VMap[I] = I;
+        VMap[&*I] = &*I;
     }
     for (llvm::inst_iterator it = inst_begin(new_f), end = inst_end(new_f); it != end; ++it) {
         llvm::RemapInstruction(&*it, VMap, flags, type_remapper, &materializer);
 
         if (llvm::IntrinsicInst* ii = llvm::dyn_cast<llvm::IntrinsicInst>(&*it)) {
-            if (ii->getIntrinsicID() == llvm::Intrinsic::experimental_patchpoint_i64
-                || ii->getIntrinsicID() == llvm::Intrinsic::experimental_patchpoint_void
-                || ii->getIntrinsicID() == llvm::Intrinsic::experimental_patchpoint_double) {
+            if (ii->getIntrinsicID() == llvm::Intrinsic::experimental_patchpoint
+                || ii->getIntrinsicID() == llvm::Intrinsic::experimental_patchpoint_void) {
                 remapPatchpoint(ii);
             }
         } else if (llvm::InvokeInst* ii = llvm::dyn_cast<llvm::InvokeInst>(&*it)) {

@@ -161,8 +161,8 @@ public:
         ConcreteCompilerVariable* func = im->func->makeConverted(emitter, UNKNOWN);
         ConcreteCompilerVariable* im_class = im->im_class->makeConverted(emitter, UNKNOWN);
 
-        llvm::Value* boxed = emitter.getBuilder()->CreateCall3(g.funcs.boxInstanceMethod, obj->getValue(),
-                                                               func->getValue(), im_class->getValue());
+        llvm::Value* boxed = emitter.getBuilder()->CreateCall(g.funcs.boxInstanceMethod, { obj->getValue(),
+                                                               func->getValue(), im_class->getValue() });
         emitter.setType(boxed, RefType::OWNED);
 
         return new ConcreteCompilerVariable(other_type, boxed);
@@ -287,9 +287,9 @@ public:
 
         static_assert(offsetof(Box, cls) % sizeof(void*) == 0, "");
         llvm::Value* cls_ptr
-            = emitter.getBuilder()->CreateConstInBoundsGEP2_32(var->getValue(), 0, offsetof(Box, cls) / sizeof(void*));
+            = emitter.getBuilder()->CreateConstInBoundsGEP1_64(g.i8, var->getValue(), offsetof(Box, cls));
 
-        llvm::Value* cls_value = emitter.getBuilder()->CreateLoad(cls_ptr);
+        llvm::Value* cls_value = emitter.getBuilder()->CreateLoad(g.llvm_class_type_ptr, cls_ptr);
         emitter.setType(cls_value, RefType::BORROWED);
         assert(cls_value->getType() == g.llvm_class_type_ptr);
         llvm::Value* rtn = emitter.getBuilder()->CreateICmpEQ(
@@ -470,7 +470,7 @@ public:
         llvm::Value* rtn;
         bool do_patchpoint = ENABLE_ICBINEXPS;
 
-        llvm::Value* rt_func;
+        llvm::FunctionCallee rt_func;
         void* rt_func_addr;
         if (exp_type == BinOp) {
             rt_func = g.funcs.binop;
@@ -522,19 +522,19 @@ public:
             = emitter.getBuilder()->CreateBitCast(emitter.getScratch(sizeof(Box*)), g.llvm_value_type_ptr_ptr);
         llvm::Value* unpacked = emitter.createCall3(info.unw_info, g.funcs.unpackIntoArray, var->getValue(),
                                                     getConstantInt(num_into, g.i64), scratch);
-        assert(unpacked->getType() == g.llvm_value_type_ptr->getPointerTo());
+        assert(unpacked->getType() == g.llvm_value_type_ptr_ptr);
 
         std::vector<CompilerVariable*> rtn;
         for (int i = 0; i < num_into; i++) {
-            llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(unpacked, i);
-            llvm::Value* val = emitter.getBuilder()->CreateLoad(ptr);
+            llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(g.llvm_value_type_ptr, unpacked, i);
+            llvm::Value* val = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, ptr);
             assert(val->getType() == g.llvm_value_type_ptr);
             emitter.setType(val, RefType::OWNED);
 
             rtn.push_back(new ConcreteCompilerVariable(UNKNOWN, val));
         }
 
-        emitter.setType(emitter.getBuilder()->CreateLoad(scratch), RefType::OWNED);
+        emitter.setType(emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, scratch), RefType::OWNED);
         return rtn;
     }
 
@@ -554,7 +554,7 @@ CompilerVariable* UnknownType::getattr(IREmitter& emitter, const OpInfo& info, C
 
     ExceptionStyle target_exception_style = cls_only ? CXX : info.preferredExceptionStyle();
 
-    llvm::Value* llvm_func;
+    llvm::FunctionCallee llvm_func;
     void* raw_func;
     if (cls_only) {
         assert(target_exception_style == CXX);
@@ -594,7 +594,7 @@ CompilerVariable* UnknownType::getattr(IREmitter& emitter, const OpInfo& info, C
 }
 
 static ConcreteCompilerVariable*
-_call(IREmitter& emitter, const OpInfo& info, llvm::Value* func, ExceptionStyle target_exception_style, void* func_addr,
+_call(IREmitter& emitter, const OpInfo& info, llvm::FunctionCallee func, ExceptionStyle target_exception_style, void* func_addr,
       const std::vector<llvm::Value*>& other_args, ArgPassSpec argspec, const std::vector<CompilerVariable*>& args,
       const std::vector<BoxedString*>* keyword_names, ConcreteCompilerType* rtn_type, bool nullable_return = false) {
     bool pass_keyword_names = (keyword_names != nullptr);
@@ -639,12 +639,12 @@ _call(IREmitter& emitter, const OpInfo& info, llvm::Value* func, ExceptionStyle 
         // Don't use the IRBuilder since we want to specifically put this in the entry block so it only gets called
         // once.
         // TODO we could take this further and use the same alloca for all function calls?
-        llvm::Instruction* insertion_point
+        llvm::BasicBlock::iterator insertion_point
             = emitter.getBuilder()->GetInsertBlock()->getParent()->getEntryBlock().getFirstInsertionPt();
-        arg_array = new llvm::AllocaInst(g.llvm_value_type_ptr, n_varargs, "arg_scratch", insertion_point);
+        arg_array = new llvm::AllocaInst(g.llvm_value_type_ptr, 0, n_varargs, "arg_scratch", insertion_point);
 
         for (int i = 3; i < args.size(); i++) {
-            llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(arg_array, i - 3);
+            llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(g.llvm_value_type_ptr, arg_array, i - 3);
             emitter.getBuilder()->CreateStore(converted_args[i]->getValue(), ptr);
             array_passed_args.push_back(converted_args[i]->getValue());
         }
@@ -653,7 +653,7 @@ _call(IREmitter& emitter, const OpInfo& info, llvm::Value* func, ExceptionStyle 
         if (pass_keyword_names)
             llvm_args.push_back(embedRelocatablePtr(keyword_names, g.vector_ptr));
     } else if (pass_keyword_names) {
-        llvm_args.push_back(getNullPtr(g.llvm_value_type_ptr->getPointerTo()));
+        llvm_args.push_back(getNullPtr(g.llvm_value_type_ptr_ptr));
         llvm_args.push_back(embedRelocatablePtr(keyword_names, g.vector_ptr));
     }
 
@@ -681,8 +681,7 @@ _call(IREmitter& emitter, const OpInfo& info, llvm::Value* func, ExceptionStyle 
                                                        target_exception_style, getNullPtr(g.llvm_value_type_ptr));
         inst = uncasted;
 
-        assert(llvm::cast<llvm::FunctionType>(llvm::cast<llvm::PointerType>(func->getType())->getElementType())
-                   ->getReturnType() == g.llvm_value_type_ptr);
+        assert(func.getFunctionType()->getReturnType() == g.llvm_value_type_ptr);
         rtn = createAfter<llvm::IntToPtrInst>(uncasted, uncasted, g.llvm_value_type_ptr, "");
     } else {
         // printf("\n");
@@ -719,7 +718,7 @@ CompilerVariable* UnknownType::call(IREmitter& emitter, const OpInfo& info, Conc
 
     ExceptionStyle exception_style = info.preferredExceptionStyle();
 
-    llvm::Value* func;
+    llvm::FunctionCallee func;
     if (pass_keywords)
         func = g.funcs.runtimeCall.get(exception_style);
     else if (npassed_args == 0)
@@ -755,7 +754,7 @@ CompilerVariable* UnknownType::callattr(IREmitter& emitter, const OpInfo& info, 
     if (exception_style == CAPI)
         assert(!flags.null_on_nonexistent); // Will conflict with CAPI's null-on-exception
 
-    llvm::Value* func;
+    llvm::FunctionCallee func;
     if (pass_keywords)
         func = g.funcs.callattr.get(exception_style);
     else if (npassed_args == 0)
@@ -859,7 +858,7 @@ CompilerVariable* makeFunction(IREmitter& emitter, BoxedCode* code, llvm::Value*
         for (auto d : defaults) {
             llvm::Value* v = d->getValue();
             array_passed_args.push_back(v);
-            llvm::Value* p = emitter.getBuilder()->CreateConstGEP1_32(scratch, i);
+            llvm::Value* p = emitter.getBuilder()->CreateConstGEP1_32(g.llvm_value_type_ptr, scratch, i);
             emitter.getBuilder()->CreateStore(v, p);
             i++;
         }
@@ -1173,17 +1172,17 @@ public:
     }
 
     void setattr(IREmitter& emitter, const OpInfo& info, VAR* var, BoxedString* attr, CompilerVariable* v) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall3(info.unw_info, g.funcs.raiseAttributeErrorStr, embedConstantPtr("int", g.i8_ptr),
                                   embedConstantPtr(attr->data(), g.i8_ptr), getConstantInt(attr->size(), g.i64));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
     }
 
     void delattr(IREmitter& emitter, const OpInfo& info, VAR* var, BoxedString* attr) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall3(info.unw_info, g.funcs.raiseAttributeErrorStr, embedConstantPtr("int", g.i8_ptr),
                                   embedConstantPtr(attr->data(), g.i8_ptr), getConstantInt(attr->size(), g.i64));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
     }
 
     ConcreteCompilerVariable* _makeConverted(IREmitter& emitter, llvm::Value* unboxed,
@@ -1207,9 +1206,9 @@ public:
     }
 
     CompilerVariable* len(IREmitter& emitter, const OpInfo& info, VAR* var) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall(info.unw_info, g.funcs.raiseNotIterableError, embedConstantPtr("int", g.i8_ptr));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
         return makeInt(llvm::UndefValue::get(g.i64));
     }
 
@@ -1337,9 +1336,9 @@ public:
     }
 
     CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall(info.unw_info, g.funcs.raiseNotIterableError, embedConstantPtr("int", g.i8_ptr));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
         return new ConcreteCompilerVariable(BOOL, llvm::UndefValue::get(BOOL->llvmType()));
     }
 
@@ -1377,7 +1376,7 @@ CompilerVariable* makeUnboxedInt(IREmitter& emitter, ConcreteCompilerVariable* v
     // if the llvm value is a pointer to boxed object extract the value to save a unboxing call.
     llvm::Value* unboxed = NULL;
     if (llvm::GlobalValue* GV = llvm::dyn_cast<llvm::GlobalValue>(v->getValue()->stripPointerCasts())) {
-        if (GV->getName().startswith("c")) {
+        if (GV->getName().starts_with("c")) {
             auto* ptr = (BoxedInt*)const_cast<void*>(getValueOfRelocatableSym(GV->getName()));
             if (ptr)
                 unboxed = llvm::ConstantInt::get(g.i64, unboxInt(ptr), true);
@@ -1454,17 +1453,17 @@ public:
     }
 
     void setattr(IREmitter& emitter, const OpInfo& info, VAR* var, BoxedString* attr, CompilerVariable* v) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall3(info.unw_info, g.funcs.raiseAttributeErrorStr, embedConstantPtr("float", g.i8_ptr),
                                   embedConstantPtr(attr->data(), g.i8_ptr), getConstantInt(attr->size(), g.i64));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
     }
 
     void delattr(IREmitter& emitter, const OpInfo& info, VAR* var, BoxedString* attr) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall3(info.unw_info, g.funcs.raiseAttributeErrorStr, embedConstantPtr("float", g.i8_ptr),
                                   embedConstantPtr(attr->data(), g.i8_ptr), getConstantInt(attr->size(), g.i64));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
     }
 
     ConcreteCompilerVariable* _makeConverted(IREmitter& emitter, llvm::Value* unboxed,
@@ -1608,9 +1607,9 @@ public:
     }
 
     CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall(info.unw_info, g.funcs.raiseNotIterableError, embedConstantPtr("float", g.i8_ptr));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
         return new ConcreteCompilerVariable(BOOL, llvm::UndefValue::get(BOOL->llvmType()));
     }
 
@@ -1647,8 +1646,8 @@ public:
     Box* deserializeFromFrame(const FrameVals& vals) override { RELEASE_ASSERT(0, "unavailable for phony types"); }
 };
 
-ConcreteCompilerType* UNBOXED_INT = new PhonyUnboxedType(llvm::Type::getInt64Ty(llvm::getGlobalContext()), INT);
-ConcreteCompilerType* UNBOXED_FLOAT = new PhonyUnboxedType(llvm::Type::getDoubleTy(llvm::getGlobalContext()), FLOAT);
+ConcreteCompilerType* UNBOXED_INT = new PhonyUnboxedType(llvm::Type::getInt64Ty(getGlobalLLVMContext()), INT);
+ConcreteCompilerType* UNBOXED_FLOAT = new PhonyUnboxedType(llvm::Type::getDoubleTy(getGlobalLLVMContext()), FLOAT);
 
 CompilerVariable* makeFloat(llvm::Value* n) {
     assert(n->getType() == g.double_);
@@ -1665,7 +1664,7 @@ CompilerVariable* makeUnboxedFloat(IREmitter& emitter, ConcreteCompilerVariable*
     // if the llvm value is a pointer to boxed object extract the value to save a unboxing call.
     llvm::Value* unboxed = NULL;
     if (llvm::GlobalValue* GV = llvm::dyn_cast<llvm::GlobalValue>(v->getValue()->stripPointerCasts())) {
-        if (GV->getName().startswith("c")) {
+        if (GV->getName().starts_with("c")) {
             auto* ptr = (BoxedFloat*)const_cast<void*>(getValueOfRelocatableSym(GV->getName()));
             if (ptr)
                 unboxed = llvm::ConstantFP::get(g.double_, unboxFloat(ptr));
@@ -1795,15 +1794,15 @@ public:
             Box* rtattr = typeLookup(cls, attr);
             if (rtattr == NULL) {
                 ExceptionStyle exception_style = info.preferredExceptionStyle();
-                llvm::Value* raise_func = exception_style == CXX ? g.funcs.raiseAttributeErrorStr
+                llvm::FunctionCallee raise_func = exception_style == CXX ? g.funcs.raiseAttributeErrorStr
                                                                  : g.funcs.raiseAttributeErrorStrCapi;
-                llvm::CallSite call = emitter.createCall3(
+                llvm::CallBase* call = emitter.createCall3(
                     info.unw_info, raise_func, embedRelocatablePtr(cls->tp_name, g.i8_ptr),
                     embedRelocatablePtr(attr->data(), g.i8_ptr), getConstantInt(attr->size(), g.i64), exception_style,
                     IREmitter::ALWAYS_THROWS);
 
                 if (exception_style == CXX)
-                    call.setDoesNotReturn();
+                    call->setDoesNotReturn();
                 return undefVariable();
             }
 
@@ -1854,16 +1853,16 @@ public:
             if (no_attribute) {
                 *no_attribute = true;
             } else {
-                llvm::Value* raise_func = exception_style == CXX ? g.funcs.raiseAttributeErrorStr
+                llvm::FunctionCallee raise_func = exception_style == CXX ? g.funcs.raiseAttributeErrorStr
                                                                  : g.funcs.raiseAttributeErrorStrCapi;
 
-                llvm::CallSite call = emitter.createCall3(
+                llvm::CallBase* call = emitter.createCall3(
                     info.unw_info, raise_func, embedRelocatablePtr(cls->tp_name, g.i8_ptr),
                     emitter.setType(embedRelocatablePtr(attr->data(), g.i8_ptr), RefType::BORROWED),
                     getConstantInt(attr->size(), g.i64), exception_style, IREmitter::ALWAYS_THROWS);
 
                 if (exception_style == CXX)
-                    call.setDoesNotReturn();
+                    call->setDoesNotReturn();
             }
             return undefVariable();
         }
@@ -1935,7 +1934,7 @@ public:
             assert(cf->spec->arg_types[i]->llvmType() == g.llvm_value_type_ptr);
 
             if (i == 3) {
-                arg_types.push_back(g.llvm_value_type_ptr->getPointerTo());
+                arg_types.push_back(g.llvm_value_type_ptr_ptr);
                 break;
             } else {
                 arg_types.push_back(g.llvm_value_type_ptr);
@@ -1943,11 +1942,12 @@ public:
         }
         llvm::FunctionType* ft = llvm::FunctionType::get(cf->spec->rtn_type->llvmType(), arg_types, false);
 
-        llvm::Value* linked_function;
+        llvm::Value* linked_function_ptr;
         if (cf->code_obj->source) // for JITed functions we need to make the desination address relocatable.
-            linked_function = embedRelocatablePtr(cf->code, ft->getPointerTo());
+            linked_function_ptr = embedRelocatablePtr(cf->code, g.i8_ptr);
         else
-            linked_function = embedConstantPtr(cf->code, ft->getPointerTo());
+            linked_function_ptr = embedConstantPtr(cf->code, g.i8_ptr);
+        llvm::FunctionCallee linked_function(ft, linked_function_ptr);
 
         std::vector<CompilerVariable*> new_args;
         new_args.push_back(var);
@@ -2102,7 +2102,7 @@ public:
                     static llvm::FunctionType* ft = llvm::FunctionType::get(
                         g.llvm_value_type_ptr, { g.llvm_value_type_ptr, g.i64, g.i64 }, false);
                     llvm::Value* r = emitter.createCall3(
-                        info.unw_info, embedConstantPtr((void*)PySequence_GetSlice, ft->getPointerTo()),
+                        info.unw_info, llvm::FunctionCallee(ft, embedConstantPtr((void*)PySequence_GetSlice, g.i8_ptr)),
                         var->getValue(), start, stop, CAPI, getNullPtr(g.llvm_value_type_ptr));
                     emitter.setType(r, RefType::OWNED);
                     emitter.setNullable(r, true);
@@ -2443,9 +2443,9 @@ public:
     }
 
     CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
-        llvm::CallSite call
+        llvm::CallBase* call
             = emitter.createCall(info.unw_info, g.funcs.raiseNotIterableError, embedConstantPtr("bool", g.i8_ptr));
-        call.setDoesNotReturn();
+        call->setDoesNotReturn();
         return new ConcreteCompilerVariable(BOOL, llvm::UndefValue::get(BOOL->llvmType()));
     }
 
@@ -2528,7 +2528,7 @@ public:
         llvm::Value* nelts = llvm::ConstantInt::get(g.i64, v.size(), false);
 
         llvm::Value* _scratch = emitter.getScratch(v.size() * sizeof(void*));
-        auto scratch = emitter.getBuilder()->CreateBitCast(_scratch, g.llvm_value_type_ptr->getPointerTo());
+        auto scratch = emitter.getBuilder()->CreateBitCast(_scratch, g.llvm_value_type_ptr_ptr);
 
         llvm::SmallVector<llvm::Value*, 4> array_passed_args;
 
@@ -2544,12 +2544,12 @@ public:
         }
 
         for (int i = 0; i < v.size(); i++) {
-            llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(scratch, i);
+            llvm::Value* ptr = emitter.getBuilder()->CreateConstGEP1_32(g.llvm_value_type_ptr, scratch, i);
             emitter.getBuilder()->CreateStore(converted_args[i]->getValue(), ptr);
             array_passed_args.push_back(converted_args[i]->getValue());
         }
 
-        llvm::Instruction* rtn = emitter.getBuilder()->CreateCall2(g.funcs.createTuple, nelts, scratch);
+        llvm::Instruction* rtn = emitter.getBuilder()->CreateCall(g.funcs.createTuple, { nelts, scratch });
         emitter.setType(rtn, RefType::OWNED);
 
         for (auto v : array_passed_args)
@@ -2581,13 +2581,13 @@ public:
                     ExceptionStyle target_exception_style = info.preferredExceptionStyle();
 
                     if (target_exception_style == CAPI) {
-                        llvm::CallSite call
+                        llvm::CallBase* call
                             = emitter.createCall(info.unw_info, g.funcs.raiseIndexErrorStrCapi,
                                                  embedConstantPtr("tuple", g.i8_ptr), CAPI, IREmitter::ALWAYS_THROWS);
                     } else {
-                        llvm::CallSite call = emitter.createCall(info.unw_info, g.funcs.raiseIndexErrorStr,
+                        llvm::CallBase* call = emitter.createCall(info.unw_info, g.funcs.raiseIndexErrorStr,
                                                                  embedConstantPtr("tuple", g.i8_ptr), CXX);
-                        call.setDoesNotReturn();
+                        call->setDoesNotReturn();
                     }
                     return undefVariable();
                 }

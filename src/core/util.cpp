@@ -110,10 +110,10 @@ void removeDirectoryIfExists(const std::string& path) {
     assert(!code);
 
     while (it != end) {
-        code = it->status(status);
-        assert(!code);
+        llvm::ErrorOr<llvm::sys::fs::basic_file_status> entry_status = it->status();
+        assert(entry_status);
 
-        if (llvm::sys::fs::is_directory(status)) {
+        if (llvm::sys::fs::is_directory(*entry_status)) {
             removeDirectoryIfExists(it->path());
         } else {
             if (VERBOSITY() >= 2)

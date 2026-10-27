@@ -1083,7 +1083,7 @@ bool ASTPrintVisitor::visit_compare(AST_Compare* node) {
     node->left->accept(this);
 
     for (int i = 0; i < node->ops.size(); i++) {
-        std::string symbol = getOpSymbol(node->ops[i]);
+        std::string symbol = getOpSymbol(node->ops[i]).str();
         stream << " " << symbol << " ";
 
         node->comparators[i]->accept(this);

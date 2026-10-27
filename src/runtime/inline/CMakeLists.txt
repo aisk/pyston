@@ -49,9 +49,9 @@ file(GLOB_RECURSE FROM_CPYTHON_HEADERS ${CMAKE_SOURCE_DIR}/from_cpython/*.h)
 
 # set compiler
 if(CCACHE)
-  set(BC_CXX ${CCACHE} ${LLVM_TOOLS_BINARY_DIR}/clang++)
+  set(BC_CXX ${CCACHE} ${LLVM_CLANGXX})
 else()
-  set(BC_CXX ${LLVM_TOOLS_BINARY_DIR}/clang++)
+  set(BC_CXX ${LLVM_CLANGXX})
 endif()
 
 # set CXX flags
@@ -64,7 +64,6 @@ else()
   set(STDLIB_SUFFIX ".release")
 endif()
 
-list(APPEND BC_CXX_FLAGS -Wno-unknown-warning-option -nostdinc++ -isystem ${BC_LIBSTDCXX_DIR}/include -isystem ${BC_LIBSTDCXX_DIR}/include-arch)
 
 # set defines
 set(BC_DEFINES "")
@@ -89,7 +88,7 @@ foreach(BC_SRC ${BC_INLINE_SRCS})
   # generate the bitcode for this file
   add_custom_command(OUTPUT ${BC_SRC_BASENAME}.bc
                      COMMAND ${BC_CXX} ${BC_DEFINES} ${BC_CXX_FLAGS} ${BC_INCLUDES} -c ${BC_SRC_FULLPATH} -o ${BC_SRC_BASENAME}.bc -emit-llvm
-                     DEPENDS copy_stdlib ${BC_SRC_FULLPATH} clang ${PYSTON_HEADERS} ${FROM_CPYTHON_HEADERS} libunwind
+                     DEPENDS copy_stdlib ${BC_SRC_FULLPATH} ${PYSTON_HEADERS} ${FROM_CPYTHON_HEADERS} libunwind
                      COMMENT "Building LLVM bitcode ${BC_SRC_BASENAME}.bc"
                      VERBATIM)
   set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_MAKE_CLEAN_FILES ${BC_SRC_BASENAME}.bc)
@@ -106,7 +105,7 @@ foreach(BC_SRC ${BC_INLINE_SRCS})
   # compile into a regular object file
   add_custom_command(OUTPUT ${BC_SRC_BASENAME}.o
                      COMMAND ${BC_CXX} ${BC_DEFINES} ${BC_CXX_FLAGS} ${BC_INCLUDES} -c ${BC_SRC_BASENAME}.pub.bc -o ${BC_SRC_BASENAME}.o
-                     DEPENDS ${BC_SRC_BASENAME}.pub.bc clang
+                     DEPENDS ${BC_SRC_BASENAME}.pub.bc
                      COMMENT "Compiling ${BC_SRC_BASENAME}.pub.bc -> ${BC_SRC_BASENAME}.o"
                      VERBATIM)
   set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_MAKE_CLEAN_FILES ${BC_SRC_BASENAME}.o)
@@ -120,13 +119,13 @@ endforeach(BC_SRC)
 # link all the bitcode files together
 add_custom_command(OUTPUT stdlib.unopt.bc
                    COMMAND ${LLVM_TOOLS_BINARY_DIR}/llvm-link -o ${CMAKE_CURRENT_BINARY_DIR}/stdlib.unopt.bc ${BC_FILES}
-                   DEPENDS ${BC_FILES} llvm-link
+                   DEPENDS ${BC_FILES}
                    COMMENT "Linking stdlib.unopt.bc")
 
 # optimize stdlib
 add_custom_command(OUTPUT stdlib${STDLIB_SUFFIX}.bc
                    COMMAND ${LLVM_TOOLS_BINARY_DIR}/opt -O3 ${OPT_OPTIONS} stdlib.unopt.bc -o stdlib${STDLIB_SUFFIX}.bc
-                   DEPENDS stdlib.unopt.bc opt
+                   DEPENDS stdlib.unopt.bc
                    COMMENT "Optimizing stdlib.unopt.bc -> stdlib.bc")
 
 add_custom_command(OUTPUT stdlib.bc.o
@@ -137,7 +136,7 @@ add_custom_command(OUTPUT stdlib.bc.o
 if(${CMAKE_BUILD_TYPE} STREQUAL "Debug")
   add_custom_command(OUTPUT stdlib.stripped.bc
                      COMMAND ${LLVM_TOOLS_BINARY_DIR}/opt -strip-debug stdlib.bc -o ${CMAKE_CURRENT_BINARY_DIR}/stdlib.stripped.bc
-                     DEPENDS stdlib.bc opt
+                     DEPENDS stdlib.bc
                      COMMENT "Stripping stdlib.bc -> stdlib.stripped.bc")
 
   add_custom_command(OUTPUT stdlib.stripped.bc.o

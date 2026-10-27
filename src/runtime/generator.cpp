@@ -435,7 +435,7 @@ extern "C" Box* yield_capi(BoxedGenerator* obj, STOLEN(Box*) value, int num_live
     }
     va_end(ap);
 
-    return yieldInternal<CAPI>(obj, value, llvm::makeArrayRef(live_values, num_live_values));
+    return yieldInternal<CAPI>(obj, value, llvm::ArrayRef(live_values, num_live_values));
 }
 
 extern "C" Box* yield(BoxedGenerator* obj, STOLEN(Box*) value, llvm::ArrayRef<Box*> live_values) {

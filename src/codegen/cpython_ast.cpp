@@ -480,7 +480,7 @@ public:
                 }
 
                 if (o->cls == str_cls) {
-                    return new (getAlloc()) AST_Str(static_cast<BoxedString*>(o)->s());
+                    return new (getAlloc()) AST_Str(static_cast<BoxedString*>(o)->s().str());
                 }
                 RELEASE_ASSERT(0, "unhandled str type: %s\n", o->cls->tp_name);
             }
@@ -729,7 +729,7 @@ public:
         ast_allocator.reset(new ASTAllocator);
         switch (mod->kind) {
             case Module_kind: {
-                AST_Module* rtn = new (getAlloc()) AST_Module(llvm::make_unique<InternedStringPool>());
+                AST_Module* rtn = new (getAlloc()) AST_Module(std::make_unique<InternedStringPool>());
                 rtn->lineno = 1;
                 assert(!this->pool);
                 this->pool = rtn->interned_strings.get();
@@ -738,7 +738,7 @@ public:
             }
             case Interactive_kind: {
                 this->interactive = 1;
-                AST_Module* rtn = new (getAlloc()) AST_Module(llvm::make_unique<InternedStringPool>());
+                AST_Module* rtn = new (getAlloc()) AST_Module(std::make_unique<InternedStringPool>());
                 rtn->lineno = 1;
                 assert(!this->pool);
                 this->pool = rtn->interned_strings.get();
@@ -746,7 +746,7 @@ public:
                 return std::make_pair(rtn, std::move(ast_allocator));
             }
             case Expression_kind: {
-                AST_Expression* rtn = new (getAlloc()) AST_Expression(llvm::make_unique<InternedStringPool>());
+                AST_Expression* rtn = new (getAlloc()) AST_Expression(std::make_unique<InternedStringPool>());
                 rtn->lineno = 1;
                 this->pool = rtn->interned_strings.get();
 

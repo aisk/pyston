@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(pyston C CXX ASM)
 
-# The bundled LLVM and some build_deps still declare compatibility with very
+# Some build_deps still declare compatibility with very
 # old CMake versions, which CMake 4 refuses unless a minimum policy is given.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "")
 
@@ -11,11 +11,6 @@ include(pyconfig)
 include(ExternalProject)
 
 set(DEPS_DIR $ENV{HOME}/pyston_deps)
-
-# The bitcode for the inlined runtime (src/runtime/inline) is compiled with the
-# bundled clang, which is too old to parse a modern libstdc++.  Point it at a
-# libstdc++ from the GCC 5 era instead; its ABI is compatible with newer ones.
-set(BC_LIBSTDCXX_DIR ${DEPS_DIR}/libstdcxx5 CACHE PATH "libstdc++ headers used when compiling runtime bitcode")
 
 if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Pyston does not support 32-bit systems yet")
@@ -194,13 +189,7 @@ add_custom_target(libjemalloc_byproducts DEPENDS ${CMAKE_BINARY_DIR}/jemalloc/li
 # COMMAND sh -c "rm -v ${CMAKE_BINARY_DIR}/jemalloc/lib/*.so*"
 # )
 
-execute_process(COMMAND cat llvm_revision.txt WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE LLVMREV OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-# llvm, clang, and libunwind patches
-add_custom_target(llvm_gotorev python3 ${CMAKE_SOURCE_DIR}/tools/git_svn_gotorev.py ${DEPS_DIR}/llvm-trunk ${LLVMREV} llvm_patches WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-add_custom_target(clang_gotorev python3 ${CMAKE_SOURCE_DIR}/tools/git_svn_gotorev.py ${DEPS_DIR}/llvm-trunk/tools/clang ${LLVMREV} clang_patches WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-add_custom_target(llvm_up DEPENDS llvm_gotorev clang_gotorev)
-
+# libunwind patches
 set(LIBUNWIND_PATCHES
   ${CMAKE_SOURCE_DIR}/libunwind_patches/0001-pyston-add-lots-of-comments.patch
   ${CMAKE_SOURCE_DIR}/libunwind_patches/0002-pyston-stop-x86_64-setcontext-restoring-uninitialize.patch
@@ -218,17 +207,28 @@ add_custom_command(OUTPUT ${CMAKE_SOURCE_DIR}/build_deps/libunwind/pyston_patche
 add_custom_target(libunwind_patched DEPENDS ${CMAKE_SOURCE_DIR}/build_deps/libunwind/pyston_patched)
 
 # llvm
-set(LLVM_TARGETS_TO_BUILD "host" CACHE STRING "LLVM targets")
-#set(LLVM_EXTERNAL_CLANG_SOURCE_DIR "${CMAKE_SOURCE_DIR}/clang" CACHE String "Clang directory")
+# The runtime bitcode (src/runtime/inline) has to be produced by a clang that
+# matches the LLVM we link against, so look for both in the same installation.
+set(LLVM_REQUIRED_VERSION 21)
+find_package(LLVM REQUIRED CONFIG HINTS /usr/lib/llvm-${LLVM_REQUIRED_VERSION}/lib/cmake/llvm)
+if(NOT LLVM_VERSION_MAJOR EQUAL LLVM_REQUIRED_VERSION)
+  message(FATAL_ERROR "LLVM ${LLVM_REQUIRED_VERSION} is required, found ${LLVM_PACKAGE_VERSION}")
+endif()
+message(STATUS "Using LLVM ${LLVM_PACKAGE_VERSION} from ${LLVM_DIR}")
 if(ENABLE_INTEL_JIT_EVENTS)
-  set(LLVM_USE_INTEL_JITEVENTS "ON" CACHE STRING "Enable building support for the Intel JIT Events API")
   set(INTEL_JIT_EVENTS_LIB "inteljitevents")
   add_definitions(-DENABLE_INTEL_JIT_EVENTS=1)
 endif()
-add_subdirectory(${DEPS_DIR}/llvm-trunk ${CMAKE_BINARY_DIR}/llvm EXCLUDE_FROM_ALL)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_BINARY_DIR}/llvm/share/llvm/cmake/")
-include(LLVMConfig)
-llvm_map_components_to_libnames(LLVM_LIBS core mcjit native bitreader bitwriter ipo irreader debuginfodwarf instrumentation ${INTEL_JIT_EVENTS_LIB})
+if(LLVM_LINK_LLVM_DYLIB)
+  set(LLVM_LIBS LLVM)
+else()
+  llvm_map_components_to_libnames(LLVM_LIBS core mcjit native bitreader bitwriter ipo irreader debuginfodwarf instrumentation passes ${INTEL_JIT_EVENTS_LIB})
+endif()
+find_program(LLVM_CLANGXX clang++ HINTS ${LLVM_TOOLS_BINARY_DIR} NO_DEFAULT_PATH)
+find_program(LLVM_CLANG_FORMAT clang-format HINTS ${LLVM_TOOLS_BINARY_DIR} NO_DEFAULT_PATH)
+if(NOT LLVM_CLANGXX)
+  message(FATAL_ERROR "clang++ not found in ${LLVM_TOOLS_BINARY_DIR}")
+endif()
 
 # libunwind
 # libunwind relies on tentative definitions in its headers, which stopped
@@ -294,12 +294,13 @@ if(ENABLE_OPROFILE)
 endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror -Wreturn-type -Wno-sign-compare -Wno-unused -Wno-unused-parameter -fno-omit-frame-pointer -g")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS} -std=c++11 -fno-rtti -fexceptions -fvisibility-inlines-hidden -ffunction-sections -fdata-sections -Woverloaded-virtual -Wno-invalid-offsetof -Wcast-qual -Wno-sign-conversion -Wnon-virtual-dtor -Winit-self -Wmissing-include-dirs -Wstrict-overflow=5 -Wpointer-arith -Wtype-limits -Wwrite-strings -Wempty-body -Waggregate-return -Wmissing-field-initializers -Wredundant-decls -Winline -Wint-to-pointer-cast -Wlong-long -Wvla -Wno-attributes -g")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS} -std=c++17 -fno-rtti -fexceptions -fvisibility-inlines-hidden -ffunction-sections -fdata-sections -Woverloaded-virtual -Wno-invalid-offsetof -Wcast-qual -Wno-sign-conversion -Wnon-virtual-dtor -Winit-self -Wmissing-include-dirs -Wstrict-overflow=5 -Wpointer-arith -Wtype-limits -Wwrite-strings -Wempty-body -Waggregate-return -Wmissing-field-initializers -Wredundant-decls -Winline -Wint-to-pointer-cast -Wlong-long -Wvla -Wno-attributes -g")
 
 # Warnings that newer compilers added, triggered by the headers of the bundled
-# LLVM and by CPython-style code (casting functions to PyCFunction, 'register').
+# LLVM and by CPython-style code (casting functions to PyCFunction, 'register'
+# which C++17 removed).
 include(CheckCXXCompilerFlag)
-foreach(FLAG deprecated-copy deprecated-register deprecated-declarations nontrivial-memcall
+foreach(FLAG deprecated-copy deprecated-register register deprecated-declarations nontrivial-memcall
              cast-function-type-mismatch address-of-packed-member bitwise-instead-of-logical
              implicit-const-int-float-conversion range-loop-construct expansion-to-defined)
   string(MAKE_C_IDENTIFIER "CXX_SUPPORTS_W${FLAG}" FLAG_VAR)
@@ -320,7 +321,7 @@ if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 endif()
 
 # Modern toolchains link position independent executables by default, but the
-# runtime bitcode is compiled by the bundled clang as non-PIC code, and the JIT
+# runtime bitcode is compiled as non-PIC code, and the JIT
 # has only ever been tested in a non-PIE address space layout.
 check_cxx_compiler_flag(-no-pie CXX_SUPPORTS_NO_PIE)
 if(CXX_SUPPORTS_NO_PIE)
@@ -340,7 +341,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${NO_PUSH_ARGS_FLAGS}")
 
 add_definitions(${LLVM_DEFINITIONS})
 add_definitions(-DDEFAULT_PYTHON_MAJOR_VERSION=2 -DDEFAULT_PYTHON_MINOR_VERSION=7 -DDEFAULT_PYTHON_MICRO_VERSION=8) # Python 2.7.8
-add_definitions(-DLLVMREV=${LLVMREV})
 
 include_directories(${CMAKE_BINARY_DIR}/include/python2.7)
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -380,7 +380,7 @@ set(TEST_THREADS 1 CACHE STRING "number of pyston test threads")
 set(PYTHONIOENCODING utf-8)
 
 add_test(NAME lint COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/lint.py WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
-add_test(NAME check-format COMMAND ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_TOOLS_BINARY_DIR}/clang-format WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME check-format COMMAND ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_CLANG_FORMAT} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME analysis_unittest COMMAND analysis_unittest)
 
 macro(add_pyston_test testname directory)
@@ -402,14 +402,14 @@ endif()
 
 # format
 file(GLOB_RECURSE FORMAT_FILES ${CMAKE_SOURCE_DIR}/src/*.h ${CMAKE_SOURCE_DIR}/src/*.cpp)
-add_custom_target(format ${CMAKE_SOURCE_DIR}/tools/do_format.sh ${LLVM_TOOLS_BINARY_DIR}/clang-format DEPENDS clang-format WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
-add_custom_target(check-format ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_TOOLS_BINARY_DIR}/clang-format DEPENDS clang-format WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
+add_custom_target(format ${CMAKE_SOURCE_DIR}/tools/do_format.sh ${LLVM_CLANG_FORMAT} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
+add_custom_target(check-format ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_CLANG_FORMAT} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
 
 # lint
 add_custom_target(lint ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/lint.py WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
 
 # check
-add_custom_target(check-deps DEPENDS pyston copy_stdlib clang-format ext_cpython ext_pyston unittests sharedmods)
+add_custom_target(check-deps DEPENDS pyston copy_stdlib ext_cpython ext_pyston unittests sharedmods)
 add_custom_target(check-pyston COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure DEPENDS check-deps)
 
 # {run,dbg,perf,memcheck,memleaks,cachegrind}_TESTNAME
@@ -437,7 +437,10 @@ else()
   add_custom_target(docs COMMAND ${CMAKE_COMMAND} -E echo "Can't create docs, doxygen not installed \(try sudo apt-get install doxygen grpahviz on Ubuntu and then rerun cmake\)" VERBATIM)
 endif()
 
-add_subdirectory(plugins/refcount_checker EXCLUDE_FROM_ALL)
+find_package(Clang CONFIG QUIET HINTS ${LLVM_INSTALL_PREFIX}/lib/cmake/clang)
+if(Clang_FOUND)
+  add_subdirectory(plugins/refcount_checker EXCLUDE_FROM_ALL)
+endif()
 
 
 # CPack config.  I think this needs to come after any other code, since it will

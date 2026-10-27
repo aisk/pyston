@@ -175,7 +175,7 @@ llvm::Instruction* findInsertionPoint(llvm::BasicBlock* BB, llvm::BasicBlock* fr
 
         remapPhis(BB, from_bb, breaker_block);
 
-        cache[key] = breaker_block->getFirstInsertionPt();
+        cache[key] = &*breaker_block->getFirstInsertionPt();
         return cache[key];
     }
 
@@ -185,7 +185,7 @@ llvm::Instruction* findInsertionPoint(llvm::BasicBlock* BB, llvm::BasicBlock* fr
         ++it;
         ++it;
         ++it;
-        cache[key] = it;
+        cache[key] = &*it;
         return &*it;
     } else {
         for (llvm::Instruction& I : *BB) {
@@ -222,12 +222,7 @@ void addIncrefs(llvm::Value* v, bool nullable, int num_refs, llvm::Instruction* 
     llvm::BasicBlock* continue_block = NULL;
     llvm::BasicBlock* incref_block;
 
-    llvm::IRBuilder<true> builder(incref_pt);
-
-    // Deal with subtypes of Box:
-    while (v->getType() != g.llvm_value_type_ptr) {
-        v = builder.CreateConstInBoundsGEP2_32(v, 0, 0);
-    }
+    llvm::IRBuilder<> builder(incref_pt);
 
     if (nullable) {
         cur_block = incref_pt->getParent();
@@ -247,13 +242,13 @@ void addIncrefs(llvm::Value* v, bool nullable, int num_refs, llvm::Instruction* 
 
 #ifdef Py_REF_DEBUG
     auto reftotal_gv = g.cur_module->getOrInsertGlobal("_Py_RefTotal", g.i64);
-    auto reftotal = builder.CreateLoad(reftotal_gv);
+    auto reftotal = builder.CreateLoad(g.i64, reftotal_gv);
     auto new_reftotal = builder.CreateAdd(reftotal, getConstantInt(num_refs, g.i64));
     builder.CreateStore(new_reftotal, reftotal_gv);
 #endif
 
-    auto refcount_ptr = builder.CreateConstInBoundsGEP2_32(v, 0, REFCOUNT_IDX);
-    auto refcount = builder.CreateLoad(refcount_ptr);
+    auto refcount_ptr = builder.CreateConstInBoundsGEP1_64(g.i8, v, offsetof(Box, ob_refcnt));
+    auto refcount = builder.CreateLoad(g.i64, refcount_ptr);
     auto new_refcount = builder.CreateAdd(refcount, getConstantInt(num_refs, g.i64));
     builder.CreateStore(new_refcount, refcount_ptr);
 
@@ -276,7 +271,7 @@ void addDecrefs(llvm::Value* v, bool nullable, int num_refs, llvm::Instruction* 
     }
 
     assert(num_refs > 0);
-    llvm::IRBuilder<true> builder(decref_pt);
+    llvm::IRBuilder<> builder(decref_pt);
 
     if (nullable) {
         llvm::BasicBlock* cur_block = decref_pt->getParent();
@@ -300,7 +295,7 @@ void addDecrefs(llvm::Value* v, bool nullable, int num_refs, llvm::Instruction* 
     RELEASE_ASSERT(num_refs == 1, "decref patchpoints don't support >1 refs");
 
     llvm::Function* patchpoint
-        = llvm::Intrinsic::getDeclaration(g.cur_module, llvm::Intrinsic::experimental_patchpoint_void);
+        = llvm::Intrinsic::getOrInsertDeclaration(g.cur_module, llvm::Intrinsic::experimental_patchpoint_void);
     int pp_id = nullable ? XDECREF_PP_ID : DECREF_PP_ID;
     int pp_size = nullable ? XDECREF_PP_SIZE : DECREF_PP_SIZE;
     builder.CreateCall(patchpoint, { getConstantInt(pp_id, g.i64), getConstantInt(pp_size, g.i32), getNullPtr(g.i8_ptr),
@@ -391,25 +386,25 @@ void addCXXFixup(llvm::Instruction* inst, const llvm::SmallVector<llvm::Tracking
     cur_block->getTerminator()->eraseFromParent();
 
     // llvm::SmallVector<llvm::Value*, 4> args(call->arg_begin(), call->arg_end());
-    llvm::SmallVector<llvm::Value*, 4> args(call->arg_operands().begin(), call->arg_operands().end());
-    llvm::InvokeInst* new_invoke
-        = InvokeInst::Create(call->getCalledValue(), continue_block, fixup_block, args, call->getName(), cur_block);
+    llvm::SmallVector<llvm::Value*, 4> args(call->args().begin(), call->args().end());
+    llvm::InvokeInst* new_invoke = InvokeInst::Create(call->getFunctionType(), call->getCalledOperand(), continue_block,
+                                                      fixup_block, args, call->getName(), cur_block);
     new_invoke->setAttributes(call->getAttributes());
     new_invoke->setDebugLoc(call->getDebugLoc());
     assert(!call->hasMetadataOtherThanDebugLoc());
     call->replaceAllUsesWith(new_invoke);
     call->eraseFromParent();
 
-    llvm::IRBuilder<true> builder(fixup_block);
+    llvm::IRBuilder<> builder(fixup_block);
 
     static llvm::Function* _personality_func = g.stdlib_module->getFunction("__gxx_personality_v0");
     assert(_personality_func);
-    llvm::Value* personality_func
+    llvm::FunctionCallee personality_func
         = g.cur_module->getOrInsertFunction(_personality_func->getName(), _personality_func->getFunctionType());
     assert(personality_func);
-    static llvm::Type* lp_type = llvm::StructType::create(std::vector<llvm::Type*>{ g.i8_ptr, g.i64 });
-    assert(lp_type);
-    llvm::LandingPadInst* landing_pad = builder.CreateLandingPad(lp_type, personality_func, 1);
+    fixup_block->getParent()->setPersonalityFn(llvm::cast<llvm::Constant>(personality_func.getCallee()));
+    llvm::Type* lp_type = llvm::StructType::get(g.context, { g.i8_ptr, g.i64 });
+    llvm::LandingPadInst* landing_pad = builder.CreateLandingPad(lp_type, 1);
     landing_pad->addClause(getNullPtr(g.i8_ptr));
 
     llvm::SmallVector<llvm::Value*, 4> call_args;
@@ -719,93 +714,8 @@ void RefcountTracker::addRefcounts(IRGenState* irstate) {
         fprintf(stderr, "\033[0m");
     }
 
-#ifndef NDEBUG
-    int num_untracked = 0;
-    auto check_val_missed = [&](llvm::Value* v) {
-        if (rt->vars.count(v))
-            return;
-
-        if (llvm::isa<UndefValue>(v))
-            return;
-
-        auto t = v->getType();
-        auto p = llvm::dyn_cast<llvm::PointerType>(t);
-        if (!p) {
-            // t->dump();
-            // printf("Not a pointer\n");
-            return;
-        }
-        auto s = llvm::dyn_cast<llvm::StructType>(p->getElementType());
-        if (!s) {
-            // t->dump();
-            // printf("Not a pointer\n");
-            return;
-        }
-
-        // Take care of inheritance.  It's represented as an instance of the base type at the beginning of the
-        // derived type, not as the types concatenated.
-        while (s->elements().size() > 0 && llvm::isa<llvm::StructType>(s->elements()[0]))
-            s = llvm::cast<llvm::StructType>(s->elements()[0]);
-
-        if (isa<ConstantPointerNull>(v))
-            return;
-
-        bool ok_type = false;
-        if (s->elements().size() >= 2 + REFCOUNT_IDX && s->elements()[REFCOUNT_IDX] == g.i64
-            && s->elements()[REFCOUNT_IDX + 1] == g.llvm_class_type_ptr) {
-            // printf("This looks likes a class\n");
-            ok_type = true;
-        }
-
-        if (!ok_type) {
-#ifndef NDEBUG
-            if (s->getName().startswith("struct.pyston::Box")
-                || (s->getName().startswith("Py") && s->getName().endswith("Object"))
-                || s->getName().startswith("class.pyston::Box")) {
-                v->dump();
-                s->dump();
-                if (s && s->elements().size() >= 2) {
-                    s->elements()[0]->dump();
-                    s->elements()[1]->dump();
-                }
-                fprintf(stderr, "This is named like a refcounted object though it doesn't look like one");
-                assert(0);
-            }
-#endif
-            return;
-        }
-
-        if (rt->vars.count(v) == 0) {
-            num_untracked++;
-            printf("missed a refcounted object: ");
-            fflush(stdout);
-            v->dump();
-            abort();
-        }
-    };
-
-    for (auto&& g : f->getParent()->getGlobalList()) {
-        // g.dump();
-        check_val_missed(&g);
-    }
-
-    for (auto&& a : f->args()) {
-        check_val_missed(&a);
-    }
-
-    for (auto&& BB : *f) {
-        for (auto&& inst : BB) {
-            check_val_missed(&inst);
-            for (auto&& u : inst.uses()) {
-                check_val_missed(u.get());
-            }
-            for (auto&& op : inst.operands()) {
-                check_val_missed(op);
-            }
-        }
-    }
-    ASSERT(num_untracked == 0, "");
-#endif
+    // There used to be a debug check here that every value whose LLVM type looked like a Box* was tracked.  With
+    // opaque pointers the LLVM type no longer says what a pointer points to, so it can't be done any more.
 
     struct RefOp {
         llvm::TrackingVH<llvm::Value> operand;
@@ -846,13 +756,13 @@ void RefcountTracker::addRefcounts(IRGenState* irstate) {
 
     std::vector<llvm::InvokeInst*> invokes;
     std::vector<llvm::CallInst*> yields;
-    for (auto&& II : llvm::inst_range(f)) {
+    for (auto&& II : llvm::instructions(f)) {
         llvm::Instruction* inst = &II;
 
         // is this a yield?
         if (llvm::isa<llvm::CallInst>(inst)) {
             llvm::CallInst* call = llvm::cast<llvm::CallInst>(inst);
-            if (call->getCalledValue() == g.funcs.yield_capi)
+            if (call->getCalledOperand() == g.funcs.yield_capi.getCallee())
                 yields.push_back(call);
         }
 
@@ -1253,7 +1163,7 @@ void RefcountTracker::addRefcounts(IRGenState* irstate) {
     // we have to create a new call instruction because we can't add arguments to an existing call instruction
     for (auto&& old_yield : yields) {
         auto&& state = states[bbg.bb_idx[old_yield->getParent()]];
-        assert(old_yield->getNumArgOperands() == 3);
+        assert(old_yield->arg_size() == 3);
         llvm::Value* yield_value = old_yield->getArgOperand(1);
 
         llvm::SmallVector<llvm::Value*, 8> args;

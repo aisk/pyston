@@ -110,7 +110,7 @@ public:
     return const_iterator(getBucketsEnd(), getBucketsEnd(), true);
   }
 
-  bool LLVM_ATTRIBUTE_UNUSED_RESULT empty() const {
+  [[nodiscard]] bool empty() const {
     return getNumEntries() == 0;
   }
   unsigned size() const { return getNumEntries(); }
@@ -357,7 +357,7 @@ protected:
     setNumEntries(other.getNumEntries());
     setNumTombstones(other.getNumTombstones());
 
-    if (isPodLike<KeyT>::value && isPodLike<ValueT>::value)
+    if (std::is_trivially_copyable<KeyT>::value && std::is_trivially_copyable<ValueT>::value)
       memcpy(getBuckets(), other.getBuckets(),
              getNumBuckets() * sizeof(BucketT));
     else

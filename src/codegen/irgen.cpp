@@ -19,23 +19,20 @@
 #include <set>
 #include <stdint.h>
 
-#include "llvm/Analysis/Passes.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
-#if LLVMREV < 229094
-#include "llvm/PassManager.h"
-#else
-#include "llvm/IR/LegacyPassManager.h"
-#endif
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetSubtargetInfo.h"
-#include "llvm/Transforms/Instrumentation.h"
-#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
 #include "analysis/function_analysis.h"
 #include "analysis/scoping_analysis.h"
@@ -45,9 +42,7 @@
 #include "codegen/gcbuilder.h"
 #include "codegen/irgen/irgenerator.h"
 #include "codegen/irgen/util.h"
-#include "codegen/opt/escape_analysis.h"
 #include "codegen/opt/inliner.h"
-#include "codegen/opt/passes.h"
 #include "codegen/osrentry.h"
 #include "codegen/patchpoints.h"
 #include "codegen/stackmaps.h"
@@ -65,9 +60,11 @@ typedef std::unordered_set<CFGBlock*> BlockSet;
 
 // This is where you can add a hook for any instruction added through the IRBuilder.
 // It's currently not doing any hooking; hopefully there's not too much overhead from this.
-void MyInserter::InsertHelper(llvm::Instruction* I, const llvm::Twine& Name, llvm::BasicBlock* BB,
+void MyInserter::InsertHelper(llvm::Instruction* I, const llvm::Twine& Name,
                               llvm::BasicBlock::iterator InsertPt) const {
-    llvm::IRBuilderDefaultInserter<true>::InsertHelper(I, Name, BB, InsertPt);
+    llvm::IRBuilderDefaultInserter::InsertHelper(I, Name, InsertPt);
+    if (llvm::CallBase* call = llvm::dyn_cast<llvm::CallBase>(I))
+        applyRuntimeFunctionAttributes(call);
 }
 
 static void optimizeIR(llvm::Function* f, EffortLevel effort) {
@@ -78,121 +75,32 @@ static void optimizeIR(llvm::Function* f, EffortLevel effort) {
 
     Timer _t("optimizing");
 
-#if LLVMREV < 229094
-    llvm::FunctionPassManager fpm(g.cur_module);
-#else
-    llvm::legacy::FunctionPassManager fpm(g.cur_module);
-#endif
-
-
-#if LLVMREV < 217548
-    fpm.add(new llvm::DataLayoutPass(*g.tm->getDataLayout()));
-#else
-    fpm.add(new llvm::DataLayoutPass());
-#endif
-
-    if (ENABLE_PYSTON_PASSES) {
-        fpm.add(createRemoveUnnecessaryBoxingPass());
-        fpm.add(createRemoveDuplicateBoxingPass());
-    }
-
     if (ENABLE_INLINING && effort >= EffortLevel::MAXIMAL)
-        fpm.add(makeFPInliner(275));
-    fpm.add(llvm::createCFGSimplificationPass());
+        inlineRuntimeCalls(*f, 275);
 
-    fpm.add(llvm::createBasicAliasAnalysisPass());
-    fpm.add(llvm::createTypeBasedAliasAnalysisPass());
-    if (ENABLE_PYSTON_PASSES) {
-        fpm.add(new EscapeAnalysis());
-        fpm.add(createPystonAAPass());
-    }
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
 
-    if (ENABLE_PYSTON_PASSES)
-        fpm.add(createMallocsNonNullPass());
+    llvm::PassBuilder pb(g.tm);
+    fam.registerPass([&] { return pb.buildDefaultAAPipeline(); });
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     // TODO: find the right set of passes
-    if (1) {
-        // Small set of passes:
-        fpm.add(llvm::createInstructionCombiningPass());
-        fpm.add(llvm::createReassociatePass());
-        fpm.add(llvm::createGVNPass());
-        fpm.add(llvm::createCFGSimplificationPass());
-
-        if (ENABLE_PYSTON_PASSES) {
-            fpm.add(createConstClassesPass());
-            fpm.add(createDeadAllocsPass());
-            fpm.add(llvm::createInstructionCombiningPass());
-            fpm.add(llvm::createCFGSimplificationPass());
-        }
-    } else {
-        // TODO Find the right place for this pass (and ideally not duplicate it)
-        if (ENABLE_PYSTON_PASSES) {
-            fpm.add(llvm::createGVNPass());
-            fpm.add(createConstClassesPass());
-        }
-
-        // copied + slightly modified from llvm/lib/Transforms/IPO/PassManagerBuilder.cpp::populateModulePassManager
-        fpm.add(llvm::createEarlyCSEPass());                   // Catch trivial redundancies
-        fpm.add(llvm::createJumpThreadingPass());              // Thread jumps.
-        fpm.add(llvm::createCorrelatedValuePropagationPass()); // Propagate conditionals
-        fpm.add(llvm::createCFGSimplificationPass());          // Merge & remove BBs
-        fpm.add(llvm::createInstructionCombiningPass());       // Combine silly seq's
-
-        fpm.add(llvm::createTailCallEliminationPass()); // Eliminate tail calls
-        fpm.add(llvm::createCFGSimplificationPass());   // Merge & remove BBs
-        fpm.add(llvm::createReassociatePass());         // Reassociate expressions
-        fpm.add(llvm::createLoopRotatePass());          // Rotate Loop
-        fpm.add(llvm::createLICMPass());                // Hoist loop invariants
-        fpm.add(llvm::createLoopUnswitchPass(true /*optimize_for_size*/));
-        fpm.add(llvm::createInstructionCombiningPass());
-        fpm.add(llvm::createIndVarSimplifyPass()); // Canonicalize indvars
-        fpm.add(llvm::createLoopIdiomPass());      // Recognize idioms like memset.
-        fpm.add(llvm::createLoopDeletionPass());   // Delete dead loops
-
-        fpm.add(llvm::createLoopUnrollPass()); // Unroll small loops
-
-        fpm.add(llvm::createGVNPass());       // Remove redundancies
-        fpm.add(llvm::createMemCpyOptPass()); // Remove memcpy / form memset
-        fpm.add(llvm::createSCCPPass());      // Constant prop with SCCP
-
-        // Run instcombine after redundancy elimination to exploit opportunities
-        // opened up by them.
-        fpm.add(llvm::createInstructionCombiningPass());
-        fpm.add(llvm::createJumpThreadingPass()); // Thread jumps
-        fpm.add(llvm::createCorrelatedValuePropagationPass());
-        fpm.add(llvm::createDeadStoreEliminationPass()); // Delete dead stores
-
-        fpm.add(llvm::createLoopRerollPass());
-        // fpm.add(llvm::createSLPVectorizerPass());   // Vectorize parallel scalar chains.
-
-
-        fpm.add(llvm::createAggressiveDCEPass());        // Delete dead instructions
-        fpm.add(llvm::createCFGSimplificationPass());    // Merge & remove BBs
-        fpm.add(llvm::createInstructionCombiningPass()); // Clean up after everything.
-
-        // fpm.add(llvm::createBarrierNoopPass());
-        // fpm.add(llvm::createLoopVectorizePass(DisableUnrollLoops, LoopVectorize));
-        fpm.add(llvm::createInstructionCombiningPass());
-        fpm.add(llvm::createCFGSimplificationPass());
-
-        // TODO Find the right place for this pass (and ideally not duplicate it)
-        if (ENABLE_PYSTON_PASSES) {
-            fpm.add(createConstClassesPass());
-            fpm.add(llvm::createInstructionCombiningPass());
-            fpm.add(llvm::createCFGSimplificationPass());
-            fpm.add(createConstClassesPass());
-            fpm.add(createDeadAllocsPass());
-            // fpm.add(llvm::createSCCPPass());                  // Constant prop with SCCP
-            // fpm.add(llvm::createEarlyCSEPass());              // Catch trivial redundancies
-            // fpm.add(llvm::createInstructionCombiningPass());
-            // fpm.add(llvm::createCFGSimplificationPass());
-        }
-    }
-
-    fpm.doInitialization();
+    llvm::FunctionPassManager fpm;
+    fpm.addPass(llvm::SimplifyCFGPass());
+    fpm.addPass(llvm::InstCombinePass());
+    fpm.addPass(llvm::ReassociatePass());
+    fpm.addPass(llvm::GVNPass());
+    fpm.addPass(llvm::SimplifyCFGPass());
 
     for (int i = 0; i < MAX_OPT_ITERATIONS; i++) {
-        bool changed = fpm.run(*f);
+        bool changed = !fpm.run(*f, fam).areAllPreserved();
 
         if (!changed) {
             if (VERBOSITY("irgen") >= 2)
@@ -456,24 +364,9 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
             llvm::Value* from_arg;
             arg_num++;
 
-            llvm::Value* ptr = entry_emitter->getBuilder()->CreateConstGEP1_32(passed_vars, arg_num);
-            if (p.second == INT) {
-                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.i64->getPointerTo());
-            } else if (p.second == BOOL) {
-                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, BOOL->llvmType()->getPointerTo());
-            } else if (p.second == FLOAT) {
-                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.double_->getPointerTo());
-            } else if (p.second == GENERATOR) {
-                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.llvm_generator_type_ptr->getPointerTo());
-            } else if (p.second == CLOSURE) {
-                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.llvm_closure_type_ptr->getPointerTo());
-            } else if (p.second == FRAME_INFO) {
-                ptr = entry_emitter->getBuilder()->CreateBitCast(
-                    ptr, g.llvm_frame_info_type->getPointerTo()->getPointerTo());
-            } else {
-                assert(p.second->llvmType() == g.llvm_value_type_ptr);
-            }
-            from_arg = entry_emitter->getBuilder()->CreateLoad(ptr);
+            // Every passed variable takes up one 8-byte slot, whatever its type is.
+            llvm::Value* ptr = entry_emitter->getBuilder()->CreateConstGEP1_32(g.i64, passed_vars, arg_num);
+            from_arg = entry_emitter->getBuilder()->CreateLoad(p.second->llvmType(), ptr);
             assert(from_arg->getType() == p.second->llvmType());
 
             ConcreteCompilerType* phi_type;
@@ -513,9 +406,8 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
         for (int vreg : entry_descriptor->potentially_undefined) {
             arg_num++;
 
-            llvm::Value* ptr = entry_emitter->getBuilder()->CreateConstGEP1_32(passed_vars, arg_num);
-            ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, BOOL->llvmType()->getPointerTo());
-            llvm::Value* from_arg = entry_emitter->getBuilder()->CreateLoad(ptr);
+            llvm::Value* ptr = entry_emitter->getBuilder()->CreateConstGEP1_32(g.i64, passed_vars, arg_num);
+            llvm::Value* from_arg = entry_emitter->getBuilder()->CreateLoad(BOOL->llvmType(), ptr);
 
             osr_definedness[vreg] = from_arg;
             // osr_definedness[vreg] = getConstantInt(0, BOOL->llvmType());
@@ -597,7 +489,7 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
                 emitter->getBuilder()->SetInsertPoint(preentry_bb);
 
                 llvm::Value* call_count_ptr = embedRelocatablePtr(&cf->times_called, g.i64->getPointerTo());
-                llvm::Value* cur_call_count = emitter->getBuilder()->CreateLoad(call_count_ptr);
+                llvm::Value* cur_call_count = emitter->getBuilder()->CreateLoad(g.i64, call_count_ptr);
                 llvm::Value* new_call_count
                     = emitter->getBuilder()->CreateAdd(cur_call_count, getConstantInt(1, g.i64));
                 emitter->getBuilder()->CreateStore(new_call_count, call_count_ptr);
@@ -624,9 +516,8 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
                 llvm::Value* r = emitter->getBuilder()->CreateCall(g.funcs.reoptCompiledFunc,
                                                                    embedRelocatablePtr(cf, g.i8->getPointerTo()));
                 assert(r);
-                assert(r->getType() == g.i8->getPointerTo());
+                assert(r->getType() == g.i8_ptr);
 
-                llvm::Value* bitcast_r = emitter->getBuilder()->CreateBitCast(r, irstate->getLLVMFunction()->getType());
 
                 std::vector<llvm::Value*> args;
                 // bitcast_r->dump();
@@ -636,7 +527,8 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
                     args.push_back(&(*AI));
                 }
                 // printf("%ld\n", args.size());
-                llvm::CallInst* postcall = emitter->getBuilder()->CreateCall(bitcast_r, args);
+                llvm::CallInst* postcall = emitter->getBuilder()->CreateCall(
+                    llvm::FunctionCallee(irstate->getLLVMFunction()->getFunctionType(), r), args);
                 postcall->setTailCall(true);
                 emitter->getBuilder()->CreateRet(postcall);
 
@@ -994,14 +886,13 @@ static llvm::MDNode* setupDebugInfo(BoxedCode* code, llvm::Function* f, std::str
     std::string dir = "";
     std::string producer = "pyston; git rev " STRINGIFY(GITREV);
 
-    llvm::DIFile file = builder.createFile(fn->s(), dir);
-    llvm::DITypeArray param_types = builder.getOrCreateTypeArray(llvm::None);
-    llvm::DICompositeType func_type = builder.createSubroutineType(file, param_types);
-    llvm::DISubprogram func_info = builder.createFunction(file, f->getName(), f->getName(), file, lineno, func_type,
-                                                          false, true, lineno + 1, 0, true, f);
-
-    llvm::DICompileUnit compile_unit
-        = builder.createCompileUnit(llvm::dwarf::DW_LANG_Python, fn->s(), dir, producer, true, "", 0);
+    llvm::DIFile* file = builder.createFile(fn->s(), dir);
+    builder.createCompileUnit(llvm::dwarf::DW_LANG_Python, file, producer, true, "", 0);
+    llvm::DISubroutineType* func_type = builder.createSubroutineType(builder.getOrCreateTypeArray({}));
+    llvm::DISubprogram* func_info
+        = builder.createFunction(file, f->getName(), f->getName(), file, lineno, func_type, lineno + 1,
+                                 llvm::DINode::FlagZero, llvm::DISubprogram::SPFlagDefinition);
+    f->setSubprogram(func_info);
 
     builder.finalize();
     return func_info;
@@ -1039,15 +930,9 @@ std::pair<CompiledFunction*, llvm::Function*> doCompile(BoxedCode* code, SourceI
 
     clearRelocatableSymsMap();
 
-    std::string name = getUniqueFunctionName(nameprefix, effort, entry_descriptor);
+    std::string name = getUniqueFunctionName(nameprefix.str(), effort, entry_descriptor);
     g.cur_module = new llvm::Module(name, g.context);
-#if LLVMREV < 217070 // not sure if this is the right rev
-    g.cur_module->setDataLayout(g.tm->getDataLayout()->getStringRepresentation());
-#elif LLVMREV < 227113
-    g.cur_module->setDataLayout(g.tm->getSubtargetImpl()->getDataLayout());
-#else
-    g.cur_module->setDataLayout(g.tm->getDataLayout());
-#endif
+    g.cur_module->setDataLayout(g.tm->createDataLayout());
     // g.engine->addModule(g.cur_module);
 
     ////
@@ -1094,10 +979,12 @@ std::pair<CompiledFunction*, llvm::Function*> doCompile(BoxedCode* code, SourceI
     llvm::FunctionType* ft = llvm::FunctionType::get(cf->getReturnType()->llvmType(), llvm_arg_types, false /*vararg*/);
 
     llvm::Function* f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, name, g.cur_module);
+    // Our frame introspection and unwinding expect every JIT'd frame to have a frame pointer.
+    f->addFnAttr("frame-pointer", "all");
 
     // g.func_registry.registerFunction(f, g.cur_module);
 
-    llvm::MDNode* dbg_funcinfo = setupDebugInfo(code, f, nameprefix);
+    llvm::MDNode* dbg_funcinfo = setupDebugInfo(code, f, nameprefix.str());
 
     irgen_us += _t2.split();
 

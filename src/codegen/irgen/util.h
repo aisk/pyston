@@ -41,6 +41,12 @@ llvm::Constant* getConstantDouble(double val);
 llvm::Constant* getConstantInt(int64_t val, llvm::Type*);
 llvm::Constant* getNullPtr(llvm::Type* t);
 
+// Calls to runtime functions go through constant addresses rather than declarations, so they don't pick up the
+// parameter attributes (ex: zeroext on bools) automatically.  Remember the declarations from the stdlib so that
+// they can be copied over to the calls.
+void registerRuntimeFunction(llvm::Value* callee, llvm::Function* decl);
+void applyRuntimeFunctionAttributes(llvm::CallBase* call);
+
 void clearRelocatableSymsMap();
 void setPointersInCodeStorage(std::vector<const void*>* v);
 const void* getValueOfRelocatableSym(llvm::StringRef str);

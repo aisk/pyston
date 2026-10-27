@@ -71,14 +71,10 @@ static void compileIR(CompiledFunction* cf, llvm::Function* func, EffortLevel ef
         Timer _t("to jit the IR");
         llvm::Module* module = func->getParent();
 
-#if LLVMREV < 215967
-        g.engine->addModule(module);
-#else
         g.engine->addModule(std::unique_ptr<llvm::Module>(module));
-#endif
 
         g.cur_cf = cf;
-        void* compiled = (void*)g.engine->getFunctionAddress(func->getName());
+        void* compiled = (void*)g.engine->getFunctionAddress(func->getName().str());
         g.cur_cf = NULL;
         assert(compiled);
         ASSERT(compiled == cf->code, "cf->code should have gotten filled in");
@@ -91,7 +87,7 @@ static void compileIR(CompiledFunction* cf, llvm::Function* func, EffortLevel ef
 
         if (VERBOSITY() >= 1 && us > 100000) {
             printf("Took %.1fs to compile %s\n", us * 0.000001, func->getName().data());
-            printf("Has %ld basic blocks\n", func->getBasicBlockList().size());
+            printf("Has %ld basic blocks\n", func->size());
         }
 
         g.engine->removeModule(module);

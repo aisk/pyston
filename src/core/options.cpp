@@ -75,10 +75,11 @@ bool ENABLE_OSR = 1 && _GLOBAL_ENABLE;
 bool ENABLE_LLVMOPTS = 1 && _GLOBAL_ENABLE;
 bool ENABLE_INLINING = 1 && _GLOBAL_ENABLE;
 bool ENABLE_REOPT = 1 && _GLOBAL_ENABLE;
-bool ENABLE_PYSTON_PASSES = 0 && _GLOBAL_ENABLE;
 bool ENABLE_TYPE_FEEDBACK = 1 && _GLOBAL_ENABLE;
 bool ENABLE_RUNTIME_ICS = 1 && _GLOBAL_ENABLE;
-bool ENABLE_JIT_OBJECT_CACHE = 1 && _GLOBAL_ENABLE;
+// The object cache relied on a patched LLVM that could emit symbolic stackmap entries, so it is disabled until
+// it is reimplemented on top of upstream LLVM.
+bool ENABLE_JIT_OBJECT_CACHE = 0 && _GLOBAL_ENABLE;
 
 bool ENABLE_FRAME_INTROSPECTION = 1;
 

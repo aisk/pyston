@@ -19,49 +19,47 @@
 // http://lists.cs.uiuc.edu/pipermail/cfe-dev/2014-June/037519.html
 #include "core/types.h"
 
-namespace llvm {
-class Value;
-}
+#include "llvm/IR/DerivedTypes.h"
 
 namespace pyston {
 
 struct GlobalFuncs {
-    llvm::Value* allowGLReadPreemption;
+    llvm::FunctionCallee allowGLReadPreemption;
 
-    llvm::Value* softspace;
+    llvm::FunctionCallee softspace;
 
-    llvm::Value* printf, *my_assert, *malloc, *free;
+    llvm::FunctionCallee printf, my_assert, malloc, free;
 
-    llvm::Value* boxInt, *unboxInt, *boxFloat, *unboxFloat, *createFunctionFromMetadata, *boxInstanceMethod, *boxBool,
-        *unboxBool, *createTuple, *createDict, *createList, *createSlice, *createUserClass, *createClosure,
-        *createGenerator, *createSet, *initFrame, *deinitFrame, *deinitFrameMaybe, *makePendingCalls, *setFrameExcInfo;
-    llvm::Value* getattr, *getattr_capi, *setattr, *delattr, *delitem, *delGlobal, *nonzero, *binop, *compare,
-        *augbinop, *unboxedLen, *getitem, *getitem_capi, *getclsattr, *getGlobal, *setitem, *unaryop, *import,
-        *importFrom, *importStar, *repr, *exceptionMatches, *yield_capi, *getiterHelper, *hasnext, *setGlobal,
-        *apply_slice, *applySlice, *assignSlice;
+    llvm::FunctionCallee boxInt, unboxInt, boxFloat, unboxFloat, createFunctionFromMetadata, boxInstanceMethod, boxBool,
+        unboxBool, createTuple, createDict, createList, createSlice, createUserClass, createClosure,
+        createGenerator, createSet, initFrame, deinitFrame, deinitFrameMaybe, makePendingCalls, setFrameExcInfo;
+    llvm::FunctionCallee getattr, getattr_capi, setattr, delattr, delitem, delGlobal, nonzero, binop, compare,
+        augbinop, unboxedLen, getitem, getitem_capi, getclsattr, getGlobal, setitem, unaryop, import,
+        importFrom, importStar, repr, exceptionMatches, yield_capi, getiterHelper, hasnext, setGlobal,
+        apply_slice, applySlice, assignSlice;
 
-    llvm::Value* unpackIntoArray, *raiseAttributeError, *raiseAttributeErrorStr, *raiseAttributeErrorCapi,
-        *raiseAttributeErrorStrCapi, *raiseNotIterableError, *raiseIndexErrorStr, *raiseIndexErrorStrCapi,
-        *assertNameDefined, *assertFail, *assertFailDerefNameDefined, *printExprHelper, *printHelper;
-    llvm::Value* listAppendInternal, *dictSetInternal;
-    ExceptionSwitchable<llvm::Value*> runtimeCall0, runtimeCall1, runtimeCall2, runtimeCall3, runtimeCall, runtimeCallN;
-    ExceptionSwitchable<llvm::Value*> callattr0, callattr1, callattr2, callattr3, callattr, callattrN;
-    llvm::Value* reoptCompiledFunc, *compilePartialFunc;
-    llvm::Value* exec;
-    llvm::Value* boxedLocalsSet, *boxedLocalsGet, *boxedLocalsDel;
+    llvm::FunctionCallee unpackIntoArray, raiseAttributeError, raiseAttributeErrorStr, raiseAttributeErrorCapi,
+        raiseAttributeErrorStrCapi, raiseNotIterableError, raiseIndexErrorStr, raiseIndexErrorStrCapi,
+        assertNameDefined, assertFail, assertFailDerefNameDefined, printExprHelper, printHelper;
+    llvm::FunctionCallee listAppendInternal, dictSetInternal;
+    ExceptionSwitchable<llvm::FunctionCallee> runtimeCall0, runtimeCall1, runtimeCall2, runtimeCall3, runtimeCall, runtimeCallN;
+    ExceptionSwitchable<llvm::FunctionCallee> callattr0, callattr1, callattr2, callattr3, callattr, callattrN;
+    llvm::FunctionCallee reoptCompiledFunc, compilePartialFunc;
+    llvm::FunctionCallee exec;
+    llvm::FunctionCallee boxedLocalsSet, boxedLocalsGet, boxedLocalsDel;
 
-    llvm::Value* __cxa_end_catch;
-    llvm::Value* raise0, *raise0_capi, *raise3, *raise3_capi, *rawReraise;
-    llvm::Value* PyErr_Fetch, *PyErr_NormalizeException, *PyErr_Restore, *caughtCapiException, *reraiseCapiExcAsCxx;
-    llvm::Value* deopt;
-    llvm::Value* checkRefs, *xdecrefAndRethrow;
+    llvm::FunctionCallee __cxa_end_catch;
+    llvm::FunctionCallee raise0, raise0_capi, raise3, raise3_capi, rawReraise;
+    llvm::FunctionCallee PyErr_Fetch, PyErr_NormalizeException, PyErr_Restore, caughtCapiException, reraiseCapiExcAsCxx;
+    llvm::FunctionCallee deopt;
+    llvm::FunctionCallee checkRefs, xdecrefAndRethrow;
 
-    llvm::Value* div_float_float, *floordiv_float_float, *mod_float_float, *pow_float_float;
+    llvm::FunctionCallee div_float_float, floordiv_float_float, mod_float_float, pow_float_float;
 
-    llvm::Value* dump;
+    llvm::FunctionCallee dump;
 
 #ifdef Py_TRACE_REFS
-    llvm::Value* _Py_Dealloc;
+    llvm::FunctionCallee _Py_Dealloc;
 #endif
 };
 }
