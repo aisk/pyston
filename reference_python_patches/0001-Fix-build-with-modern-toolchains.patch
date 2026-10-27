@@ -1,0 +1,251 @@
+Fix building CPython 2.7.8 with modern toolchains (C23 libm, OpenSSL 3, ncurses 6).
+
+This is the CPython that the Pyston tests compare against; see tools/setup_deps.sh.
+The same changes are applied to the copies of these files in from_cpython/.
+
+diff --git a/Modules/_cursesmodule.c b/Modules/_cursesmodule.c
+index 7c9d0109..15c5783b 100644
+--- a/Modules/_cursesmodule.c
++++ b/Modules/_cursesmodule.c
+@@ -113,6 +113,13 @@ char *PyCursesVersion = "2.2";
+ #define CURSES_MODULE
+ #include "py_curses.h"
+ 
++/* ncurses 6 makes WINDOW opaque, but provides is_pad() instead (backported from CPython 2.7.18) */
++#if NCURSES_EXT_FUNCS+0 >= 20170401 && NCURSES_EXT_COLORS+0 >= 20170401
++#define py_is_pad(win)      is_pad(win)
++#elif defined(WINDOW_HAS_FLAGS)
++#define py_is_pad(win)      ((win) ? ((win)->_flags & _ISPAD) != 0 : FALSE)
++#endif
++
+ /*  These prototypes are in <term.h>, but including this header
+     #defines many common symbols (such as "lines") which breaks the
+     curses module in other ways.  So the code will just specify
+@@ -806,8 +813,8 @@ PyCursesWindow_EchoChar(PyCursesWindowObject *self, PyObject *args)
+         return NULL;
+     }
+ 
+-#ifdef WINDOW_HAS_FLAGS
+-    if (self->win->_flags & _ISPAD)
++#ifdef py_is_pad
++    if (py_is_pad(self->win))
+         return PyCursesCheckERR(pechochar(self->win, ch | attr),
+                                 "echochar");
+     else
+@@ -1234,10 +1241,10 @@ PyCursesWindow_NoOutRefresh(PyCursesWindowObject *self, PyObject *args)
+     int pminrow,pmincol,sminrow,smincol,smaxrow,smaxcol;
+     int rtn;
+ 
+-#ifndef WINDOW_HAS_FLAGS
++#ifndef py_is_pad
+     if (0)
+ #else
+-        if (self->win->_flags & _ISPAD)
++        if (py_is_pad(self->win))
+ #endif
+         {
+             switch(PyTuple_Size(args)) {
+@@ -1377,10 +1384,10 @@ PyCursesWindow_Refresh(PyCursesWindowObject *self, PyObject *args)
+     int pminrow,pmincol,sminrow,smincol,smaxrow,smaxcol;
+     int rtn;
+ 
+-#ifndef WINDOW_HAS_FLAGS
++#ifndef py_is_pad
+     if (0)
+ #else
+-        if (self->win->_flags & _ISPAD)
++        if (py_is_pad(self->win))
+ #endif
+         {
+             switch(PyTuple_Size(args)) {
+@@ -1446,8 +1453,8 @@ PyCursesWindow_SubWin(PyCursesWindowObject *self, PyObject *args)
+     }
+ 
+     /* printf("Subwin: %i %i %i %i   \n", nlines, ncols, begin_y, begin_x); */
+-#ifdef WINDOW_HAS_FLAGS
+-    if (self->win->_flags & _ISPAD)
++#ifdef py_is_pad
++    if (py_is_pad(self->win))
+         win = subpad(self->win, nlines, ncols, begin_y, begin_x);
+     else
+ #endif
+diff --git a/Modules/_ssl.c b/Modules/_ssl.c
+index 8d0a4931..35b8066e 100644
+--- a/Modules/_ssl.c
++++ b/Modules/_ssl.c
+@@ -99,6 +99,17 @@ enum py_ssl_version {
+ #include "openssl/err.h"
+ #include "openssl/rand.h"
+ 
++/* OpenSSL 1.1 dropped SSLv2 without defining OPENSSL_NO_SSL2. */
++#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(OPENSSL_NO_SSL2)
++#define OPENSSL_NO_SSL2
++#endif
++
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++#define X509_NAME_ENTRY_set(ne) ((ne)->set)
++#define X509_EXTENSION_get_data(ext) ((ext)->value)
++#define ASN1_STRING_get0_data ASN1_STRING_data
++#endif
++
+ /* SSL error object */
+ static PyObject *PySSLErrorObject;
+ 
+@@ -314,8 +325,10 @@ newPySSLObject(PySocketSockObject *Sock, char *key_file, char *cert_file,
+     PySSL_BEGIN_ALLOW_THREADS
+     if (proto_version == PY_SSL_VERSION_TLS1)
+         self->ctx = SSL_CTX_new(TLSv1_method()); /* Set up context */
++#ifndef OPENSSL_NO_SSL3_METHOD
+     else if (proto_version == PY_SSL_VERSION_SSL3)
+         self->ctx = SSL_CTX_new(SSLv3_method()); /* Set up context */
++#endif
+ #ifndef OPENSSL_NO_SSL2
+     else if (proto_version == PY_SSL_VERSION_SSL2)
+         self->ctx = SSL_CTX_new(SSLv2_method()); /* Set up context */
+@@ -621,7 +634,7 @@ _create_tuple_for_X509_NAME (X509_NAME *xname)
+ 
+         /* check to see if we've gotten to a new RDN */
+         if (rdn_level >= 0) {
+-            if (rdn_level != entry->set) {
++            if (rdn_level != X509_NAME_ENTRY_set(entry)) {
+                 /* yes, new RDN */
+                 /* add old RDN to DN */
+                 rdnt = PyList_AsTuple(rdn);
+@@ -638,7 +651,7 @@ _create_tuple_for_X509_NAME (X509_NAME *xname)
+                     goto fail0;
+             }
+         }
+-        rdn_level = entry->set;
++        rdn_level = X509_NAME_ENTRY_set(entry);
+ 
+         /* now add this attribute to the current RDN */
+         name = X509_NAME_ENTRY_get_object(entry);
+@@ -740,16 +753,16 @@ _get_peer_alt_names (X509 *certificate) {
+             goto fail;
+         }
+ 
+-        p = ext->value->data;
++        p = ASN1_STRING_get0_data(X509_EXTENSION_get_data(ext));
+         if (method->it)
+             names = (GENERAL_NAMES*) (ASN1_item_d2i(NULL,
+                                                     &p,
+-                                                    ext->value->length,
++                                                    ASN1_STRING_length(X509_EXTENSION_get_data(ext)),
+                                                     ASN1_ITEM_ptr(method->it)));
+         else
+             names = (GENERAL_NAMES*) (method->d2i(NULL,
+                                                   &p,
+-                                                  ext->value->length));
++                                                  ASN1_STRING_length(X509_EXTENSION_get_data(ext))));
+ 
+         for(j = 0; j < sk_GENERAL_NAME_num(names); j++) {
+             /* get a rendering of each name in the set of names */
+@@ -1609,6 +1622,7 @@ Returns 1 if the OpenSSL PRNG has been seeded with enough data and 0 if not.\n\
+ It is necessary to seed the PRNG with RAND_add() on some platforms before\n\
+ using the ssl() function.");
+ 
++#ifndef OPENSSL_NO_EGD
+ static PyObject *
+ PySSL_RAND_egd(PyObject *self, PyObject *arg)
+ {
+@@ -1634,6 +1648,7 @@ PyDoc_STRVAR(PySSL_RAND_egd_doc,
+ Queries the entropy gather daemon (EGD) on the socket named by 'path'.\n\
+ Returns number of bytes read.  Raises SSLError if connection to EGD\n\
+ fails or if it does not provide enough data to seed PRNG.");
++#endif /* OPENSSL_NO_EGD */
+ 
+ #endif /* HAVE_OPENSSL_RAND */
+ 
+@@ -1648,8 +1663,10 @@ static PyMethodDef PySSL_methods[] = {
+ #ifdef HAVE_OPENSSL_RAND
+     {"RAND_add",            PySSL_RAND_add, METH_VARARGS,
+      PySSL_RAND_add_doc},
++#ifndef OPENSSL_NO_EGD
+     {"RAND_egd",            PySSL_RAND_egd, METH_O,
+      PySSL_RAND_egd_doc},
++#endif
+     {"RAND_status",         (PyCFunction)PySSL_RAND_status, METH_NOARGS,
+      PySSL_RAND_status_doc},
+ #endif
+diff --git a/Modules/mathmodule.c b/Modules/mathmodule.c
+index 8d492114..66ca6866 100644
+--- a/Modules/mathmodule.c
++++ b/Modules/mathmodule.c
+@@ -71,7 +71,7 @@ static const double pi = 3.141592653589793238462643383279502884197;
+ static const double sqrtpi = 1.772453850905516027298167483341145182798;
+ 
+ static double
+-sinpi(double x)
++m_sinpi(double x)
+ {
+     double y, r;
+     int n;
+@@ -270,7 +270,7 @@ m_tgamma(double x)
+        integer. */
+     if (absx > 200.0) {
+         if (x < 0.0) {
+-            return 0.0/sinpi(x);
++            return 0.0/m_sinpi(x);
+         }
+         else {
+             errno = ERANGE;
+@@ -294,7 +294,7 @@ m_tgamma(double x)
+     }
+     z = z * lanczos_g / y;
+     if (x < 0.0) {
+-        r = -pi / sinpi(absx) / absx * exp(y) / lanczos_sum(absx);
++        r = -pi / m_sinpi(absx) / absx * exp(y) / lanczos_sum(absx);
+         r -= z * r;
+         if (absx < 140.0) {
+             r /= pow(y, absx - 0.5);
+@@ -366,7 +366,7 @@ m_lgamma(double x)
+             (x-0.5)*(log(x+lanczos_g-0.5)-1);
+     }
+     else {
+-        r = log(pi) - log(fabs(sinpi(absx))) - log(absx) -
++        r = log(pi) - log(fabs(m_sinpi(absx))) - log(absx) -
+             (log(lanczos_sum(absx)) - lanczos_g +
+              (absx-0.5)*(log(absx+lanczos_g-0.5)-1));
+     }
+diff --git a/Lib/socket.py b/Lib/socket.py
+index aac04f6c..5497feb3 100644
+--- a/Lib/socket.py
++++ b/Lib/socket.py
+@@ -67,7 +67,6 @@ else:
+     from _ssl import SSLError as sslerror
+     from _ssl import \
+          RAND_add, \
+-         RAND_egd, \
+          RAND_status, \
+          SSL_ERROR_ZERO_RETURN, \
+          SSL_ERROR_WANT_READ, \
+@@ -78,6 +77,11 @@ else:
+          SSL_ERROR_WANT_CONNECT, \
+          SSL_ERROR_EOF, \
+          SSL_ERROR_INVALID_ERROR_CODE
++    try:
++        from _ssl import RAND_egd
++    except ImportError:
++        # LibreSSL and OpenSSL 1.1+ do not provide RAND_egd
++        pass
+ 
+ import os, sys, warnings
+ 
+diff --git a/Lib/ssl.py b/Lib/ssl.py
+index 666cea33..fc08f31c 100644
+--- a/Lib/ssl.py
++++ b/Lib/ssl.py
+@@ -62,7 +62,12 @@ import _ssl             # if we can't import it, let the error propagate
+ from _ssl import OPENSSL_VERSION_NUMBER, OPENSSL_VERSION_INFO, OPENSSL_VERSION
+ from _ssl import SSLError
+ from _ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
+-from _ssl import RAND_status, RAND_egd, RAND_add
++from _ssl import RAND_status, RAND_add
++try:
++    from _ssl import RAND_egd
++except ImportError:
++    # LibreSSL and OpenSSL 1.1+ do not provide RAND_egd
++    pass
+ from _ssl import \
+      SSL_ERROR_ZERO_RETURN, \
+      SSL_ERROR_WANT_READ, \

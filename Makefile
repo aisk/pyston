@@ -20,6 +20,8 @@ USE_DISTCC := 0
 
 PYPY := pypy
 CPYTHON := python3
+# CPython 2.7, used as the reference implementation that Pyston is compared against
+REFERENCE_PYTHON := $(DEPS_DIR)/python2.7/bin/python2.7
 
 ENABLE_VALGRIND := 0
 
@@ -830,7 +832,7 @@ $(call make_target,_gcc)
 $(call make_target,_release_gcc)
 
 nosearch_runpy_% nosearch_pyrun_%: %.py ext_python
-	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7:$${PYTHONPATH} zsh -c 'time $(CPYTHON) $<'
+	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7:$${PYTHONPATH} zsh -c 'time $(REFERENCE_PYTHON) $<'
 nosearch_pypyrun_%: %.py ext_python
 	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7:$${PYTHONPATH} zsh -c 'time $(PYPY) $<'
 $(call make_search,runpy_%)
@@ -1006,7 +1008,7 @@ $(wordlist 2,9999,$(SHAREDMODS_OBJS)): $(firstword $(SHAREDMODS_OBJS))
 
 .PHONY: ext_python ext_pythondbg
 ext_python: $(TEST_EXT_MODULE_SRCS)
-	cd $(TEST_DIR)/test_extension; $(CPYTHON) setup.py build
+	cd $(TEST_DIR)/test_extension; $(REFERENCE_PYTHON) setup.py build
 ext_pythondbg: $(TEST_EXT_MODULE_SRCS)
 	cd $(TEST_DIR)/test_extension; python2.7-dbg setup.py build
 

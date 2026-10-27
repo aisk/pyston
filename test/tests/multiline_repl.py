@@ -18,7 +18,17 @@ def test(s, expected_code=0):
     _, wcode = os.waitpid(pid, 0)
 
     print
-    r = os.read(fd, 10240)
+    # A single read can return only part of the output, so read until the pty is drained
+    # (reading from a pty whose other end has been closed raises EIO).
+    r = ''
+    while True:
+        try:
+            chunk = os.read(fd, 10240)
+        except OSError:
+            break
+        if not chunk:
+            break
+        r += chunk
     lines = r.split('\n')
     while not (lines[0].startswith('Python') or lines[0].startswith('Pyston')):
         lines.pop(0)

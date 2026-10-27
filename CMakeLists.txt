@@ -99,6 +99,15 @@ else()
   find_program(PYTHON_EXE python3)
 endif()
 
+# Pyston implements Python 2.7 semantics, so the tests compare its output against
+# a real CPython 2.7.  Modern distributions no longer ship one; build it from
+# source into ${DEPS_DIR}/python2.7 or point REFERENCE_PYTHON at an existing one.
+find_program(REFERENCE_PYTHON NAMES python2.7 python2 HINTS ${DEPS_DIR}/python2.7/bin
+             DOC "CPython 2.7 interpreter that the tests compare against")
+if(NOT REFERENCE_PYTHON)
+  message(WARNING "CPython 2.7 not found; set REFERENCE_PYTHON to run the tests")
+endif()
+
 # initial clang flags (set here so they're used when building llvm)
 set(CLANG_FLAGS "-Qunused-arguments -fcolor-diagnostics" CACHE STRING "Clang specific C and CXX flags")
 if("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang")
@@ -375,7 +384,7 @@ add_test(NAME check-format COMMAND ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${L
 add_test(NAME analysis_unittest COMMAND analysis_unittest)
 
 macro(add_pyston_test testname directory)
-  add_test(NAME pyston_${testname}_${directory} COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -q -k -a=-S ${ARGV2} ${ARGV3} ${ARGV4} ${CMAKE_SOURCE_DIR}/test/${directory})
+  add_test(NAME pyston_${testname}_${directory} COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -q -k -a=-S --reference-python=${REFERENCE_PYTHON} ${ARGV2} ${ARGV3} ${ARGV4} ${CMAKE_SOURCE_DIR}/test/${directory})
 endmacro()
 
 # tests         testname directory arguments

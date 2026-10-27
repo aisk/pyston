@@ -69,6 +69,12 @@ def set_ulimits():
 
 EXTMODULE_DIR = None
 EXTMODULE_DIR_PYSTON = None
+# The CPython 2.7 interpreter whose output the tests are compared against
+REFERENCE_PYTHON = "python2.7"
+
+# Test programs can print arbitrary bytes; decode them losslessly so that output
+# from pyston and from the reference interpreter can be compared as text.
+OUTPUT_ENCODING = dict(encoding="utf-8", errors="surrogateescape")
 THIS_FILE = os.path.abspath(__file__)
 
 _global_mtime = None
@@ -100,22 +106,25 @@ def get_expected_output(fn):
         cache_mtime = os.stat(cache_fn).st_mtime
         if cache_mtime > os.stat(fn).st_mtime and cache_mtime > get_global_mtime():
             try:
-                return pickle.load(open(cache_fn))
-            except (EOFError, ValueError):
+                with open(cache_fn, "rb") as f:
+                    return pickle.load(f)
+            except (EOFError, ValueError, pickle.UnpicklingError):
                 pass
 
     # TODO don't suppress warnings globally:
     env = dict(os.environ)
     env["PYTHONPATH"] = EXTMODULE_DIR
     env["PYTHONIOENCODING"] = PYTHONIOENCODING
-    p = subprocess.Popen(["python3", "-Wignore", fn], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=open("/dev/null"), preexec_fn=set_ulimits, env=env)
+    p = subprocess.Popen([REFERENCE_PYTHON, "-Wignore", fn], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         stdin=subprocess.DEVNULL, preexec_fn=set_ulimits, env=env, **OUTPUT_ENCODING)
     out, err = p.communicate()
     code = p.wait()
 
     r = code, out, err
     assert code >= 0, "CPython exited with an unexpected exit code: %d" % (code,)
 
-    pickle.dump(r, open(cache_fn, 'w'))
+    with open(cache_fn, "wb") as f:
+        pickle.dump(r, f)
     return r
 
 def canonicalize_stderr(stderr):
@@ -131,7 +140,7 @@ def canonicalize_stderr(stderr):
 
     substitutions = [
             ("NameError: global name '", "NameError: name '"),
-            ("AttributeError: '(\w+)' object attribute '(\w+)' is read-only", "AttributeError: \\2"),
+            (r"AttributeError: '(\w+)' object attribute '(\w+)' is read-only", "AttributeError: \\2"),
             (r"TypeError: object.__new__\(\) takes no parameters", "TypeError: object() takes no parameters"),
             ("IndexError: list assignment index out of range", "IndexError: list index out of range"),
             (r"unqualified exec is not allowed in function '(\w+)' it (.*)",
@@ -152,9 +161,6 @@ def run_test(fn, check_stats, run_memcheck):
     opts = get_test_options(fn, check_stats, run_memcheck)
     del check_stats, run_memcheck
 
-    if opts.expected != "py3ready":
-        opts.skip = True
-
     if opts.skip:
         return ("(skipped: %s)" % opts.skip) if DISPLAY_SKIPS else ""
 
@@ -163,8 +169,8 @@ def run_test(fn, check_stats, run_memcheck):
     env["PYTHONIOENCODING"] = PYTHONIOENCODING
     run_args = [os.path.abspath(IMAGE)] + opts.jit_args + [fn]
     start = time.time()
-    p = subprocess.Popen(run_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=open("/dev/null"),
-                         preexec_fn=set_ulimits, env=env)
+    p = subprocess.Popen(run_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         preexec_fn=set_ulimits, env=env, **OUTPUT_ENCODING)
     out, stderr = p.communicate()
     code = p.wait()
     elapsed = time.time() - start
@@ -187,7 +193,8 @@ def get_test_options(fn, check_stats, run_memcheck):
     opts.allow_warnings = []
     opts.skip = None
 
-    for l in open(fn):
+    # latin-1 maps every byte to a character, so this works for tests in any source encoding
+    for l in open(fn, encoding="latin-1"):
         l = l.strip()
         if not l:
             continue
@@ -243,9 +250,12 @@ def get_test_options(fn, check_stats, run_memcheck):
 def diff_output(expected, received, expected_file_prefix, received_file_prefix):
     exp_fd, exp_fn = tempfile.mkstemp(prefix=expected_file_prefix)
     rec_fd, rec_fn = tempfile.mkstemp(prefix=received_file_prefix)
-    os.fdopen(exp_fd, 'w').write(expected)
-    os.fdopen(rec_fd, 'w').write(received)
-    p = subprocess.Popen(["diff", "--unified=5", "-a", exp_fn, rec_fn], stdout=subprocess.PIPE, preexec_fn=set_ulimits)
+    with os.fdopen(exp_fd, 'w', **OUTPUT_ENCODING) as f:
+        f.write(expected)
+    with os.fdopen(rec_fd, 'w', **OUTPUT_ENCODING) as f:
+        f.write(received)
+    p = subprocess.Popen(["diff", "--unified=5", "-a", exp_fn, rec_fn], stdout=subprocess.PIPE, preexec_fn=set_ulimits,
+                         **OUTPUT_ENCODING)
     diff = p.stdout.read()
     assert p.wait() in (0, 1)
     os.unlink(exp_fn)
@@ -395,12 +405,12 @@ def determine_test_result(fn, opts, code, out, stderr, elapsed):
                     break
                 else:
                     msg = ()
-                    m = re.match("""stats\[['"]([\w_]+)['"]]""", l)
+                    m = re.match(r"""stats\[['"]([\w_]+)['"]]""", l)
                     if m:
                         statname = m.group(1)
                         msg = (l, statname, stats[statname])
 
-                    m = re.search("""noninit_count\(['"]([\w_]+)['"]\)""", l)
+                    m = re.search(r"""noninit_count\(['"]([\w_]+)['"]\)""", l)
                     if m and not msg:
                         statname = m.group(1)
                         msg = (l, statname, noninit_count(statname))
@@ -460,14 +470,14 @@ def worker_thread():
 
             results[job[0]] = run_test(*job)
             with cv:
-                cv.notifyAll()
+                cv.notify_all()
         except:
             import traceback
             # traceback.print_exc()
             quit[job[0]] = job[0] + ':\n' + traceback.format_exc()
             results[job[0]] = None
             with cv:
-                cv.notifyAll()
+                cv.notify_all()
             # os._exit(-1)
 
 def fileSize(fn):
@@ -499,6 +509,8 @@ parser.add_argument('--skip-failing', action='store_true',
                     help="skip tests expected to fail")
 parser.add_argument('--order-by-mtime', action='store_true',
                     help="order test execution by modification time, instead of file size")
+parser.add_argument('--reference-python', default=REFERENCE_PYTHON,
+                    help="the CPython 2.7 interpreter to compare against (default: %s)" % REFERENCE_PYTHON)
 
 parser.add_argument('test_dir')
 parser.add_argument('pattern', nargs='*')
@@ -518,6 +530,7 @@ def main(orig_dir):
     global EXTMODULE_DIR
     global DISPLAY_SUCCESSES
     global IS_OPTIMIZED
+    global REFERENCE_PYTHON
 
     run_memcheck = False
 
@@ -532,14 +545,14 @@ def main(orig_dir):
     TESTS_TO_SKIP = list(filter(bool, TESTS_TO_SKIP)) # "".split(',') == ['']
     EXIT_CODE_ONLY = opts.exit_code_only
     SKIP_FAILING_TESTS = opts.skip_failing
+    REFERENCE_PYTHON = opts.reference_python
 
     if opts.quiet:
         DISPLAY_SUCCESSES = False
 
     TEST_DIR = os.path.join(orig_dir, opts.test_dir)
     EXTMODULE_DIR_PYSTON = os.path.abspath(os.path.dirname(os.path.realpath(IMAGE)) + "/test/test_extension/")
-    # EXTMODULE_DIR = os.path.abspath(os.path.dirname(os.path.realpath(IMAGE)) + "/test/test_extension/build/lib.linux-x86_64-3.5/")
-    EXTMODULE_DIR = os.path.abspath(orig_dir) + "/test/test_extension/build/lib.linux-x86_64-3.5/"
+    EXTMODULE_DIR = os.path.abspath(orig_dir) + "/test/test_extension/build/lib.linux-x86_64-2.7/"
     patterns = opts.pattern
 
     IS_OPTIMIZED = int(subprocess.check_output([IMAGE, "-c", 'import sysconfig; print int("-O0" not in sysconfig.get_config_var(\"CFLAGS\"))']))
@@ -547,8 +560,7 @@ def main(orig_dir):
     if not patterns and not TESTS_TO_SKIP:
         TESTS_TO_SKIP = ["t", "t2", "t3"]
 
-    # py3updating: I removed all old CPython2 tests for now.
-    # assert os.path.isdir(TEST_DIR), "%s doesn't look like a directory with tests in it" % TEST_DIR
+    assert os.path.isdir(TEST_DIR), "%s doesn't look like a directory with tests in it" % TEST_DIR
 
     if TEST_DIR.rstrip('/').endswith("cpython") and not EXIT_CODE_ONLY:
         print("Test directory name ends in cpython; are you sure you don't want --exit-code-only?", file=sys.stderr)
@@ -565,7 +577,10 @@ def main(orig_dir):
 
     tests = [t for t in glob.glob("%s/*.py" % TEST_DIR)]
 
-    LIB_DIR = os.path.join(sys.prefix, "lib/python3.5")
+    LIB_DIR, builtin_module_names = subprocess.check_output([REFERENCE_PYTHON, "-c",
+        "import sys, sysconfig; print(sysconfig.get_path('stdlib')); print(' '.join(sys.builtin_module_names))"],
+        universal_newlines=True).splitlines()
+    builtin_module_names = builtin_module_names.split()
     for t in tests:
         bn = os.path.basename(t)
         assert bn.endswith(".py")
@@ -573,13 +588,13 @@ def main(orig_dir):
 
         if os.path.exists(os.path.join(LIB_DIR, module_name)) or \
            os.path.exists(os.path.join(LIB_DIR, module_name + ".py")) or \
-           module_name in sys.builtin_module_names:
+           module_name in builtin_module_names:
             raise Exception("Error: %s hides builtin module '%s'" % (t, module_name))
 
     if patterns:
         filtered_tests = []
         for t in tests:
-            if any(re.match(os.path.join(TEST_DIR, p) + ".*\.py", t) for p in patterns):
+            if any(re.match(os.path.join(TEST_DIR, p) + r".*\.py", t) for p in patterns):
                 filtered_tests.append(t)
         tests = filtered_tests
     if not tests:
@@ -605,7 +620,7 @@ def main(orig_dir):
     threads = []
     for i in range(NUM_THREADS):
         t = threading.Thread(target=worker_thread)
-        t.setDaemon(True)
+        t.daemon = True
         t.start()
         threads.append(t)
         q.put(None)
