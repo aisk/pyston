@@ -6,9 +6,9 @@ We have a small website [pyston.org](http://pyston.org/), which for now just hos
 
 ### Current state
 
-Pyston is updating to Python 3, it totally unusable for now.
+Pyston implements Python 2.7.8 and builds with current Linux toolchains (see [`INSTALLING.md`](docs/INSTALLING.md)).  Porting it to Python 3 is planned, targeting Python 3.8, but hasn't started yet.
 
-Currently, Pyston targets Python 3.5.2(commit da27a8813f67271dd15d33d9852ca9469bdb0078), only runs on x86_64 platforms, and only has been tested on Ubuntu.  Support for more platforms is desired but deferred until we feel successful on our initial platform.  Pyston does not currently work on Mac OSX, and it is not clear when it will.
+Pyston only runs on x86_64 platforms, and has only been tested on Linux.  Support for more platforms is desired but deferred until we feel successful on our initial platform.  Pyston does not currently work on Mac OSX, and it is not clear when it will.
 
 ### Getting Pyston
 

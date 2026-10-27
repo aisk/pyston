@@ -97,6 +97,8 @@ Third, when unwinding, we only check whether a function *has* a personality func
 
 3. The personality function checks the exception's type against `catch`-block types. All Pyston exceptions have the same type, so this is unnecessary.
 
+Fourth, we don't apply `DW_CFA_GNU_args_size` when jumping to a landing pad (and the old libunwind we use doesn't expose it). Compilers emit it when they pass stack arguments with `push` instructions, and then expect the unwinder to pop those arguments before entering the landing pad; otherwise the landing pad runs with a corrupted stack pointer. Newer clangs do this on x86-64 for calls with more than six arguments, so we compile with `-mllvm -no-x86-call-frame-opt` (`-maccumulate-outgoing-args` for GCC) to keep it out of our code. The symptom of getting this wrong is a segfault at a stack address shortly after a Python exception is thrown through C++ runtime code.
+
 ## Functions we override
 - `std::terminate`
 - `__gxx_personality_v0`: stubbed out, should never be called

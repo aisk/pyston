@@ -155,6 +155,28 @@ The C++ stacktrace can be quite difficult to read. Every Python function call wi
 
 For example, `tests/sys_argv` might output `['/mnt/rudi/pyston/test/tests/sys_argv.py']` instead of `['/mnt/rudi/pyston/./test/tests/sys_argv.py']`. If you switch between testing in debug mode and release mode, try running `touch test/tester.py` in-between runs.
 
+##### Problem: I want to run a single test
+
+The tests compare Pyston's output against CPython 2.7.8 (built by `tools/setup_deps.sh`). From the build directory:
+
+```
+python3 ~/pyston/tools/tester.py -R ./pyston -j1 -k -a=-S --reference-python=$HOME/pyston_deps/python2.7/bin/python2.7 ~/pyston/test/tests TESTNAME
+```
+
+Add `-a=-n` to force the LLVM tier, or `-a=-L` for the maximum compilation tier, like `ctest` does.
+
+##### Problem: A test fails with bad output, but running it by hand gives the same output as CPython
+
+The tester caches CPython's output in `test/*/TESTNAME.expected_cache` and only regenerates it when the test or the tester changes. If CPython's output was wrong when the cache was written (a flaky test, a different reference interpreter), delete the cache file.
+
+##### Problem: Something crashes in release mode but works in debug mode
+
+Pyston's JIT and unwinder make assumptions about the code the C++ compiler generates, and newer compilers can break them. Two we have hit:
+- Generated code passed the result of a `setcc` to a C++ function taking `bool` without zero-extending it, but clang assumes `bool` arguments are extended to 32 bits.
+- The custom unwinder doesn't support `DW_CFA_GNU_args_size`; see [unwinding](UNWINDING.md).
+
+Running with `-I` (interpreter only) or `-n` (always use the LLVM tier) helps narrow down whether the JIT is involved. Also note that debug builds against a recent libstdc++ enable `_GLIBCXX_ASSERTIONS`, which catches out-of-bounds container accesses that release builds silently get away with.
+
 ##### Problem: I can't reproduce a crash consistently on my machine
 
 This can be caused by objects being allocated in different places in memory in each run and changing the way GC/memory errors manifest. Try disabling [Address Space Layout Randomization](http://docs.oracle.com/cd/E37670_01/E36387/html/ol_kernel_sec.html).
