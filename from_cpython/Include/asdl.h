@@ -5,7 +5,8 @@ typedef PyObject * identifier;
 typedef PyObject * string;
 typedef PyObject * object;
 
-#ifndef __cplusplus
+/* bool, true and false are keywords in C23 */
+#if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L)
 typedef enum {false, true} bool;
 #endif
 

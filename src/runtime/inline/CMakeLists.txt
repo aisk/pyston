@@ -64,6 +64,8 @@ else()
   set(STDLIB_SUFFIX ".release")
 endif()
 
+list(APPEND BC_CXX_FLAGS -Wno-unknown-warning-option -nostdinc++ -isystem ${BC_LIBSTDCXX_DIR}/include -isystem ${BC_LIBSTDCXX_DIR}/include-arch)
+
 # set defines
 set(BC_DEFINES "")
 get_directory_property(COMPILE_DEFINITIONS COMPILE_DEFINITIONS)
@@ -128,7 +130,7 @@ add_custom_command(OUTPUT stdlib${STDLIB_SUFFIX}.bc
                    COMMENT "Optimizing stdlib.unopt.bc -> stdlib.bc")
 
 add_custom_command(OUTPUT stdlib.bc.o
-                   COMMAND ${CMAKE_LINKER} -r -b binary stdlib${STDLIB_SUFFIX}.bc -o ${CMAKE_CURRENT_BINARY_DIR}/stdlib.bc.o
+                   COMMAND ${CMAKE_LINKER} -m elf_x86_64 -r -b binary stdlib${STDLIB_SUFFIX}.bc -o ${CMAKE_CURRENT_BINARY_DIR}/stdlib.bc.o
                    DEPENDS stdlib${STDLIB_SUFFIX}.bc
                    COMMENT "Embedding stdlib${STDLIB_SUFFIX}.bc -> stdlib.bc.o")
 
@@ -139,7 +141,7 @@ if(${CMAKE_BUILD_TYPE} STREQUAL "Debug")
                      COMMENT "Stripping stdlib.bc -> stdlib.stripped.bc")
 
   add_custom_command(OUTPUT stdlib.stripped.bc.o
-                     COMMAND ${CMAKE_LINKER} -r -b binary stdlib.stripped.bc -o ${CMAKE_CURRENT_BINARY_DIR}/stdlib.stripped.bc.o
+                     COMMAND ${CMAKE_LINKER} -m elf_x86_64 -r -b binary stdlib.stripped.bc -o ${CMAKE_CURRENT_BINARY_DIR}/stdlib.stripped.bc.o
                      DEPENDS stdlib.stripped.bc
                      COMMENT "Embedding stdlib.stripped.bc -> stdlib.stripped.bc.o")
   add_library(stdlib stdlib.stripped.bc.o stdlib.bc.o ${BC_OBJS})

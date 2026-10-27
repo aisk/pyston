@@ -1,5 +1,9 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
 project(pyston C CXX ASM)
+
+# The bundled LLVM and some build_deps still declare compatibility with very
+# old CMake versions, which CMake 4 refuses unless a minimum policy is given.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "")
 
 set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 
@@ -7,6 +11,11 @@ include(pyconfig)
 include(ExternalProject)
 
 set(DEPS_DIR $ENV{HOME}/pyston_deps)
+
+# The bitcode for the inlined runtime (src/runtime/inline) is compiled with the
+# bundled clang, which is too old to parse a modern libstdc++.  Point it at a
+# libstdc++ from the GCC 5 era instead; its ABI is compatible with newer ones.
+set(BC_LIBSTDCXX_DIR ${DEPS_DIR}/libstdcxx5 CACHE PATH "libstdc++ headers used when compiling runtime bitcode")
 
 if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Pyston does not support 32-bit systems yet")
@@ -213,12 +222,15 @@ include(LLVMConfig)
 llvm_map_components_to_libnames(LLVM_LIBS core mcjit native bitreader bitwriter ipo irreader debuginfodwarf instrumentation ${INTEL_JIT_EVENTS_LIB})
 
 # libunwind
+# libunwind relies on tentative definitions in its headers, which stopped
+# working when GCC 10 made -fno-common the default.
 if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
-  set(LIBUNWIND_DEBUG_CFLAGS "CFLAGS=-O0 -g")
+  set(LIBUNWIND_CFLAGS "CFLAGS=-O0 -g -fcommon")
   set(LIBUNWIND_DEBUG "--enable-debug")
   set(LIBUNWIND_DEBUG_FRAME "--enable-debug-frame")
   set(LIBUNWIND_CONSERVATIVE_CHECKS "--enable-conservative-checks")
 else()
+  set(LIBUNWIND_CFLAGS "CFLAGS=-O2 -g -fcommon")
   set(LIBUNWIND_CONSERVATIVE_CHECKS "--disable-conservative-checks")
 endif()
 ExternalProject_Add(libunwind
@@ -226,7 +238,7 @@ ExternalProject_Add(libunwind
                     SOURCE_DIR ${CMAKE_SOURCE_DIR}/build_deps/libunwind
                     DEPENDS libunwind_patched
                     UPDATE_COMMAND autoreconf -i
-                    CONFIGURE_COMMAND ${CMAKE_SOURCE_DIR}/build_deps/libunwind/configure ${LIBUNWIND_DEBUG_CFLAGS} --prefix=${CMAKE_BINARY_DIR}/build_deps/libunwind --enable-shared=0 --disable-block-signals ${LIBUNWIND_CONSERVATIVE_CHECKS} ${LIBUNWIND_DEBUG} ${LIBUNWIND_DEBUG_FRAME}
+                    CONFIGURE_COMMAND ${CMAKE_SOURCE_DIR}/build_deps/libunwind/configure ${LIBUNWIND_CFLAGS} --prefix=${CMAKE_BINARY_DIR}/build_deps/libunwind --enable-shared=0 --disable-block-signals ${LIBUNWIND_CONSERVATIVE_CHECKS} ${LIBUNWIND_DEBUG} ${LIBUNWIND_DEBUG_FRAME}
                     BUILD_COMMAND ${MAKE_PRG} -j${TEST_THREADS}
                     LOG_UPDATE ON
                     LOG_CONFIGURE ON
@@ -275,6 +287,19 @@ endif()
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror -Wreturn-type -Wno-sign-compare -Wno-unused -Wno-unused-parameter -fno-omit-frame-pointer -g")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS} -std=c++11 -fno-rtti -fexceptions -fvisibility-inlines-hidden -ffunction-sections -fdata-sections -Woverloaded-virtual -Wno-invalid-offsetof -Wcast-qual -Wno-sign-conversion -Wnon-virtual-dtor -Winit-self -Wmissing-include-dirs -Wstrict-overflow=5 -Wpointer-arith -Wtype-limits -Wwrite-strings -Wempty-body -Waggregate-return -Wmissing-field-initializers -Wredundant-decls -Winline -Wint-to-pointer-cast -Wlong-long -Wvla -Wno-attributes -g")
 
+# Warnings that newer compilers added, triggered by the headers of the bundled
+# LLVM and by CPython-style code (casting functions to PyCFunction, 'register').
+include(CheckCXXCompilerFlag)
+foreach(FLAG deprecated-copy deprecated-register deprecated-declarations nontrivial-memcall
+             cast-function-type-mismatch address-of-packed-member bitwise-instead-of-logical
+             implicit-const-int-float-conversion range-loop-construct expansion-to-defined)
+  string(MAKE_C_IDENTIFIER "CXX_SUPPORTS_W${FLAG}" FLAG_VAR)
+  check_cxx_compiler_flag("-W${FLAG}" ${FLAG_VAR})
+  if(${FLAG_VAR})
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-${FLAG}")
+  endif()
+endforeach()
+
 set(CLANG_FLAGS "${CLANG_FLAGS} -Wimplicit-int -Wstrict-prototypes -Wold-style-definition -Wnested-externs -Wpointer-to-int-cast -Wno-mismatched-tags -Wno-extern-c-compat")
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CLANG_FLAGS}")
@@ -283,6 +308,14 @@ endif()
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-long-long -Wno-aggregate-return -Wno-inline -Wno-redundant-decls -Wno-strict-overflow")
   set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -Wl,--no-as-needed") # without this, we don't seem to get jemalloc on gcc builds
+endif()
+
+# Modern toolchains link position independent executables by default, but the
+# runtime bitcode is compiled by the bundled clang as non-PIC code, and the JIT
+# has only ever been tested in a non-PIE address space layout.
+check_cxx_compiler_flag(-no-pie CXX_SUPPORTS_NO_PIE)
+if(CXX_SUPPORTS_NO_PIE)
+  set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -no-pie")
 endif()
 
 add_definitions(${LLVM_DEFINITIONS})

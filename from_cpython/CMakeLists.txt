@@ -163,6 +163,20 @@ file(GLOB_RECURSE STDPARSER_SRCS Parser
     )
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-missing-field-initializers -Wno-tautological-compare -Wno-type-limits -Wno-unused-result -Wno-strict-aliasing -DPy_BUILD_CORE")
+
+# Warnings that newer compilers added and that the CPython 2.7 sources trip
+# all over the place (e.g. casting method implementations to PyCFunction).
+include(CheckCCompilerFlag)
+foreach(FLAG cast-function-type-mismatch cast-function-type incompatible-pointer-types-discards-qualifiers
+             discarded-qualifiers deprecated-declarations single-bit-bitfield-constant-conversion
+             null-pointer-subtraction misleading-indentation)
+  string(MAKE_C_IDENTIFIER "C_SUPPORTS_W${FLAG}" FLAG_VAR)
+  check_c_compiler_flag("-W${FLAG}" ${FLAG_VAR})
+  if(${FLAG_VAR})
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-${FLAG}")
+  endif()
+endforeach()
+
 add_library(FROM_CPYTHON OBJECT ${STDMODULE_SRCS} ${STDOBJECT_SRCS} ${STDPYTHON_SRCS} ${STDPARSER_SRCS})
 add_dependencies(FROM_CPYTHON copy_stdlib)
 

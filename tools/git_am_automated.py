@@ -18,7 +18,7 @@ def main():
         sys.exit(0)
 
     # git am errored. recover by unconditionally aborting.
-    print >>sys.stderr, "----- Running `git am --abort' -----"
+    print("----- Running `git am --abort' -----", file=sys.stderr)
     subprocess.check_call(["git", "am", "--abort"])
     sys.exit(1)
 

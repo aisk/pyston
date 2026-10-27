@@ -24,10 +24,10 @@
 	ignore = all
 [submodule "build_deps/lz4"]
 	path = build_deps/lz4
-	url = git://github.com/Cyan4973/lz4.git
+	url = https://github.com/Cyan4973/lz4.git
 [submodule "build_deps/jemalloc"]
 	path = build_deps/jemalloc
-	url = git://github.com/jemalloc/jemalloc.git
+	url = https://github.com/jemalloc/jemalloc.git
 	ignore = untracked
 [submodule "test/lib/decorator"]
 	path = test/lib/decorator

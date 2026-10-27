@@ -62,7 +62,12 @@ import _ssl             # if we can't import it, let the error propagate
 from _ssl import OPENSSL_VERSION_NUMBER, OPENSSL_VERSION_INFO, OPENSSL_VERSION
 from _ssl import SSLError
 from _ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
-from _ssl import RAND_status, RAND_egd, RAND_add
+from _ssl import RAND_status, RAND_add
+try:
+    from _ssl import RAND_egd
+except ImportError:
+    # LibreSSL and OpenSSL 1.1+ do not provide RAND_egd
+    pass
 from _ssl import \
      SSL_ERROR_ZERO_RETURN, \
      SSL_ERROR_WANT_READ, \

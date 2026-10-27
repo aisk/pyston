@@ -325,7 +325,9 @@ private:
 public:
     template <typename Functor> SmallFunction(Functor&& f) noexcept {
 // workaround missing "is_trivially_copy_constructible" in g++ < 5.0
-#if __GNUG__ && __GNUC__ < 5
+// clang always reports __GNUC__ == 4, so detect the libstdc++ version instead; _GLIBCXX_USE_CXX11_ABI
+// was introduced in libstdc++ 5, the first version to provide is_trivially_copy_constructible.
+#if defined(__GLIBCXX__) && !defined(_GLIBCXX_USE_CXX11_ABI)
 #define IS_TRIVIALLY_COPY_CONSTRUCTIBLE(T) std::has_trivial_copy_constructor<T>::value
 #else
 #define IS_TRIVIALLY_COPY_CONSTRUCTIBLE(T) std::is_trivially_copy_constructible<T>::value

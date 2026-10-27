@@ -1,0 +1,66 @@
+From 7e6ccdbf597f4f9840ee3a37851874c47e08ea74 Mon Sep 17 00:00:00 2001
+From: An Long <aisk1988@gmail.com>
+Date: Tue, 27 Oct 2026 22:47:18 +0900
+Subject: [PATCH] Fix build with modern compilers and libstdc++
+
+---
+ include/llvm/ADT/STLExtras.h               | 1 +
+ include/llvm/IR/ValueMap.h                 | 2 +-
+ lib/Transforms/Vectorize/SLPVectorizer.cpp | 2 +-
+ utils/TableGen/AsmWriterEmitter.cpp        | 2 +-
+ 4 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/include/llvm/ADT/STLExtras.h b/include/llvm/ADT/STLExtras.h
+index e6215e4a..0efb2d60 100644
+--- a/include/llvm/ADT/STLExtras.h
++++ b/include/llvm/ADT/STLExtras.h
+@@ -20,6 +20,7 @@
+ #include <algorithm> // for std::all_of
+ #include <cassert>
+ #include <cstddef> // for std::size_t
++#include <cstdint>
+ #include <cstdlib> // for qsort
+ #include <functional>
+ #include <iterator>
+diff --git a/include/llvm/IR/ValueMap.h b/include/llvm/IR/ValueMap.h
+index 08d6d176..655e1ab9 100644
+--- a/include/llvm/IR/ValueMap.h
++++ b/include/llvm/IR/ValueMap.h
+@@ -101,7 +101,7 @@ public:
+ 
+   ~ValueMap() {}
+ 
+-  bool hasMD() const { return MDMap; }
++  bool hasMD() const { return bool(MDMap); }
+   MDMapT &MD() {
+     if (!MDMap)
+       MDMap.reset(new MDMapT);
+diff --git a/lib/Transforms/Vectorize/SLPVectorizer.cpp b/lib/Transforms/Vectorize/SLPVectorizer.cpp
+index baf97418..06d38952 100644
+--- a/lib/Transforms/Vectorize/SLPVectorizer.cpp
++++ b/lib/Transforms/Vectorize/SLPVectorizer.cpp
+@@ -2985,7 +2985,7 @@ void BoUpSLP::scheduleBlock(BlockScheduling *BS) {
+   // sorted by the original instruction location. This lets the final schedule
+   // be as  close as possible to the original instruction order.
+   struct ScheduleDataCompare {
+-    bool operator()(ScheduleData *SD1, ScheduleData *SD2) {
++    bool operator()(ScheduleData *SD1, ScheduleData *SD2) const {
+       return SD2->SchedulingPriority < SD1->SchedulingPriority;
+     }
+   };
+diff --git a/utils/TableGen/AsmWriterEmitter.cpp b/utils/TableGen/AsmWriterEmitter.cpp
+index 587de26f..2bc52773 100644
+--- a/utils/TableGen/AsmWriterEmitter.cpp
++++ b/utils/TableGen/AsmWriterEmitter.cpp
+@@ -760,7 +760,7 @@ static unsigned CountNumOperands(StringRef AsmString, unsigned Variant) {
+ namespace {
+ struct AliasPriorityComparator {
+   typedef std::pair<CodeGenInstAlias *, int> ValueType;
+-  bool operator()(const ValueType &LHS, const ValueType &RHS) {
++  bool operator()(const ValueType &LHS, const ValueType &RHS) const {
+     if (LHS.second ==  RHS.second) {
+       // We don't actually care about the order, but for consistency it
+       // shouldn't depend on pointer comparisons.
+-- 
+2.53.0
+

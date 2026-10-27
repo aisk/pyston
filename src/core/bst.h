@@ -133,7 +133,7 @@ public:
 
     void* allocate(int num_bytes) {
         mem.resize(mem.size() + num_bytes, 0);
-        return &mem[mem.size() - num_bytes];
+        return mem.data() + mem.size() - num_bytes;
     }
     template <typename T> T* allocate() { return (T*)allocate(sizeof(T)); }
 

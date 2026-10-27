@@ -635,7 +635,10 @@ extern "C" HIDDEN void _Unwind_Resume(struct _Unwind_Exception* _exc) {
 // C++ ABI functionality
 namespace __cxxabiv1 {
 
-extern "C" HIDDEN void* __cxa_allocate_exception(size_t size) noexcept {
+// Newer libstdc++ headers declare __cxa_allocate_exception with default visibility, and clang refuses to
+// redeclare it as hidden.  Define it under a different name and bind it to the real symbol instead.
+extern "C" HIDDEN void* pyston_cxa_allocate_exception(size_t size) noexcept __asm__("__cxa_allocate_exception");
+extern "C" HIDDEN void* pyston_cxa_allocate_exception(size_t size) noexcept {
     // we should only ever be throwing ExcInfos
     RELEASE_ASSERT(size == sizeof(pyston::ExcInfo), "allocating exception whose size doesn't match ExcInfo");
 

@@ -1783,7 +1783,7 @@ Box* builtinFormat(Box* value, Box* format_spec) {
 }
 
 static PyObject* builtin_compile(PyObject* self, PyObject* args, PyObject* kwds) noexcept {
-    char* str;
+    const char* str;
     char* filename;
     char* startstr;
     int mode = -1;

@@ -113,6 +113,13 @@ char *PyCursesVersion = "2.2";
 #define CURSES_MODULE
 #include "py_curses.h"
 
+/* ncurses 6 makes WINDOW opaque, but provides is_pad() instead (backported from CPython 2.7.18) */
+#if NCURSES_EXT_FUNCS+0 >= 20170401 && NCURSES_EXT_COLORS+0 >= 20170401
+#define py_is_pad(win)      is_pad(win)
+#elif defined(WINDOW_HAS_FLAGS)
+#define py_is_pad(win)      ((win) ? ((win)->_flags & _ISPAD) != 0 : FALSE)
+#endif
+
 /*  These prototypes are in <term.h>, but including this header
     #defines many common symbols (such as "lines") which breaks the
     curses module in other ways.  So the code will just specify
@@ -806,8 +813,8 @@ PyCursesWindow_EchoChar(PyCursesWindowObject *self, PyObject *args)
         return NULL;
     }
 
-#ifdef WINDOW_HAS_FLAGS
-    if (self->win->_flags & _ISPAD)
+#ifdef py_is_pad
+    if (py_is_pad(self->win))
         return PyCursesCheckERR(pechochar(self->win, ch | attr),
                                 "echochar");
     else
@@ -1234,10 +1241,10 @@ PyCursesWindow_NoOutRefresh(PyCursesWindowObject *self, PyObject *args)
     int pminrow,pmincol,sminrow,smincol,smaxrow,smaxcol;
     int rtn;
 
-#ifndef WINDOW_HAS_FLAGS
+#ifndef py_is_pad
     if (0)
 #else
-        if (self->win->_flags & _ISPAD)
+        if (py_is_pad(self->win))
 #endif
         {
             switch(PyTuple_Size(args)) {
@@ -1377,10 +1384,10 @@ PyCursesWindow_Refresh(PyCursesWindowObject *self, PyObject *args)
     int pminrow,pmincol,sminrow,smincol,smaxrow,smaxcol;
     int rtn;
 
-#ifndef WINDOW_HAS_FLAGS
+#ifndef py_is_pad
     if (0)
 #else
-        if (self->win->_flags & _ISPAD)
+        if (py_is_pad(self->win))
 #endif
         {
             switch(PyTuple_Size(args)) {
@@ -1446,8 +1453,8 @@ PyCursesWindow_SubWin(PyCursesWindowObject *self, PyObject *args)
     }
 
     /* printf("Subwin: %i %i %i %i   \n", nlines, ncols, begin_y, begin_x); */
-#ifdef WINDOW_HAS_FLAGS
-    if (self->win->_flags & _ISPAD)
+#ifdef py_is_pad
+    if (py_is_pad(self->win))
         win = subpad(self->win, nlines, ncols, begin_y, begin_x);
     else
 #endif

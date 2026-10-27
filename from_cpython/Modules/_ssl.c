@@ -99,6 +99,17 @@ enum py_ssl_version {
 #include "openssl/err.h"
 #include "openssl/rand.h"
 
+/* OpenSSL 1.1 dropped SSLv2 without defining OPENSSL_NO_SSL2. */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(OPENSSL_NO_SSL2)
+#define OPENSSL_NO_SSL2
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#define X509_NAME_ENTRY_set(ne) ((ne)->set)
+#define X509_EXTENSION_get_data(ext) ((ext)->value)
+#define ASN1_STRING_get0_data ASN1_STRING_data
+#endif
+
 /* SSL error object */
 static PyObject *PySSLErrorObject;
 
@@ -314,8 +325,10 @@ newPySSLObject(PySocketSockObject *Sock, char *key_file, char *cert_file,
     PySSL_BEGIN_ALLOW_THREADS
     if (proto_version == PY_SSL_VERSION_TLS1)
         self->ctx = SSL_CTX_new(TLSv1_method()); /* Set up context */
+#ifndef OPENSSL_NO_SSL3_METHOD
     else if (proto_version == PY_SSL_VERSION_SSL3)
         self->ctx = SSL_CTX_new(SSLv3_method()); /* Set up context */
+#endif
 #ifndef OPENSSL_NO_SSL2
     else if (proto_version == PY_SSL_VERSION_SSL2)
         self->ctx = SSL_CTX_new(SSLv2_method()); /* Set up context */
@@ -621,7 +634,7 @@ _create_tuple_for_X509_NAME (X509_NAME *xname)
 
         /* check to see if we've gotten to a new RDN */
         if (rdn_level >= 0) {
-            if (rdn_level != entry->set) {
+            if (rdn_level != X509_NAME_ENTRY_set(entry)) {
                 /* yes, new RDN */
                 /* add old RDN to DN */
                 rdnt = PyList_AsTuple(rdn);
@@ -638,7 +651,7 @@ _create_tuple_for_X509_NAME (X509_NAME *xname)
                     goto fail0;
             }
         }
-        rdn_level = entry->set;
+        rdn_level = X509_NAME_ENTRY_set(entry);
 
         /* now add this attribute to the current RDN */
         name = X509_NAME_ENTRY_get_object(entry);
@@ -740,16 +753,16 @@ _get_peer_alt_names (X509 *certificate) {
             goto fail;
         }
 
-        p = ext->value->data;
+        p = ASN1_STRING_get0_data(X509_EXTENSION_get_data(ext));
         if (method->it)
             names = (GENERAL_NAMES*) (ASN1_item_d2i(NULL,
                                                     &p,
-                                                    ext->value->length,
+                                                    ASN1_STRING_length(X509_EXTENSION_get_data(ext)),
                                                     ASN1_ITEM_ptr(method->it)));
         else
             names = (GENERAL_NAMES*) (method->d2i(NULL,
                                                   &p,
-                                                  ext->value->length));
+                                                  ASN1_STRING_length(X509_EXTENSION_get_data(ext))));
 
         for(j = 0; j < sk_GENERAL_NAME_num(names); j++) {
             /* get a rendering of each name in the set of names */
@@ -1609,6 +1622,7 @@ Returns 1 if the OpenSSL PRNG has been seeded with enough data and 0 if not.\n\
 It is necessary to seed the PRNG with RAND_add() on some platforms before\n\
 using the ssl() function.");
 
+#ifndef OPENSSL_NO_EGD
 static PyObject *
 PySSL_RAND_egd(PyObject *self, PyObject *arg)
 {
@@ -1634,6 +1648,7 @@ PyDoc_STRVAR(PySSL_RAND_egd_doc,
 Queries the entropy gather daemon (EGD) on the socket named by 'path'.\n\
 Returns number of bytes read.  Raises SSLError if connection to EGD\n\
 fails or if it does not provide enough data to seed PRNG.");
+#endif /* OPENSSL_NO_EGD */
 
 #endif /* HAVE_OPENSSL_RAND */
 
@@ -1648,8 +1663,10 @@ static PyMethodDef PySSL_methods[] = {
 #ifdef HAVE_OPENSSL_RAND
     {"RAND_add",            PySSL_RAND_add, METH_VARARGS,
      PySSL_RAND_add_doc},
+#ifndef OPENSSL_NO_EGD
     {"RAND_egd",            PySSL_RAND_egd, METH_O,
      PySSL_RAND_egd_doc},
+#endif
     {"RAND_status",         (PyCFunction)PySSL_RAND_status, METH_NOARGS,
      PySSL_RAND_status_doc},
 #endif
