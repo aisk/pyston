@@ -177,6 +177,10 @@ Pyston's JIT and unwinder make assumptions about the code the C++ compiler gener
 
 Running with `-I` (interpreter only) or `-n` (always use the LLVM tier) helps narrow down whether the JIT is involved. Also note that debug builds against a recent libstdc++ enable `_GLIBCXX_ASSERTIONS`, which catches out-of-bounds container accesses that release builds silently get away with.
 
+##### Problem: JIT'd code crashes with a corrupted local
+
+The ICs patch machine code into LLVM patchpoints and assume a frame layout that LLVM doesn't guarantee, for example that rsp sits at the bottom of the static frame (which is why we pass `--no-x86-call-frame-opt` to LLVM in `codegen/entry.cpp`). To find out whether an IC is responsible, turn off the `ENABLE_IC*` flags in `core/options.cpp` one at a time. To find out who writes a stack slot, break where the interpreter enters the compiled code (e.g. `ast_interpreter.cpp` at the `call_osr` call for OSR), break again after the function's prologue, and set `watch -l *(long*)($rbp-OFFSET)`. If the write lands inside a patchpoint (a run of nops in the disassembly), it came from IC code.
+
 ##### Problem: I can't reproduce a crash consistently on my machine
 
 This can be caused by objects being allocated in different places in memory in each run and changing the way GC/memory errors manifest. Try disabling [Address Space Layout Randomization](http://docs.oracle.com/cd/E37670_01/E36387/html/ol_kernel_sec.html).
