@@ -1500,6 +1500,20 @@ static Box* intFormat(PyObject* self, Box* format_spec) {
     return rtn;
 }
 
+// A C-level number slot for int that calls the implementation directly instead of going through the
+// slot_nb_* wrappers, which look up and call int.__op__ like a Python method.
+template <Box* (*F)(BoxedInt*, Box*), Box* (*RF)(BoxedInt*, Box*)>
+static PyObject* intNbBinop(PyObject* a, PyObject* b) noexcept {
+    try {
+        if (PyLong_Check(a))
+            return F(static_cast<BoxedInt*>(a), b);
+        return RF(static_cast<BoxedInt*>(b), a);
+    } catch (ExcInfo e) {
+        setCAPIException(e);
+        return NULL;
+    }
+}
+
 void setupInt() {
     static PyNumberMethods int_as_number;
     int_cls->tp_as_number = &int_as_number;
@@ -1610,5 +1624,14 @@ void setupInt() {
     int_cls->tp_repr = (reprfunc)int_to_decimal_string;
     int_cls->tp_new = (newfunc)intNewPacked;
     int_as_number.nb_int = (unaryfunc)int_int;
+    int_as_number.nb_add = intNbBinop<intAdd, intRAdd>;
+    int_as_number.nb_subtract = intNbBinop<intSub, intRSub>;
+    int_as_number.nb_multiply = intNbBinop<intMul, intRMul>;
+    int_as_number.nb_floor_divide = intNbBinop<intFloordiv, intRFloordiv>;
+    int_as_number.nb_true_divide = intNbBinop<intTruediv, intRTruediv>;
+    int_as_number.nb_remainder = intNbBinop<intMod, intRMod>;
+    int_as_number.nb_and = intNbBinop<intAnd, intRAnd>;
+    int_as_number.nb_or = intNbBinop<intOr, intROr>;
+    int_as_number.nb_xor = intNbBinop<intXor, intRXor>;
 }
 }
