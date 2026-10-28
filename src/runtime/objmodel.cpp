@@ -5433,10 +5433,62 @@ static Box* binopInternalHelper(BinopRewriteArgs*& rewrite_args, BoxedString* op
     return rtn;
 }
 
+// Finishes a binop whose lhs.__op__(rhs) call returned 'rtn', following binary_op1: when it is
+// NotImplemented the reflected method of a different rhs type gets a turn.
+extern "C" Box* binopAfterUserOp(STOLEN(Box*) rtn, Box* lhs, Box* rhs, int op_type) {
+    if (rtn != NotImplemented)
+        return rtn;
+    Py_DECREF(rtn);
+
+    if (lhs->cls != rhs->cls) {
+        DecrefHandle<BoxedString> rop_name = getReverseOpName(op_type);
+        Box* rrtn = callattrInternal1<CXX, NOT_REWRITABLE>(rhs, rop_name, CLASS_ONLY, NULL, ArgPassSpec(1), lhs);
+        if (rrtn) {
+            if (rrtn != NotImplemented)
+                return rrtn;
+            Py_DECREF(rrtn);
+        }
+    }
+
+    raiseExcHelper(TypeError, "unsupported operand type(s) for %s: '%s' and '%s'", getOpSymbol(op_type).data(),
+                   getTypeName(lhs), getTypeName(rhs));
+}
+
 template <Rewritable rewritable, bool inplace>
 Box* binopInternal(Box* lhs, Box* rhs, int op_type, BinopRewriteArgs* rewrite_args) {
     if (rewritable == NOT_REWRITABLE) {
         assert(!rewrite_args);
+        rewrite_args = NULL;
+    }
+
+    // A user-defined lhs whose operator method gets the first try: call it through a callattr rewrite
+    // (so the method call is fast) and let binopAfterUserOp handle a NotImplemented result.
+    if (!inplace && rewrite_args && lhs->cls->is_user_defined
+        && (lhs->cls == rhs->cls || !isSubclass(rhs->cls, lhs->cls))) {
+        Rewriter* rewriter = rewrite_args->rewriter;
+        rewrite_args->lhs->addAttrGuard(offsetof(Box, cls), (intptr_t)lhs->cls);
+        rewrite_args->rhs->addAttrGuard(offsetof(Box, cls), (intptr_t)rhs->cls);
+
+        CallattrRewriteArgs srewrite_args(rewriter, rewrite_args->lhs, rewrite_args->destination);
+        srewrite_args.arg1 = rewrite_args->rhs;
+        srewrite_args.args_guarded = true;
+        Box* rtn = callattrInternal1<CXX, REWRITABLE>(lhs, getOpName(op_type), CLASS_ONLY, &srewrite_args,
+                                                      ArgPassSpec(1), rhs);
+        if (rtn) {
+            if (srewrite_args.isSuccessful()) {
+                RewriterVar* r_rtn = srewrite_args.getReturn(ReturnConvention::HAS_RETURN);
+                RewriterVar* r_final = rewriter->call(true, (void*)binopAfterUserOp, r_rtn, rewrite_args->lhs,
+                                                      rewrite_args->rhs, rewriter->loadConst(op_type));
+                r_final->setType(RefType::OWNED);
+                r_rtn->refConsumed();
+                rewrite_args->out_rtn = r_final;
+                rewrite_args->out_success = true;
+            }
+            return binopAfterUserOp(rtn, lhs, rhs, op_type);
+        }
+        // No such method: the rewriter state may be partial, so finish without rewriting.
+        if (srewrite_args.isSuccessful())
+            srewrite_args.assertReturnConvention(ReturnConvention::NO_RETURN);
         rewrite_args = NULL;
     }
 
