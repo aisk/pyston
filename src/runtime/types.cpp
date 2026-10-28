@@ -4513,6 +4513,7 @@ void setupRuntime() {
     setupDict();
     setupSet();
     setupTuple();
+    setupRange();
     setupGenerator();
     setupUnpackStarred();
     setupRaiseFrom();

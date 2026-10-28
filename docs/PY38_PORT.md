@@ -36,6 +36,12 @@ are deferred and listed at the end of this file.
   other operand is big, and their specialized versions only accept exact small ints.
   `Py_TYPE()` in C code still sees the hidden class. Merging the two into one layout is
   still an open decision.
+- **`range`** is `Objects/rangeobject.c`, since Python 3's range (big ints, slicing,
+  `count`/`index`, comparisons) is much more than Pyston's old `xrange`. Its iterator for
+  ranges that fit in a C long gets Pyston's iteration protocol in
+  `runtime/inline/range.cpp` (`tpp_hasnext`, `__hasnext__`, an unboxed `__next__`), which
+  is part of the inlined runtime bitcode. `range` and `range_iterator` are marked
+  `is_constant` so the JIT can speculate on them.
 - Old-style classes, `print`/`exec` statements, backticks, `long`, `basestring`,
   `unicode`, `xrange`, `file` and `__cmp__` are removed.
 - C extension modules from 3.8 are compiled in, and are initialized through
@@ -182,6 +188,14 @@ porting first).
 - **Exception chaining** looks up the exception being handled (`getFrameExcInfo`) for every
   newly raised exception that reaches a Python frame, and sets `__context__`. Measure
   `exceptions_ubench.py` style loops.
+- **`range` loops.** `__iter__` can return either `range_iterator` or
+  `longrange_iterator`, so the JIT only learns the iterator type at run time, and creating a
+  range goes through CPython's argument parsing. On a 1M iteration `for i in range(n): pass`
+  loop the 3.8 Release build takes about 1.2x the time of the 2.7 build with `xrange`, and
+  short ranges created in a loop are slower still.
+- **Types implemented in C aren't `is_constant`.** `freeze()` would replace their C slots, so
+  `str`, `bytes` and the other CPython types are not marked constant and the JIT doesn't
+  speculate on them (`range` is set by hand).
 - **`dict` keeps a second array** for insertion order, so every dict costs more memory and
   inserts write two structures. Lookups go through the index DenseMap as before.
 - **Calls with several `*args`/`**kwargs`** build an extra tuple and dict, and functions

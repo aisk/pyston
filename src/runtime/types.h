@@ -57,6 +57,7 @@ void dict_dtor(BoxedDict* d);
 void setupDict();
 void tuple_dtor(BoxedTuple* d);
 void setupTuple();
+void setupRange();
 void file_dtor(BoxedFile* d);
 void setupFile();
 void setupCAPI();
