@@ -265,14 +265,18 @@ int ICInfo::calculateSuggestedSize() {
     if (times_rewritten < slots.size()) {
         // add up the sizes of all used slots
         int size = 0;
+        int max_slot_size = 0;
         int i = 0;
         for (auto&& slot : slots) {
             if (i >= times_rewritten)
                 break;
             size += slot.size + additional_space_per_slot;
+            max_slot_size = std::max(max_slot_size, slot.size);
             ++i;
         }
-        return size;
+        // Leave room for one more slot: a site that only saw one type in the baseline JIT can become
+        // polymorphic later, and without a free slot each new type would evict the previous one.
+        return size + max_slot_size + additional_space_per_slot;
     }
 
     // get total size of IC
