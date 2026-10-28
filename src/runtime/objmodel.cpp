@@ -3095,6 +3095,9 @@ void setattrGeneric(Box* obj, BoxedString* attr, STOLEN(Box*) val, SetattrRewrit
 
         bool touched_slot = update_slot(self, attr->s());
         if (touched_slot) {
+            // The store above may already have marked the rewrite as successful.
+            if (rewrite_args)
+                rewrite_args->out_success = false;
             rewrite_args = NULL;
             REWRITE_ABORTED("");
         }
@@ -6570,6 +6573,8 @@ extern "C" void delattrGeneric(Box* obj, BoxedString* attr, DelattrRewriteArgs* 
         assert(attr->data()[attr->size()] == '\0');
         bool touched_slot = update_slot(self, attr->data());
         if (touched_slot) {
+            if (rewrite_args)
+                rewrite_args->out_success = false;
             rewrite_args = NULL;
             REWRITE_ABORTED("");
         }
