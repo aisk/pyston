@@ -336,6 +336,7 @@ ConcreteCompilerVariable* doIs(IREmitter& emitter, CompilerVariable* lhs, Compil
 // These functions all return an INT variable, from either an unboxed representation (makeInt) or
 // a boxed representation (makeUnboxedInt)
 CompilerVariable* makeInt(int64_t);
+CompilerVariable* makeUnboxedFromPhi(ConcreteCompilerVariable*);
 CompilerVariable* makeInt(llvm::Value*);
 CompilerVariable* makeUnboxedInt(IREmitter&, ConcreteCompilerVariable*);
 CompilerVariable* makeUnboxedInt(IREmitter&, llvm::Value*);

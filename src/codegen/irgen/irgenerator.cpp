@@ -2837,6 +2837,8 @@ public:
 
     void giveLocalSymbol(int vreg, CompilerVariable* var) override {
         assert(var->getType()->isUsable());
+        if (var->getType() == UNBOXED_INT_PHI || var->getType() == UNBOXED_FLOAT_PHI)
+            var = makeUnboxedFromPhi(static_cast<ConcreteCompilerVariable*>(var));
 
         CompilerVariable*& cur = symbol_table[vreg];
         assert(cur == NULL);

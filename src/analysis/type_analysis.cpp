@@ -61,9 +61,9 @@ ConcreteCompilerType* NullTypeAnalysis::getTypeAtBlockEnd(int vreg, CFGBlock* bl
 static CompilerType* unboxedType(ConcreteCompilerType* t) {
     if (t == BOXED_BOOL)
         return BOOL;
-    if (t == BOXED_INT)
+    if (t == BOXED_INT || t == UNBOXED_INT_PHI)
         return INT;
-    if (t == BOXED_FLOAT)
+    if (t == BOXED_FLOAT || t == UNBOXED_FLOAT_PHI)
         return FLOAT;
     return t;
 }
@@ -181,9 +181,26 @@ private:
         return type == STR || type == INT || type == FLOAT || type == LIST || type == DICT;
     }
 
+    // Must match the ops IntType::binexp lowers to machine arithmetic.
+    static bool isLoweredIntOp(CompilerType* left, CompilerType* right, AST_TYPE::AST_TYPE op) {
+        return left == INT && right == INT
+               && (op == AST_TYPE::Add || op == AST_TYPE::Sub || op == AST_TYPE::Mult || op == AST_TYPE::BitAnd
+                   || op == AST_TYPE::BitOr || op == AST_TYPE::BitXor);
+    }
+
+    // Float arithmetic FloatType::binexp emits directly (IntType::binexp converts an int lhs first).
+    static bool isIntFloatOp(CompilerType* left, CompilerType* right, AST_TYPE::AST_TYPE op) {
+        return (left == FLOAT || left == INT) && (right == FLOAT || right == INT) && (left == FLOAT || right == FLOAT)
+               && (op == AST_TYPE::Add || op == AST_TYPE::Sub || op == AST_TYPE::Mult || op == AST_TYPE::TrueDiv);
+    }
+
     CompilerType* visit_augbinopHelper(BST_AugBinOp* node) {
         CompilerType* left = getType(node->vreg_left);
         CompilerType* right = getType(node->vreg_right);
+        if (isLoweredIntOp(left, right, node->op_type))
+            return INT;
+        if (isIntFloatOp(left, right, node->op_type))
+            return FLOAT;
         if (!hasFixedOps(left) || !hasFixedOps(right))
             return UNKNOWN;
 
@@ -218,6 +235,10 @@ private:
     CompilerType* visit_binopHelper(BST_BinOp* node) {
         CompilerType* left = getType(node->vreg_left);
         CompilerType* right = getType(node->vreg_right);
+        if (isLoweredIntOp(left, right, node->op_type))
+            return INT;
+        if (isIntFloatOp(left, right, node->op_type))
+            return FLOAT;
         if (!hasFixedOps(left) || !hasFixedOps(right))
             return UNKNOWN;
 
@@ -322,6 +343,10 @@ private:
         // depends on the right operand too (it may override the reflected method), so it is unknown.
         if (left == left->getBoxType())
             return UNKNOWN;
+        if ((left == INT || left == FLOAT) && left == right
+            && (op_type == AST_TYPE::Lt || op_type == AST_TYPE::LtE || op_type == AST_TYPE::Gt
+                || op_type == AST_TYPE::GtE || op_type == AST_TYPE::Eq || op_type == AST_TYPE::NotEq))
+            return BOOL;
 
         BoxedString* name = getOpName(node->op);
         CompilerType* attr_type = left->getattrType(name, true);
@@ -765,7 +790,8 @@ TypeAnalysis* doTypeAnalysis(const OSREntryDescriptor* entry_descriptor, EffortL
     TypeMap initial_types(vreg_info.getTotalNumOfVRegs());
 
     for (auto&& p : entry_descriptor->args) {
-        initial_types[p.first] = p.second;
+        // irgen unboxes OSR'd ints (int_cls instances always fit in an i64).
+        initial_types[p.first] = (p.second == BOXED_INT || p.second == BOXED_FLOAT) ? unboxedType(p.second) : p.second;
     }
 
     return PropagatingTypeAnalysis::doAnalysis(speculation, std::move(initial_types),
