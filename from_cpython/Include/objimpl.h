@@ -140,7 +140,13 @@ _PyObject_INIT(PyObject *op, PyTypeObject *typeobj)
 {
     assert(op != NULL);
     Py_TYPE(op) = typeobj;
+    // Pyston change: read the flags directly like CPython 3.9 does, PyType_GetFlags is an out-of-line call.
+    // (Pyston's own C++ sees PyTypeObject as an incomplete BoxedClass here.)
+#if !defined(Py_LIMITED_API) && !defined(_PYSTON_API)
+    if (typeobj->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+#else
     if (PyType_GetFlags(typeobj) & Py_TPFLAGS_HEAPTYPE) {
+#endif
         Py_INCREF(_PyObject_CAST(typeobj));
     }
     _Py_NewReference(op);

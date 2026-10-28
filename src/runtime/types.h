@@ -586,7 +586,9 @@ public:
 
         PyIntObject* v = free_list;
         free_list = (PyIntObject*)Py_TYPE(v);
-        PyObject_INIT((BoxedInt*)v, int_cls);
+        // A static type, so unlike PyObject_INIT there is no type reference to take.
+        Py_TYPE(v) = int_cls;
+        _Py_NewReference((PyObject*)v);
         return v;
 #endif
     }
@@ -632,7 +634,9 @@ public:
 
         PyFloatObject* v = free_list;
         free_list = (PyFloatObject*)Py_TYPE(v);
-        PyObject_INIT((BoxedFloat*)v, &PyFloat_Type);
+        // A static type, so unlike PyObject_INIT there is no type reference to take.
+        Py_TYPE(v) = &PyFloat_Type;
+        _Py_NewReference((PyObject*)v);
         return v;
 #endif
     }
