@@ -1255,7 +1255,7 @@ private:
             else // eg the runtime helper functions the CFG calls
                 return new ConcreteCompilerVariable(UNKNOWN, rtn);
         }
-        CompilerVariable* rtn = symbol_table[vreg];
+        CompilerVariable* rtn = unboxLocal(vreg);
         if (is_kill) {
             symbol_table[vreg] = NULL;
             popDefinedVar(vreg, true /* allow_missing */);
@@ -1369,9 +1369,19 @@ private:
                 popDefinedVar(node->vreg);
             }
 
-            CompilerVariable* rtn = symbol_table[node->vreg];
-            return rtn;
+            return unboxLocal(node->vreg);
         }
+    }
+
+    // An int or float that type analysis kept in a boxed phi: unbox it on first use, keeping the box.
+    CompilerVariable* unboxLocal(int vreg) {
+        CompilerVariable* rtn = symbol_table[vreg];
+        if (rtn && (rtn->getType() == BOXED_INT || rtn->getType() == BOXED_FLOAT)) {
+            auto boxed = static_cast<ConcreteCompilerVariable*>(rtn);
+            rtn = rtn->getType() == BOXED_INT ? makeUnboxedInt(emitter, boxed) : makeUnboxedFloat(emitter, boxed);
+            symbol_table[vreg] = rtn;
+        }
+        return rtn;
     }
 
     CompilerVariable* evalRepr(BST_Repr* node, const UnwindInfo& unw_info) {
