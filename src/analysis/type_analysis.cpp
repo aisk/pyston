@@ -18,6 +18,7 @@
 #include <deque>
 #include <unordered_set>
 
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include "analysis/fpc.h"
@@ -90,16 +91,24 @@ private:
     ExprTypeMap& expr_types;
     TypeSpeculations& type_speculations;
     TypeAnalysis::SpeculationLevel speculation;
+    // If set, collects the vregs that get an int or float which is unboxed to begin with (like the result of
+    // arithmetic), as opposed to one that is only speculated to be an int or float and comes boxed.
+    llvm::BitVector* unboxed_stores;
+    // The vregs that got such a value in this block so far.
+    llvm::BitVector unboxed_here;
+    bool speculated_unboxed = false;
 
     BasicBlockTypePropagator(CFGBlock* block, TypeMap& initial, ExprTypeMap& expr_types,
                              TypeSpeculations& type_speculations, TypeAnalysis::SpeculationLevel speculation,
-                             const CodeConstants& code_constants)
+                             const CodeConstants& code_constants, llvm::BitVector* unboxed_stores)
         : StmtVisitor(code_constants),
           block(block),
           sym_table(initial),
           expr_types(expr_types),
           type_speculations(type_speculations),
-          speculation(speculation) {}
+          speculation(speculation),
+          unboxed_stores(unboxed_stores),
+          unboxed_here(unboxed_stores ? unboxed_stores->size() : 0) {}
 
     void run() {
         for (BST_stmt* stmt : *block) {
@@ -124,6 +133,7 @@ private:
                 }
 
                 type_speculations[node] = speculated_cls;
+                speculated_unboxed = speculated_type == INT || speculated_type == FLOAT;
                 return speculated_type;
             }
         }
@@ -170,10 +180,22 @@ private:
         return t;
     }
 
-    void _doSet(int vreg, CompilerType* t) {
+    void _doSet(int vreg, CompilerType* t, bool unboxed_store = true) {
         assert(t->isUsable());
-        if (t && vreg != VREG_UNDEFINED)
+        if (t && vreg != VREG_UNDEFINED) {
             sym_table[vreg] = t;
+            if (unboxed_stores) {
+                bool unboxed = unboxed_store && !speculated_unboxed && (t == INT || t == FLOAT);
+                unboxed_here[vreg] = unboxed;
+                if (unboxed)
+                    unboxed_stores->set(vreg);
+            }
+        }
+        speculated_unboxed = false;
+    }
+
+    void _doCopy(int vreg_dst, int vreg_src) {
+        _doSet(vreg_dst, getType(vreg_src), vreg_src >= 0 && unboxed_stores && unboxed_here.test(vreg_src));
     }
 
     bool hasFixedOps(CompilerType* type) {
@@ -400,7 +422,7 @@ private:
         assert(node->lookup_type != ScopeInfo::VarScopeType::UNKNOWN);
         if (node->lookup_type == ScopeInfo::VarScopeType::FAST
             || node->lookup_type == ScopeInfo::VarScopeType::CLOSURE) {
-            _doSet(node->vreg, getType(node->vreg_value));
+            _doCopy(node->vreg, node->vreg_value);
         } else
             assert(node->vreg == VREG_UNDEFINED);
     }
@@ -417,8 +439,10 @@ private:
             InternedString id = getCodeConstants().getInternedString(node->index_id);
             if (id.s() == "None")
                 t = NONE;
-        } else if (name_scope == ScopeInfo::VarScopeType::FAST || name_scope == ScopeInfo::VarScopeType::CLOSURE)
-            t = getType(node->vreg);
+        } else if (name_scope == ScopeInfo::VarScopeType::FAST || name_scope == ScopeInfo::VarScopeType::CLOSURE) {
+            _doCopy(node->vreg_dst, node->vreg);
+            return;
+        }
 
         _doSet(node->vreg_dst, t);
     }
@@ -581,9 +605,11 @@ private:
 public:
     static TypeMap propagate(CFGBlock* block, const TypeMap& starting, ExprTypeMap& expr_types,
                              TypeSpeculations& type_speculations, TypeAnalysis::SpeculationLevel speculation,
-                             const CodeConstants& code_constants) {
+                             const CodeConstants& code_constants, llvm::BitVector* unboxed_stores = NULL) {
         TypeMap ending = starting;
-        BasicBlockTypePropagator(block, ending, expr_types, type_speculations, speculation, code_constants).run();
+        BasicBlockTypePropagator(block, ending, expr_types, type_speculations, speculation, code_constants,
+                                 unboxed_stores)
+            .run();
         return ending;
     }
 };
@@ -594,13 +620,18 @@ private:
     ExprTypeMap expr_types;
     TypeSpeculations type_speculations;
     SpeculationLevel speculation;
+    // Vregs that get an unboxed int or float somewhere in the function. The others (like an argument that is only
+    // read, or a name that only gets results of calls) keep their boxed values, instead of being reboxed on every
+    // boxed use.
+    llvm::BitVector assigned;
 
     PropagatingTypeAnalysis(const AllTypeMap& starting_types, const ExprTypeMap& expr_types,
-                            TypeSpeculations& type_speculations, SpeculationLevel speculation)
+                            TypeSpeculations& type_speculations, SpeculationLevel speculation, llvm::BitVector assigned)
         : starting_types(starting_types),
           expr_types(expr_types),
           type_speculations(type_speculations),
-          speculation(speculation) {}
+          speculation(speculation),
+          assigned(std::move(assigned)) {}
 
 public:
     ConcreteCompilerType* getTypeAtBlockEnd(int vreg, CFGBlock* block) override {
@@ -615,6 +646,8 @@ public:
 
         ConcreteCompilerType* rtn = base->getConcreteType();
         ASSERT(rtn != NULL, "%s %d", block->cfg->getVRegInfo().getName(vreg).c_str(), block->idx);
+        if ((rtn == UNBOXED_INT_PHI || rtn == UNBOXED_FLOAT_PHI) && !assigned.test(vreg))
+            return rtn->getBoxType();
         return rtn;
     }
 
@@ -752,7 +785,15 @@ public:
         static StatCounter us_types("us_compiling_analysis_types");
         us_types.log(_t.end());
 
-        return new PropagatingTypeAnalysis(starting_types, expr_types, type_speculations, speculation);
+        llvm::BitVector unboxed_stores(num_vregs);
+        for (CFGBlock* block : cfg->blocks) {
+            if (starting_types.count(block))
+                BasicBlockTypePropagator::propagate(block, starting_types.find(block)->second, expr_types,
+                                                    type_speculations, speculation, code_constants, &unboxed_stores);
+        }
+
+        return new PropagatingTypeAnalysis(starting_types, expr_types, type_speculations, speculation,
+                                           std::move(unboxed_stores));
     }
 };
 
@@ -790,7 +831,7 @@ TypeAnalysis* doTypeAnalysis(const OSREntryDescriptor* entry_descriptor, EffortL
     TypeMap initial_types(vreg_info.getTotalNumOfVRegs());
 
     for (auto&& p : entry_descriptor->args) {
-        // irgen unboxes OSR'd ints (int_cls instances always fit in an i64).
+        // Analyze OSR'd ints as unboxed (int_cls instances always fit in an i64).
         initial_types[p.first] = (p.second == BOXED_INT || p.second == BOXED_FLOAT) ? unboxedType(p.second) : p.second;
     }
 
