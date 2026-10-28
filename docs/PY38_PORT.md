@@ -136,6 +136,11 @@ CPython's own test suite is only a reference. It needs `unittest`, `test.support
 large part of the stdlib, so it is not run. When working on a feature, read the matching
 tests in `~/cpython38/Lib/test` and copy the relevant cases into a small `test/py38` test.
 
+`test/py38_bench/run.sh` compares a few classic benchmarks (converted from
+`minibenchmarks` and `microbenchmarks`) on CPython 3.8, a modern CPython and Pyston
+with and without `-n`. Each benchmark exposes `run()`, and `harness.py` times it
+in-process, so the steady state numbers exclude JIT compilation.
+
 The command line takes CPython's `-I`, `-s`, `-W` and `-X` (the last two only fill
 `sys.warnoptions` and `sys._xoptions`). Pyston's old `-I` (interpreter only) is now `-Y`.
 
