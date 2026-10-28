@@ -18,12 +18,6 @@ sudo apt-get install -yq git cmake ninja-build ccache clang-21 llvm-21-dev clang
 
 `libgtest-dev` is needed for the unit tests and is optional.
 
-### Additional prerequisites for running the integration tests
-**Ubuntu**
-```
-sudo apt-get install libgeoip-dev
-```
-
 ### Building and testing
 
 `tools/setup_deps.sh` builds CPython 2.7.8 into `~/pyston_deps`, which the tests compare Pyston's output against (with the patches in `reference_python_patches/`).

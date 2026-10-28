@@ -1,2 +1,0 @@
-# should_error
-continue

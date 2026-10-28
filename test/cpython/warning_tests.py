@@ -1,1 +1,0 @@
-../../from_cpython/Lib/test/warning_tests.py

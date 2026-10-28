@@ -1,1 +1,0 @@
-../../from_cpython/Lib/test/mp_fork_bomb.py

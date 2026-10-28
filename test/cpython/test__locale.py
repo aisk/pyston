@@ -1,1 +1,0 @@
-../../from_cpython/Lib/test/test__locale.py

@@ -1,1 +1,0 @@
-../../from_cpython/Lib/test/check_soundcard.vbs

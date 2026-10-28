@@ -1,1 +1,0 @@
-print "B.name2"

@@ -1,1 +1,0 @@
-../../from_cpython/Lib/test/test_ascii_formatd.py

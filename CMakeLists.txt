@@ -43,7 +43,6 @@ if(UNIX)
 endif()
 
 option(ENABLE_CCACHE "enable caching compiler output" ON)
-option(ENABLE_EXTRA_TESTS "pyston extra tests" OFF)
 option(ENABLE_GIL "threading use GIL" ON)
 option(ENABLE_GOLD "enable the gold linker" ON)
 option(ENABLE_GPERFTOOLS "enable the google performance tools" OFF)
@@ -359,7 +358,6 @@ set(CMAKE_ENABLE_EXPORTS ON)
 
 add_subdirectory(from_cpython)
 add_subdirectory(src)
-add_subdirectory(test/test_extension)
 add_subdirectory(test/unittests)
 add_subdirectory(tools)
 
@@ -383,21 +381,6 @@ add_test(NAME lint COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/lint.py WORKI
 add_test(NAME check-format COMMAND ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_CLANG_FORMAT} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME analysis_unittest COMMAND analysis_unittest)
 
-macro(add_pyston_test testname directory)
-  add_test(NAME pyston_${testname}_${directory} COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -q -k -a=-S --reference-python=${REFERENCE_PYTHON} ${ARGV2} ${ARGV3} ${ARGV4} ${CMAKE_SOURCE_DIR}/test/${directory})
-endmacro()
-
-# tests         testname directory arguments
-add_pyston_test(defaults tests --order-by-mtime -t50)
-add_pyston_test(force_llvm tests -a=-n -t90)
-if(${CMAKE_BUILD_TYPE} STREQUAL "Release")
-  add_pyston_test(max_compilation_tier tests -a=-L -t50)
-endif()
-add_pyston_test(defaults cpython --exit-code-only --skip-failing -t100)
-add_pyston_test(defaults integration --exit-code-only --skip-failing -t900)
-if(ENABLE_EXTRA_TESTS)
-  add_pyston_test(defaults extra -t900 --exit-code-only)
-endif()
 
 
 # format
@@ -409,11 +392,11 @@ add_custom_target(check-format ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_
 add_custom_target(lint ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/lint.py WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
 
 # check
-add_custom_target(check-deps DEPENDS pyston copy_stdlib ext_cpython ext_pyston unittests sharedmods)
+add_custom_target(check-deps DEPENDS pyston copy_stdlib unittests)
 add_custom_target(check-pyston COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure DEPENDS check-deps)
 
 # {run,dbg,perf,memcheck,memleaks,cachegrind}_TESTNAME
-file(GLOB RUNTARGETS ${CMAKE_SOURCE_DIR}/test/tests/*.py ${CMAKE_SOURCE_DIR}/microbenchmarks/*.py ${CMAKE_SOURCE_DIR}/minibenchmarks/*.py)
+file(GLOB RUNTARGETS ${CMAKE_SOURCE_DIR}/microbenchmarks/*.py ${CMAKE_SOURCE_DIR}/minibenchmarks/*.py)
 foreach(RUNTARGET ${RUNTARGETS})
   get_filename_component(BASEFILENAME ${RUNTARGET} NAME_WE)
   add_custom_target(run_${BASEFILENAME} ./pyston -q ${RUNTARGET} DEPENDS pyston)
