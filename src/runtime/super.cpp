@@ -17,13 +17,14 @@
 #include <sstream>
 
 #include "capi/types.h"
+#include "codegen/unwinding.h"
+#include "core/cfg.h"
 #include "core/types.h"
 #include "runtime/objmodel.h"
 #include "runtime/types.h"
 
 namespace pyston {
 
-BoxedClass* super_cls;
 
 class BoxedSuper : public Box {
 public:
@@ -64,7 +65,7 @@ public:
 static const char* class_str = "__class__";
 
 Box* superGetattribute(Box* _s, Box* _attr) {
-    RELEASE_ASSERT(_s->cls == super_cls, "");
+    RELEASE_ASSERT(PyObject_TypeCheck(_s, super_cls), "");
     BoxedSuper* s = static_cast<BoxedSuper*>(_s);
 
     RELEASE_ASSERT(_attr->cls == str_cls, "");
@@ -154,7 +155,7 @@ Box* super_getattro(Box* _s, Box* _attr) noexcept {
 }
 
 Box* superRepr(Box* _s) {
-    RELEASE_ASSERT(_s->cls == super_cls, "");
+    RELEASE_ASSERT(PyObject_TypeCheck(_s, super_cls), "");
     BoxedSuper* s = static_cast<BoxedSuper*>(_s);
 
     if (s->obj_type) {
@@ -213,9 +214,107 @@ static PyObject* superGet(PyObject* _self, PyObject* obj, PyObject* type) noexce
     }
 }
 
+// Does the class attribute `attr` wrap a function whose code is `code`?
+static bool attrHasCode(Box* attr, BoxedCode* code) {
+    if (!attr)
+        return false;
+    if (attr->cls == staticmethod_cls)
+        attr = static_cast<BoxedStaticmethod*>(attr)->sm_callable;
+    else if (attr->cls == classmethod_cls)
+        attr = static_cast<BoxedClassmethod*>(attr)->cm_callable;
+    else if (attr->cls == property_cls) {
+        BoxedProperty* prop = static_cast<BoxedProperty*>(attr);
+        return attrHasCode(prop->prop_get, code) || attrHasCode(prop->prop_set, code)
+               || attrHasCode(prop->prop_del, code);
+    }
+    if (!attr || !PyFunction_Check(attr))
+        return false;
+    return static_cast<BoxedFunctionBase*>(attr)->code == code;
+}
+
+static BoxedClass* findDefiningClass(BoxedClass* start, BoxedCode* code) {
+    Box* mro = start->tp_mro;
+    if (!mro)
+        return NULL;
+    // Methods are nearly always stored under their own name, so try that before scanning
+    // every class dict.
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < PyTuple_GET_SIZE(mro); i++) {
+            BoxedClass* cls = static_cast<BoxedClass*>(PyTuple_GET_ITEM(mro, i));
+            if (pass == 0) {
+                if (code->name && attrHasCode(cls->getattr(code->name), code))
+                    return cls;
+            } else {
+                BoxedDict* d = static_cast<BoxedDict*>(PyObject_GetAttrString(cls, "__dict__"));
+                if (!d)
+                    throwCAPIException();
+                AUTO_DECREF(d);
+                Box* values = PyMapping_Values(d);
+                if (!values)
+                    throwCAPIException();
+                AUTO_DECREF(values);
+                for (int j = 0; j < PyList_GET_SIZE(values); j++) {
+                    if (attrHasCode(PyList_GET_ITEM(values, j), code))
+                        return cls;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+// Zero-argument super().  CPython finds the class through the __class__ cell that the compiler
+// creates for every method that mentions super or __class__.  We don't have that cell yet, so
+// instead take the first argument of the calling frame and search its MRO for the class whose
+// dict holds the function being run.
+// TODO: implement the __class__ cell; this guess fails for functions that are nested inside a
+// method or that are attached to a class after it was created.
+static void superFromFrame(Box** type_out, Box** obj_out) {
+    FrameInfo* frame_info = getPythonFrameInfo(0);
+    if (!frame_info || !frame_info->code || !frame_info->code->source)
+        raiseExcHelper(RuntimeError, "super(): no current frame");
+    BoxedCode* code = frame_info->code;
+    const ParamNames& params = code->param_names;
+    if (params.numNormalArgs() == 0 || !params.all_args_contains_names)
+        raiseExcHelper(RuntimeError, "super(): no arguments");
+
+    BST_Name* first = params.all_args[0].name;
+    int vreg = first->vreg;
+    if (vreg == VREG_UNDEFINED) {
+        // getVReg() only exists in debug builds, so look the name up in the user visible vregs.
+        auto names = code->source->cfg->getVRegInfo().getVRegSymUserVisibleMap();
+        for (int i = 0; i < names.size(); i++) {
+            if (names[i] == first->id) {
+                vreg = i;
+                break;
+            }
+        }
+    }
+    Box* obj = (vreg >= 0 && vreg < frame_info->num_vregs) ? frame_info->vregs[vreg] : NULL;
+    if (!obj)
+        raiseExcHelper(RuntimeError, "super(): arg[0] deleted");
+
+    BoxedClass* type = NULL;
+    if (PyType_Check(obj))
+        type = findDefiningClass(static_cast<BoxedClass*>(obj), code);
+    if (!type)
+        type = findDefiningClass(obj->cls, code);
+    if (!type)
+        raiseExcHelper(RuntimeError, "super(): __class__ cell not found");
+
+    *type_out = type;
+    *obj_out = obj;
+}
+
 Box* superInit(Box* _self, Box* _type, Box* obj) {
-    RELEASE_ASSERT(_self->cls == super_cls, "");
+    RELEASE_ASSERT(PyObject_TypeCheck(_self, super_cls), "");
     BoxedSuper* self = static_cast<BoxedSuper*>(_self);
+
+    if (!_type) {
+        if (obj)
+            raiseExcHelper(TypeError, "super() argument 1 must be type, not None");
+        superFromFrame(&_type, &obj);
+    }
 
     if (!PyType_Check(_type))
         raiseExcHelper(TypeError, "must be type, not %s", getTypeName(_type));
@@ -248,8 +347,7 @@ Box* superInit(Box* _self, Box* _type, Box* obj) {
 }
 
 void setupSuper() {
-    super_cls
-        = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(BoxedSuper), false, "super", true,
+    BoxedClass::createStatic(super_cls, type_cls, object_cls, 0, 0, sizeof(BoxedSuper), false, "super", true,
                              (destructor)BoxedSuper::dealloc, NULL, true, (traverseproc)BoxedSuper::traverse, NOCLEAR);
 
     // super_cls->giveAttr("__getattribute__", new BoxedFunction(BoxedCode::create((void*)superGetattribute,
@@ -258,7 +356,7 @@ void setupSuper() {
 
     super_cls->giveAttr(
         "__init__",
-        new BoxedFunction(BoxedCode::create((void*)superInit, UNKNOWN, 3, false, false, "super.__init__"), { NULL }));
+        new BoxedFunction(BoxedCode::create((void*)superInit, UNKNOWN, 3, false, false, "super.__init__"), { NULL, NULL }));
     super_cls->giveAttr("__get__",
                         new BoxedFunction(BoxedCode::create((void*)superGet<CXX>, UNKNOWN, 3, "super.__get__")));
 

@@ -76,6 +76,15 @@ Box* tupleGetitemInt(BoxedTuple* self, BoxedInt* slice) {
     return tupleGetitemUnboxed(self, slice->n);
 }
 
+extern "C" PyObject* _PyTuple_FromArray(PyObject* const* src, Py_ssize_t n) noexcept {
+    BoxedTuple* tuple = BoxedTuple::create(n);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        Py_INCREF(src[i]);
+        tuple->elts[i] = src[i];
+    }
+    return tuple;
+}
+
 extern "C" BORROWED(PyObject*) PyTuple_GetItem(PyObject* op, Py_ssize_t i) noexcept {
     if (!PyTuple_Check(op)) {
         PyErr_BadInternalCall();
@@ -201,7 +210,7 @@ template <ExceptionStyle S> Box* tupleGetitem(BoxedTuple* self, Box* slice) {
     } else if (slice->cls == slice_cls)
         return tupleGetitemSlice(self, static_cast<BoxedSlice*>(slice));
     else
-        raiseExcHelper(TypeError, "tuple indices must be integers, not %s", getTypeName(slice));
+        raiseExcHelper(TypeError, "tuple indices must be integers or slices, not %s", getTypeName(slice));
 }
 
 Box* tupleAdd(BoxedTuple* self, Box* rhs) {
@@ -319,11 +328,6 @@ Box* tupleRepr(Box* _t) {
 }
 static Box* tuple_repr(Box* v) noexcept {
     return callCXXFromStyle<CAPI>(tupleRepr, v);
-}
-
-Box* tupleNonzero(BoxedTuple* self) {
-    RELEASE_ASSERT(PyTuple_Check(self), "");
-    return boxBool(self->size() != 0);
 }
 
 static int tuplecontains(BoxedTuple* self, Box* elt) noexcept {
@@ -769,6 +773,30 @@ extern "C" int PyTuple_ClearFreeList() noexcept {
     return freelist_size;
 }
 
+static Box* tupleiterReduce(Box* s) {
+    assert(s->cls == tuple_iterator_cls);
+    BoxedTupleIterator* self = static_cast<BoxedTupleIterator*>(s);
+    Box* iter_func = getattr(builtins_module, autoDecref(internStringMortal("iter")));
+    AUTO_DECREF(iter_func);
+    return BoxedTuple::create({ iter_func, autoDecref(BoxedTuple::create({ self->t })), autoDecref(boxInt(self->pos)) });
+}
+
+static Box* tupleiterSetstate(Box* s, Box* state) {
+    assert(s->cls == tuple_iterator_cls);
+    BoxedTupleIterator* self = static_cast<BoxedTupleIterator*>(s);
+    Py_ssize_t index = PyLong_AsSsize_t(state);
+    if (index == -1 && PyErr_Occurred())
+        throwCAPIException();
+    self->pos = std::max<Py_ssize_t>(0, std::min<Py_ssize_t>(index, self->t->size()));
+    Py_RETURN_NONE;
+}
+
+static Box* tupleiterLengthHint(Box* s) {
+    assert(s->cls == tuple_iterator_cls);
+    BoxedTupleIterator* self = static_cast<BoxedTupleIterator*>(s);
+    return boxInt(std::max<Py_ssize_t>(0, self->t->size() - self->pos));
+}
+
 void setupTuple() {
     static PySequenceMethods tuple_as_sequence;
     tuple_cls->tp_as_sequence = &tuple_as_sequence;
@@ -776,7 +804,7 @@ void setupTuple() {
     tuple_cls->tp_as_mapping = &tuple_as_mapping;
 
     tuple_iterator_cls = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(BoxedTupleIterator), false,
-                                            "tupleiterator", false, (destructor)BoxedTupleIterator::dealloc, NULL, true,
+                                            "tuple_iterator", false, (destructor)BoxedTupleIterator::dealloc, NULL, true,
                                             (traverseproc)BoxedTupleIterator::traverse, NOCLEAR);
 
     tuple_cls->giveAttr("__new__",
@@ -803,8 +831,6 @@ void setupTuple() {
 
     tuple_cls->tp_richcompare = tuplerichcompare;
 
-    tuple_cls->giveAttr("__nonzero__",
-                        new BoxedFunction(BoxedCode::create((void*)tupleNonzero, BOXED_BOOL, 1, "tuple.__nonzero__")));
 
     tuple_cls->giveAttr("__len__",
                         new BoxedFunction(BoxedCode::create((void*)tupleLen, BOXED_INT, 1, "tuple.__len__")));
@@ -821,7 +847,6 @@ void setupTuple() {
                                                             "", ParamNames::empty(), CAPI)));
 
     tuple_cls->tp_hash = (hashfunc)tuple_hash;
-    tuple_cls->tp_as_sequence->sq_slice = (ssizessizeargfunc)&tupleslice;
     add_operators(tuple_cls);
 
     tuple_cls->freeze();
@@ -844,7 +869,15 @@ void setupTuple() {
         "__iter__", new BoxedFunction(BoxedCode::create((void*)tupleIterIter, typeFromClass(tuple_iterator_cls), 1,
                                                         "tuple_iterator.__iter__")));
     tuple_iterator_cls->giveAttr(
-        "next", new BoxedFunction(BoxedCode::create((void*)tupleiterNext, UNKNOWN, 1, "tuple_iterator.next")));
+        "__next__", new BoxedFunction(BoxedCode::create((void*)tupleiterNext, UNKNOWN, 1, "tuple_iterator.next")));
+
+    tuple_iterator_cls->giveAttr("__reduce__", new BoxedFunction(BoxedCode::create((void*)tupleiterReduce, UNKNOWN, 1,
+                                                                                   "tuple_iterator.__reduce__")));
+    tuple_iterator_cls->giveAttr("__setstate__", new BoxedFunction(BoxedCode::create(
+                                                     (void*)tupleiterSetstate, NONE, 2, "tuple_iterator.__setstate__")));
+    tuple_iterator_cls->giveAttr("__length_hint__",
+                                 new BoxedFunction(BoxedCode::create((void*)tupleiterLengthHint, BOXED_INT, 1,
+                                                                     "tuple_iterator.__length_hint__")));
 
     tuple_iterator_cls->freeze();
     tuple_iterator_cls->tpp_hasnext = tupleiterHasnextUnboxed;

@@ -21,10 +21,14 @@
 
 #include "Python.h"
 #include "structmember.h"
+// For the static PyCode_Type and PyFrame_Type:
+#include "code.h"
+#include "frameobject.h"
 
 #include "codegen/irgen/future.h"
 #include "core/contiguous_map.h"
 #include "core/from_llvm/DenseMap.h"
+#include "core/ordered_dense_map.h"
 #include "core/threading.h"
 #include "core/types.h"
 
@@ -63,8 +67,6 @@ void setupFrame();
 
 void setupSys();
 void setupBuiltins();
-void setupPyston();
-void setupThread();
 void setupImport();
 void setupAST();
 void setupSysEnd();
@@ -72,21 +74,54 @@ void setupSysEnd();
 BORROWED(BoxedDict*) getSysModulesDict();
 BORROWED(BoxedList*) getSysPath();
 
+} // namespace pyston
+extern "C" PyObject* PyInit___pyston__();
+extern "C" PyObject* PyInit__thread();
+namespace pyston {
+
 extern "C" BoxedTuple* EmptyTuple;
 extern "C" BoxedString* EmptyString;
 
-extern "C" {
-extern BoxedClass* object_cls, *type_cls, *bool_cls, *int_cls, *long_cls, *float_cls, *str_cls, *function_cls,
-    *none_cls, *instancemethod_cls, *list_cls, *slice_cls, *module_cls, *dict_cls, *tuple_cls, *enumerate_cls,
-    *xrange_cls, *closure_cls, *generator_cls, *complex_cls, *basestring_cls, *property_cls, *staticmethod_cls,
-    *classmethod_cls, *attrwrapper_cls, *builtin_function_or_method_cls, *set_cls, *frozenset_cls, *code_cls,
-    *frame_cls, *capifunc_cls;
-}
-#define unicode_cls (&PyUnicode_Type)
+// The builtin types live in the static storage that CPython uses for them, so that the C code
+// from CPython can refer to them in static initializers.  The ones implemented in C++ get
+// constructed in place by setupRuntime().
+#define object_cls (&PyBaseObject_Type)
+#define type_cls (&PyType_Type)
+#define bool_cls (&PyBool_Type)
+#define int_cls (&PyLong_Type)
+#define float_cls (&PyFloat_Type)
+#define complex_cls (&PyComplex_Type)
+#define str_cls (&PyUnicode_Type)
+#define bytes_cls (&PyBytes_Type)
+#define list_cls (&PyList_Type)
+#define tuple_cls (&PyTuple_Type)
+#define dict_cls (&PyDict_Type)
+#define set_cls (&PySet_Type)
+#define frozenset_cls (&PyFrozenSet_Type)
+#define slice_cls (&PySlice_Type)
+#define function_cls (&PyFunction_Type)
+#define instancemethod_cls (&PyMethod_Type)
+#define capifunc_cls (&PyCFunction_Type)
+#define module_cls (&PyModule_Type)
+#define code_cls (&PyCode_Type)
+#define frame_cls (&PyFrame_Type)
+#define generator_cls (&PyGen_Type)
+#define property_cls (&PyProperty_Type)
+#define staticmethod_cls (&PyStaticMethod_Type)
+#define classmethod_cls (&PyClassMethod_Type)
+#define none_cls (&_PyNone_Type)
+#define enumerate_cls (&PyEnum_Type)
+#define range_cls (&PyRange_Type)
 #define memoryview_cls (&PyMemoryView_Type)
+#define super_cls (&PySuper_Type)
+#define ellipsis_cls (&PyEllipsis_Type)
+#define notimplemented_cls (&_PyNotImplemented_Type)
 
-#define unicode_cls (&PyUnicode_Type)
-#define memoryview_cls (&PyMemoryView_Type)
+extern "C" {
+// long_cls is the class of ints that don't fit in 64 bits.  It is a hidden subclass of int
+// (see int.cpp), so type() and __class__ report int for these objects too.
+extern BoxedClass* long_cls, *closure_cls, *attrwrapper_cls, *builtin_function_or_method_cls;
+}
 
 #define SystemError ((BoxedClass*)PyExc_SystemError)
 #define StopIteration ((BoxedClass*)PyExc_StopIteration)
@@ -139,8 +174,7 @@ extern "C" inline Box* boxBoolNegated(bool b) {
 extern "C" Box* boxInt(i64) __attribute__((visibility("default")));
 extern "C" i64 unboxInt(Box*);
 extern "C" Box* boxFloat(double d);
-extern "C" Box* boxInstanceMethod(Box* obj, Box* func, Box* type);
-extern "C" Box* boxUnboundInstanceMethod(Box* func, Box* type);
+extern "C" Box* boxInstanceMethod(Box* obj, Box* func);
 
 // Both llvm::StringRef and llvm::Twine offer implicit conversions from const char*, so
 // put the twine version under a different name.
@@ -154,7 +188,8 @@ extern "C" inline void listAppendInternalStolen(Box* self, Box* v) __attribute__
 extern "C" void listAppendArrayInternal(Box* self, Box** v, int nelts);
 extern "C" Box* createFunctionFromMetadata(BoxedCode* code, BoxedClosure* closure, Box* globals,
                                            std::initializer_list<Box*> defaults) noexcept;
-extern "C" Box* createUserClass(BoxedString* name, Box* base, Box* attr_dict);
+extern "C" Box* createUserClass(BoxedString* name, Box* base, Box* body_func, Box* kwargs);
+extern "C" Box* createClassNamespace();
 extern "C" double unboxFloat(Box* b);
 extern "C" Box* createDict();
 extern "C" Box* createList();
@@ -255,7 +290,16 @@ public:
 
     void freeze();
 
-    // These should only be used for builtin types:
+    // These should only be used for builtin types.  Builtin types are never allocated by the GC,
+    // like CPython's static types: createStatic() constructs the class in place in one of the static
+    // PyXxx_Type symbols, and create() mallocs a class that is never freed.
+    static void createStatic(BoxedClass* storage, BoxedClass* metatype, BoxedClass* base, int attrs_offset,
+                             int weaklist_offset, int instance_size, bool is_user_defined, const char* name,
+                             bool is_subclassable = true, destructor dealloc = NULL, freefunc free = NULL,
+                             bool is_gc = true, traverseproc traverse = NULL, inquiry clear = NULL);
+    // Prepares memory for a builtin class that will be constructed with placement new.
+    // Allocates the memory if storage is NULL.
+    static BoxedClass* prepareStaticStorage(BoxedClass* storage, BoxedClass* metatype);
     static BoxedClass* create(BoxedClass* metatype, BoxedClass* base, int attrs_offset, int weaklist_offset,
                               int instance_size, bool is_user_defined, const char* name, bool is_subclassable = true,
                               destructor dealloc = NULL, freefunc free = NULL, bool is_gc = true,
@@ -278,7 +322,7 @@ protected:
 
     friend void setupRuntime();
     friend void setupSysEnd();
-    friend void setupThread();
+    friend PyObject* ::PyInit__thread();
 };
 
 template <bool is_gc> void* Box::newFast(size_t size, BoxedClass* cls) {
@@ -323,6 +367,7 @@ template <bool is_gc> void* Box::newFast(size_t size, BoxedClass* cls) {
 // will point to `this->as_number`.
 class BoxedHeapClass : public BoxedClass {
 public:
+    PyAsyncMethods as_async;
     PyNumberMethods as_number;
     PyMappingMethods as_mapping;
     PySequenceMethods as_sequence;
@@ -330,6 +375,8 @@ public:
 
     BoxedString* ht_name;
     PyObject* ht_slots;
+    BoxedString* ht_qualname;
+    void* ht_cached_keys;
 
     size_t nslots() { return this->ob_size; }
 
@@ -347,22 +394,24 @@ private:
 
     friend void setupRuntime();
     friend void setupSys();
-    friend void setupThread();
+    friend PyObject* ::PyInit__thread();
 };
 
 // Assert that our data structures have the same layout as the C API ones with which they need to be interchangeable.
 static_assert(sizeof(pyston::Box) == sizeof(struct _object), "");
 static_assert(offsetof(pyston::Box, cls) == offsetof(struct _object, ob_type), "");
 
-static_assert(offsetof(pyston::BoxedClass, cls) == offsetof(struct _typeobject, ob_type), "");
+static_assert(offsetof(pyston::BoxedClass, cls) == offsetof(struct _typeobject, ob_base.ob_base.ob_type), "");
 static_assert(offsetof(pyston::BoxedClass, tp_name) == offsetof(struct _typeobject, tp_name), "");
 static_assert(offsetof(pyston::BoxedClass, attrs) == offsetof(struct _typeobject, _hcls), "");
 static_assert(sizeof(pyston::BoxedClass) == sizeof(struct _typeobject), "");
 
+static_assert(offsetof(pyston::BoxedHeapClass, as_async) == offsetof(PyHeapTypeObject, as_async), "");
 static_assert(offsetof(pyston::BoxedHeapClass, as_number) == offsetof(PyHeapTypeObject, as_number), "");
 static_assert(offsetof(pyston::BoxedHeapClass, as_mapping) == offsetof(PyHeapTypeObject, as_mapping), "");
 static_assert(offsetof(pyston::BoxedHeapClass, as_sequence) == offsetof(PyHeapTypeObject, as_sequence), "");
 static_assert(offsetof(pyston::BoxedHeapClass, as_buffer) == offsetof(PyHeapTypeObject, as_buffer), "");
+static_assert(offsetof(pyston::BoxedHeapClass, ht_qualname) == offsetof(PyHeapTypeObject, ht_qualname), "");
 static_assert(sizeof(pyston::BoxedHeapClass) == sizeof(PyHeapTypeObject), "");
 
 // DecrefHandle: a simple RAII-style class that [x]decref's its argument when it is destructed.
@@ -503,6 +552,13 @@ template <ExceptionStyle S, typename Func, typename... Args> Box* callCAPIFromSt
 // TODO we should have a flag like this to disable all freelists, not just the int one.
 //#define DISABLE_INT_FREELIST
 
+// The layout of a small int.  This used to be CPython 2's PyIntObject; ints that don't fit in it
+// are BoxedLong objects.
+typedef struct {
+    PyObject_HEAD
+    int64_t ob_ival;
+} PyIntObject;
+
 extern "C" int PyInt_ClearFreeList() noexcept;
 class BoxedInt : public Box {
 private:
@@ -528,8 +584,8 @@ public:
         }
 
         PyIntObject* v = free_list;
-        free_list = (PyIntObject*)v->ob_type;
-        PyObject_INIT((BoxedInt*)v, &PyInt_Type);
+        free_list = (PyIntObject*)Py_TYPE(v);
+        PyObject_INIT((BoxedInt*)v, int_cls);
         return v;
 #endif
     }
@@ -539,6 +595,14 @@ public:
     friend int PyInt_ClearFreeList() noexcept;
 };
 static_assert(sizeof(BoxedInt) == sizeof(PyIntObject), "");
+
+// An int object is either a BoxedInt (an int64, the representation of CPython 2's int) or a
+// BoxedLong (a GMP integer, an instance of the hidden long_cls subclass).  These macros keep
+// their CPython 2 names and check for, or access, the BoxedInt representation.
+#define PyInt_Check(op) (PyLong_Check(op) && !PyType_IsSubtype(Py_TYPE(op), long_cls))
+#define PyInt_CheckExact(op) (Py_TYPE(op) == int_cls)
+#define PyInt_AS_LONG(op) (((BoxedInt*)(op))->n)
+#define PyLongObject_Check(op) PyType_IsSubtype(Py_TYPE(op), long_cls)
 static_assert(offsetof(BoxedInt, n) == offsetof(PyIntObject, ob_ival), "");
 
 extern "C" int PyFloat_ClearFreeList() noexcept;
@@ -566,7 +630,7 @@ public:
         }
 
         PyFloatObject* v = free_list;
-        free_list = (PyFloatObject*)v->ob_type;
+        free_list = (PyFloatObject*)Py_TYPE(v);
         PyObject_INIT((BoxedFloat*)v, &PyFloat_Type);
         return v;
 #endif
@@ -600,94 +664,71 @@ public:
     DEFAULT_CLASS_SIMPLE(bool_cls, false);
 };
 
-class BoxedString : public BoxVar {
+// Python's str type.  Strings are CPython's PEP 393 unicode objects (Objects/unicodeobject.c),
+// and this class mirrors the PyASCIIObject header so that C++ code can look inside them.
+class BoxedString : public Box {
 public:
-    // llvm::StringRef is basically just a pointer and a length, so with proper compiler
-    // optimizations and inlining, creating a new one each time shouldn't have any cost.
-    llvm::StringRef s() const { return llvm::StringRef(s_data, ob_size); };
+    Py_ssize_t length; // number of code points
+    Py_hash_t hash;    // -1 means not yet computed
+    struct {
+        unsigned int interned : 2;
+        unsigned int kind : 3;
+        unsigned int compact : 1;
+        unsigned int ascii : 1;
+        unsigned int ready : 1;
+        unsigned int : 24;
+    } state;
+    wchar_t* wstr;
 
-    long hash; // -1 means not yet computed
-    int interned_state;
-    char s_data[0];
+    bool isCompactAscii() const { return state.ascii && state.compact; }
 
-    char* data() { return s_data; }
-    const char* c_str() {
-        assert(data()[size()] == '\0');
-        return data();
+    // Returns the UTF-8 encoding of the string.  For compact ASCII strings (nearly all identifiers)
+    // this points straight at the character data; otherwise it uses the string's UTF-8 cache.
+    llvm::StringRef s() const {
+        if (likely(isCompactAscii()))
+            return llvm::StringRef((const char*)(this + 1), length);
+        return sSlow();
     }
-    size_t size() { return this->ob_size; }
+    llvm::StringRef sSlow() const;
 
-    // DEFAULT_CLASS_VAR_SIMPLE doesn't work because of the +1 for the null byte
-    void* operator new(size_t size, BoxedClass* cls, size_t nitems) __attribute__((visibility("default"))) {
-        ALLOC_STATS_VAR(str_cls)
+    const char* c_str() const { return s().data(); }
+    const char* data() const { return s().data(); }
+    size_t size() const { return s().size(); }
+    bool isInterned() const { return state.interned != SSTATE_NOT_INTERNED; }
 
-        assert(cls->tp_itemsize == sizeof(char));
-        return BoxVar::operator new(size, cls, nitems);
+    // Creates an uninitialized ASCII string of length n.  The caller must only write ASCII characters
+    // into it, through getWriteableStringContents().
+    static BoxedString* createUninitializedString(ssize_t n);
+    char* getWriteableStringContents() {
+        assert(isCompactAscii());
+        return (char*)(this + 1);
     }
-    void* operator new(size_t size, size_t nitems) __attribute__((visibility("default"))) {
-        ALLOC_STATS_VAR(str_cls)
-
-        assert(str_cls->tp_alloc == PyType_GenericAlloc);
-        assert(str_cls->tp_itemsize == 1);
-        assert(str_cls->tp_basicsize == offsetof(BoxedString, s_data) + 1);
-        assert(str_cls->is_pyston_class);
-        assert(str_cls->attrs_offset == 0);
-
-        void* mem = PyObject_MALLOC(sizeof(BoxedString) + 1 + nitems);
-        assert(mem);
-
-        BoxVar* rtn = static_cast<BoxVar*>(mem);
-        rtn->cls = str_cls;
-        rtn->ob_size = nitems;
-        _Py_NewReference(rtn);
-        return rtn;
-    }
-
-    // these should be private, but str.cpp needs them
-    BoxedString(const char* s, size_t n) __attribute__((visibility("default")));
-    explicit BoxedString(size_t n, char c) __attribute__((visibility("default")));
-    explicit BoxedString(llvm::StringRef s) __attribute__((visibility("default")));
-    explicit BoxedString(llvm::StringRef lhs, llvm::StringRef rhs) __attribute__((visibility("default")));
-
-    // creates an uninitialized string of length n; useful for directly constructing into the string and avoiding
-    // copies:
-    static BoxedString* createUninitializedString(ssize_t n) { return new (n) BoxedString(n); }
-    static BoxedString* createUninitializedString(BoxedClass* cls, ssize_t n) { return new (cls, n) BoxedString(n); }
-
-    // Gets a writeable pointer to the contents of a string.
-    // Is only meant to be used with something just created from createUninitializedString(), though
-    // in theory it might work in more cases.
-    char* getWriteableStringContents() { return s_data; }
 
 private:
-    void* operator new(size_t size) = delete;
-
-    BoxedString(size_t n); // non-initializing constructor
-
-    friend void setupRuntime();
+    BoxedString() = delete;
 };
-static_assert(sizeof(BoxedString) == sizeof(PyStringObject), "");
-static_assert(offsetof(BoxedString, ob_size) == offsetof(PyStringObject, ob_size), "");
-static_assert(offsetof(BoxedString, hash) == offsetof(PyStringObject, ob_shash), "");
-static_assert(offsetof(BoxedString, interned_state) == offsetof(PyStringObject, ob_sstate), "");
-static_assert(offsetof(BoxedString, s_data) == offsetof(PyStringObject, ob_sval), "");
+static_assert(sizeof(BoxedString) == sizeof(PyASCIIObject), "");
+static_assert(offsetof(BoxedString, length) == offsetof(PyASCIIObject, length), "");
+static_assert(offsetof(BoxedString, hash) == offsetof(PyASCIIObject, hash), "");
+static_assert(offsetof(BoxedString, wstr) == offsetof(PyASCIIObject, wstr), "");
 
 size_t strHashUnboxedStrRef(llvm::StringRef str);
 extern "C" size_t strHashUnboxed(BoxedString* self);
 extern "C" int64_t hashUnboxed(Box* obj);
 
+// A bound method.  Python 3 has no unbound methods, so obj is never NULL.
 class BoxedInstanceMethod : public Box {
 public:
+    Box* func;
+    Box* obj;
     Box** im_weakreflist;
+    vectorcallfunc vectorcall;
 
-    // obj is NULL for unbound instancemethod
-    Box* obj, *func, *im_class;
-
-    BoxedInstanceMethod(Box* obj, Box* func, Box* im_class) __attribute__((visibility("default")))
-    : im_weakreflist(NULL), obj(obj), func(func), im_class(im_class) {
+    BoxedInstanceMethod(Box* obj, Box* func) __attribute__((visibility("default")))
+    : func(func), obj(obj), im_weakreflist(NULL), vectorcall(NULL) {
+        assert(obj);
         Py_INCREF(func);
-        Py_XINCREF(obj);
-        Py_XINCREF(im_class);
+        Py_INCREF(obj);
     }
 
     DEFAULT_CLASS_SIMPLE(instancemethod_cls, true);
@@ -695,6 +736,10 @@ public:
     static void dealloc(Box* self) noexcept;
     static int traverse(Box* self, visitproc visit, void* arg) noexcept;
 };
+
+static_assert(offsetof(BoxedInstanceMethod, func) == offsetof(PyMethodObject, im_func), "");
+static_assert(offsetof(BoxedInstanceMethod, obj) == offsetof(PyMethodObject, im_self), "");
+static_assert(sizeof(BoxedInstanceMethod) == sizeof(PyMethodObject), "");
 
 class GCdArray {
 public:
@@ -758,7 +803,7 @@ public:
 };
 static_assert(sizeof(BoxedList) <= sizeof(PyListObject), "");
 static_assert(sizeof(BoxedList) >= sizeof(PyListObject), "");
-static_assert(offsetof(BoxedList, size) == offsetof(PyListObject, ob_size), "");
+static_assert(offsetof(BoxedList, size) == offsetof(PyListObject, ob_base.ob_size), "");
 static_assert(offsetof(BoxedList, elts) == offsetof(PyListObject, ob_item), "");
 static_assert(offsetof(GCdArray, elts) == 0, "");
 static_assert(offsetof(BoxedList, allocated) == offsetof(PyListObject, allocated), "");
@@ -975,10 +1020,9 @@ public:
     operator llvm::ArrayRef<Box*>() const { return llvm::ArrayRef<Box*>(this->elts, size()); }
 };
 static_assert(sizeof(BoxedTuple) == sizeof(PyTupleObject), "");
-static_assert(offsetof(BoxedTuple, ob_size) == offsetof(PyTupleObject, ob_size), "");
+static_assert(offsetof(BoxedTuple, ob_size) == offsetof(PyTupleObject, ob_base.ob_size), "");
 static_assert(offsetof(BoxedTuple, elts) == offsetof(PyTupleObject, ob_item), "");
 
-extern BoxedString* characters[UCHAR_MAX + 1];
 
 // C++ functor objects that implement Python semantics.
 struct PyHasher {
@@ -1049,8 +1093,8 @@ inline BoxAndHash& incref(BoxAndHash& b) {
 
 class BoxedDict : public Box {
 public:
-    typedef pyston::DenseMap<BoxAndHash, Box*, BoxAndHash::Comparisons, detail::DenseMapPair<BoxAndHash, Box*>,
-                             /* MinSize= */ 8> DictMap;
+    // Ordered by insertion, like dicts in Python 3.7+.
+    typedef OrderedDenseMap<BoxAndHash, Box*, BoxAndHash::Comparisons> DictMap;
 
     DictMap d;
 
@@ -1154,13 +1198,16 @@ public:
 
     BoxedString* filename = nullptr;
     BoxedString* name = nullptr;
+    BoxedString* qualname = nullptr;
     int firstlineno;
     // In CPython, this is just stored as consts[0]
     Box* _doc = nullptr;
 
     const ParamNames param_names;
     const bool takes_varargs, takes_kwargs;
+    // num_args counts the keyword-only arguments too; they are the last num_kwonly of them.
     const int num_args;
+    int num_kwonly = 0;
 
     FunctionList
         versions; // any compiled versions along with their type parameters; in order from most preferred to least
@@ -1269,6 +1316,9 @@ public:
     Box* globals;
 
     BoxedTuple* defaults;
+    Box* kwdefaults;       // __kwdefaults__, a dict or NULL
+    Box* annotations;      // __annotations__, a dict or NULL until first accessed
+    BoxedString* qualname; // NULL means use the code's qualname
     bool can_change_defaults;
 
     ICInvalidator dependent_ics;
@@ -1283,7 +1333,7 @@ public:
 
     ParamReceiveSpec getParamspec() {
         return ParamReceiveSpec(code->num_args, defaults ? defaults->size() : 0, code->takes_varargs,
-                                code->takes_kwargs);
+                                code->takes_kwargs, code->num_kwonly);
     }
 };
 
@@ -1313,6 +1363,11 @@ public:
     HCAttrs attrs;
 
     FutureFlags future_flags;
+
+    // From CPython's PyModuleObject:
+    PyModuleDef* md_def = NULL;
+    void* md_state = NULL;
+    Box* md_weaklist = NULL;
 
     BoxedModule() {} // noop constructor to disable zero-initialization of cls
     std::string name();
@@ -1348,18 +1403,10 @@ public:
     friend void _PyModule_Clear(PyObject*) noexcept;
 };
 
+// slice is implemented by CPython's Objects/sliceobject.c; use createSlice() to create one.
 class BoxedSlice : public Box {
 public:
     Box* start, *stop, *step;
-    BoxedSlice(Box* lower, Box* upper, Box* step) : start(lower), stop(upper), step(step) {
-        Py_INCREF(lower);
-        Py_INCREF(upper);
-        Py_INCREF(step);
-    }
-
-    static void dealloc(Box* b) noexcept;
-
-    DEFAULT_CLASS_SIMPLE(slice_cls, false);
 };
 static_assert(sizeof(BoxedSlice) == sizeof(PySliceObject), "");
 static_assert(offsetof(BoxedSlice, start) == offsetof(PySliceObject, start), "");
@@ -1509,18 +1556,6 @@ int frameinfo_traverse(FrameInfo* frame_info, visitproc visit, void* arg) noexce
 extern "C" void initFrame(FrameInfo* frame_info);
 extern "C" void setFrameExcInfo(FrameInfo* frame_info, STOLEN(Box*) type, STOLEN(Box*) value, STOLEN(Box*) tb);
 
-inline BoxedString* boxString(llvm::StringRef s) {
-    if (s.size() <= 1) {
-        BoxedString* r;
-        if (s.size() == 0)
-            r = EmptyString;
-        else
-            r = characters[s.data()[0] & UCHAR_MAX];
-        Py_INCREF(r);
-        return r;
-    }
-    return new (s.size()) BoxedString(s);
-}
 
 #define MIN_INTERNED_INT -5  // inclusive
 #define MAX_INTERNED_INT 256 // inclusive
@@ -1536,6 +1571,12 @@ extern "C" inline Box* boxInt(int64_t n) {
 }
 
 // Helper function: fetch an arg from our calling convention
+// The class that Python code sees for an object. Ints that don't fit in 64 bits are
+// instances of a hidden GMP subclass of int, but type() and __class__ report int.
+inline BORROWED(BoxedClass*) visibleClass(Box* b) {
+    return b->cls == long_cls ? int_cls : b->cls;
+}
+
 inline Box*& getArg(int idx, Box*& arg1, Box*& arg2, Box*& arg3, Box** args) {
     if (idx == 0)
         return arg1;

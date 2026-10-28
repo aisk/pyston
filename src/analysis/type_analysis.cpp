@@ -142,14 +142,16 @@ private:
             return LONG;
         else if (o->cls == str_cls)
             return STR;
-        else if (o->cls == unicode_cls)
-            return typeFromClass(unicode_cls);
+        else if (o->cls == bytes_cls)
+            return typeFromClass(bytes_cls);
         else if (o->cls == none_cls)
             return NONE;
+        else if (o->cls == bool_cls)
+            return BOXED_BOOL;
         else if (o->cls == ellipsis_cls)
             return typeFromClass(ellipsis_cls);
-        else
-            RELEASE_ASSERT(0, "");
+        else // eg the runtime helper functions the CFG calls
+            return UNKNOWN;
     }
 
     CompilerType* getType(int vreg) {
@@ -315,6 +317,11 @@ private:
             || op_type == AST_TYPE::NotIn) {
             return BOOL;
         }
+
+        // irgen only specializes comparisons of unboxed values.  For boxed objects the result
+        // depends on the right operand too (it may override the reflected method), so it is unknown.
+        if (left == left->getBoxType())
+            return UNKNOWN;
 
         BoxedString* name = getOpName(node->op);
         CompilerType* attr_type = left->getattrType(name, true);

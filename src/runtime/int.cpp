@@ -81,8 +81,8 @@ PyIntObject* BoxedInt::fill_free_list(void) noexcept {
     p = &((PyIntBlock*)p)->objects[0];
     q = p + N_INTOBJECTS;
     while (--q > p)
-        q->ob_type = (struct _typeobject*)(q - 1);
-    q->ob_type = NULL;
+        Py_TYPE(q) = (PyTypeObject*)(q - 1);
+    Py_TYPE(q) = NULL;
     return p + N_INTOBJECTS - 1;
 }
 
@@ -92,7 +92,7 @@ void BoxedInt::tp_dealloc(Box* b) noexcept {
 #else
     if (PyInt_CheckExact(b)) {
         PyIntObject* v = (PyIntObject*)(b);
-        v->ob_type = (struct _typeobject*)free_list;
+        Py_TYPE(v) = (PyTypeObject*)free_list;
         free_list = v;
     } else {
         b->cls->tp_free(b);
@@ -108,70 +108,17 @@ extern "C" unsigned long PyInt_AsUnsignedLongMask(PyObject* op) noexcept {
     Py_FatalError("unimplemented");
 }
 
-extern "C" long PyInt_AsLong(PyObject* op) noexcept {
-    PyNumberMethods* nb;
-    BoxedInt* io;
-    long val;
-
-    if (op && PyInt_Check(op))
-        return static_cast<BoxedInt*>(op)->n;
-
-    if (op == NULL || (nb = Py_TYPE(op)->tp_as_number) == NULL || nb->nb_int == NULL) {
-        PyErr_SetString(PyExc_TypeError, "an integer is required");
-        return -1;
-    }
-
-    io = (BoxedInt*)(*nb->nb_int)(op);
-    if (io == NULL)
-        return -1;
-    if (!PyInt_Check(io)) {
-        if (PyLong_Check(io)) {
-            /* got a long? => retry int conversion */
-            val = PyLong_AsLong((PyObject*)io);
-            Py_DECREF(io);
-            if ((val == -1) && PyErr_Occurred())
-                return -1;
-            return val;
-        } else {
-            Py_DECREF(io);
-            PyErr_SetString(PyExc_TypeError, "__int__ method should return an integer");
-            return -1;
-        }
-    }
-
-    val = static_cast<BoxedInt*>(io)->n;
-    Py_DECREF(io);
-
-    return val;
+extern "C" PyObject* PyLong_FromSize_t(size_t ival) noexcept {
+    if (ival <= LONG_MAX)
+        return boxInt(ival);
+    return PyLong_FromUnsignedLong(ival);
 }
 
-extern "C" Py_ssize_t PyInt_AsSsize_t(PyObject* op) noexcept {
-    if (op == NULL) {
-        PyErr_SetString(PyExc_TypeError, "an integer is required");
-        return -1;
-    }
-
-    if (PyInt_Check(op))
-        return ((BoxedInt*)op)->n;
-    if (PyLong_Check(op))
-        return _PyLong_AsSsize_t(op);
-#if SIZEOF_SIZE_T == SIZEOF_LONG
-    return PyInt_AsLong(op);
-#else
-    RELEASE_ASSERT("not implemented", "");
-#endif
-}
-
-extern "C" PyObject* PyInt_FromSize_t(size_t ival) noexcept {
-    RELEASE_ASSERT(ival <= LONG_MAX, "");
+extern "C" PyObject* PyLong_FromSsize_t(Py_ssize_t ival) noexcept {
     return boxInt(ival);
 }
 
-extern "C" PyObject* PyInt_FromSsize_t(Py_ssize_t ival) noexcept {
-    return boxInt(ival);
-}
-
-extern "C" PyObject* PyInt_FromLong(long n) noexcept {
+extern "C" PyObject* PyLong_FromLong(long n) noexcept {
     return boxInt(n);
 }
 
@@ -180,6 +127,9 @@ extern "C" PyObject* PyInt_FromLong(long n) noexcept {
    conversion machinery in _PyInt_Format, thanks to optimization
    opportunities offered by division by a compile-time constant. */
 static Box* int_to_decimal_string(BoxedInt* v) noexcept {
+    // C code calls PyLong_Type.tp_repr directly, also on our big ints.
+    if (PyLongObject_Check(v))
+        return long_cls->tp_repr(v);
     char buf[sizeof(long) * CHAR_BIT / 3 + 6], *p, *bufend;
     long n = v->n;
     unsigned long absn;
@@ -191,7 +141,7 @@ static Box* int_to_decimal_string(BoxedInt* v) noexcept {
     } while (absn);
     if (n < 0)
         *--p = '-';
-    return PyString_FromStringAndSize(p, bufend - p);
+    return PyUnicode_FromStringAndSize(p, bufend - p);
 }
 
 extern "C" PyAPI_FUNC(PyObject*) _PyInt_Format(PyIntObject* v, int base, int newstyle) noexcept {
@@ -255,11 +205,11 @@ extern "C" PyAPI_FUNC(PyObject*) _PyInt_Format(PyIntObject* v, int base, int new
     if (negative)
         *--p = '-';
 
-    return PyString_FromStringAndSize(p, &buf[sizeof(buf)] - p);
+    return PyUnicode_FromStringAndSize(p, &buf[sizeof(buf)] - p);
 }
 
 extern "C" int _PyInt_AsInt(PyObject* obj) noexcept {
-    long result = PyInt_AsLong(obj);
+    long result = PyLong_AsLong(obj);
     if (result == -1 && PyErr_Occurred())
         return -1;
     if (result > INT_MAX || result < INT_MIN) {
@@ -280,62 +230,7 @@ extern "C" unsigned PY_LONG_LONG PyInt_AsUnsignedLongLongMask(register PyObject*
 #endif
 
 extern "C" PyObject* PyInt_FromString(const char* s, char** pend, int base) noexcept {
-    char* end;
-    long x;
-    Py_ssize_t slen;
-    PyObject* sobj, *srepr;
-
-    if ((base != 0 && base < 2) || base > 36) {
-        PyErr_SetString(PyExc_ValueError, "int() base must be >= 2 and <= 36");
-        return NULL;
-    }
-
-    while (*s && isspace(Py_CHARMASK(*s)))
-        s++;
-    errno = 0;
-    if (base == 0 && s[0] == '0') {
-        x = (long)PyOS_strtoul(const_cast<char*>(s), &end, base);
-        if (x < 0)
-            return PyLong_FromString(s, pend, base);
-    } else
-        x = PyOS_strtol(const_cast<char*>(s), &end, base);
-    if (end == s || !isalnum(Py_CHARMASK(end[-1])))
-        goto bad;
-    while (*end && isspace(Py_CHARMASK(*end)))
-        end++;
-    if (*end != '\0') {
-    bad:
-        slen = strlen(s) < 200 ? strlen(s) : 200;
-
-        // Pyston addition: try to avoid doing the string repr if possible.
-        bool use_fast = true;
-        for (int i = 0; i < slen; i++) {
-            char c = s[i];
-            if (c == '\'' || c == '\\' || c == '\t' || c == '\n' || c == '\r' || c < ' ' || c >= 0x7f) {
-                use_fast = false;
-                break;
-            }
-        }
-        if (use_fast) {
-            PyErr_Format(PyExc_ValueError, "invalid literal for int() with base %d: '%.200s'", base, s);
-            return NULL;
-        }
-
-        sobj = PyString_FromStringAndSize(s, slen);
-        if (sobj == NULL)
-            return NULL;
-        srepr = PyObject_Repr(sobj);
-        Py_DECREF(sobj);
-        if (srepr == NULL)
-            return NULL;
-        PyErr_Format(PyExc_ValueError, "invalid literal for int() with base %d: %s", base, PyString_AS_STRING(srepr));
-        Py_DECREF(srepr);
-        return NULL;
-    } else if (errno != 0)
-        return PyLong_FromString(s, pend, base);
-    if (pend)
-        *pend = end;
-    return PyInt_FromLong(x);
+    return PyLong_FromString(s, pend, base);
 }
 
 #ifdef Py_USING_UNICODE
@@ -482,7 +377,7 @@ extern "C" Box* pow_i64_i64(i64 lhs, i64 rhs, Box* mod) {
     if (rhs < 0)
         // already checked, rhs is a integer,
         // and mod will be None in this case.
-        return boxFloat(pow_float_float(lhs, rhs));
+        return powFloatFloat(lhs, rhs);
 
     // let longPow do the checks.
     return longPow(autoDecref(boxLong(lhs)), autoDecref(boxLong(rhs)), mod);
@@ -493,6 +388,15 @@ extern "C" Box* mul_i64_i64(i64 lhs, i64 rhs) {
     if (!__builtin_smull_overflow(lhs, rhs, &result))
         return boxInt(result);
     return longMul(autoDecref(boxLong(lhs)), autoDecref(boxLong(rhs)));
+}
+
+// The GMP ints are instances of a hidden subclass of int, so they can reach int's methods
+// through explicit calls like int.__add__(2**70, 1). Hand those to the GMP implementation.
+static Box* forwardToLong(const char* name, Box* self, Box* a = NULL, Box* b = NULL) {
+    Box* r = PyObject_CallMethodObjArgs(self, autoDecref(internStringMortal(name)), a, b, NULL);
+    if (!r)
+        throwCAPIException();
+    return r;
 }
 
 extern "C" Box* intAddInt(BoxedInt* lhs, BoxedInt* rhs) {
@@ -508,8 +412,12 @@ extern "C" Box* intAddFloat(BoxedInt* lhs, BoxedFloat* rhs) {
 }
 
 extern "C" Box* intAdd(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__add__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__add__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__add__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
@@ -523,9 +431,13 @@ extern "C" Box* intAdd(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRAdd(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__radd__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__radd__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__radd__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
@@ -542,8 +454,12 @@ extern "C" Box* intAndInt(BoxedInt* lhs, BoxedInt* rhs) {
 }
 
 extern "C" Box* intAnd(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__and__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__and__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__and__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -553,9 +469,13 @@ extern "C" Box* intAnd(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRAnd(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rand__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rand__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rand__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -571,8 +491,12 @@ extern "C" Box* intOrInt(BoxedInt* lhs, BoxedInt* rhs) {
 }
 
 extern "C" Box* intOr(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__or__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__or__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__or__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -582,8 +506,12 @@ extern "C" Box* intOr(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intROr(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__ror__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__ror__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__ror__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -599,8 +527,12 @@ extern "C" Box* intXorInt(BoxedInt* lhs, BoxedInt* rhs) {
 }
 
 extern "C" Box* intXor(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__xor__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__xor__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__xor__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -610,9 +542,13 @@ extern "C" Box* intXor(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRXor(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rxor__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rxor__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rxor__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -638,8 +574,12 @@ extern "C" Box* intDivFloat(BoxedInt* lhs, BoxedFloat* rhs) {
 }
 
 extern "C" Box* intDiv(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__div__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__div__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__div__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         return intDivInt(lhs, static_cast<BoxedInt*>(rhs));
@@ -651,9 +591,13 @@ extern "C" Box* intDiv(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRDiv(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rdiv__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rdiv__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rdiv__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         return div_i64_i64(static_cast<BoxedInt*>(rhs)->n, lhs->n);
@@ -679,9 +623,13 @@ extern "C" Box* intFloordivFloat(BoxedInt* lhs, BoxedFloat* rhs) {
 }
 
 extern "C" Box* intFloordiv(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__floordiv__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__floordiv__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__floordiv__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         return intFloordivInt(lhs, static_cast<BoxedInt*>(rhs));
@@ -693,9 +641,13 @@ extern "C" Box* intFloordiv(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRFloordiv(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rfloordiv__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rfloordiv__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rfloordiv__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -725,9 +677,13 @@ extern "C" Box* intTruedivFloat(BoxedInt* lhs, BoxedFloat* rhs) {
 }
 
 extern "C" Box* intTruediv(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__truediv__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__truediv__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__truediv__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         return intTruedivInt(lhs, static_cast<BoxedInt*>(rhs));
@@ -739,9 +695,13 @@ extern "C" Box* intTruediv(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRTruediv(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rtruediv__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rtruediv__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rtruediv__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         return intTruedivInt(static_cast<BoxedInt*>(rhs), lhs);
@@ -767,11 +727,15 @@ extern "C" Box* intLShiftInt(BoxedInt* lhs, BoxedInt* rhs) {
 }
 
 extern "C" Box* intLShift(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__lshift__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__lshift__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__lshift__", autoDecref(boxLong(lhs->n)), rhs);
 
-    if (PyLong_Check(rhs))
+    if (PyLongObject_Check(rhs))
         return longLShiftLong(autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
@@ -782,9 +746,13 @@ extern "C" Box* intLShift(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRLShift(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rlshift__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rlshift__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rlshift__", autoDecref(boxLong(lhs->n)), rhs);
 
 
     if (!PyInt_Check(rhs)) {
@@ -801,8 +769,12 @@ extern "C" Box* intModInt(BoxedInt* lhs, BoxedInt* rhs) {
 }
 
 extern "C" Box* intMod(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__mod__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__mod__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__mod__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -812,9 +784,13 @@ extern "C" Box* intMod(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRMod(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rmod__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rmod__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rmod__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -824,9 +800,13 @@ Box* intRMod(BoxedInt* lhs, Box* rhs) {
 }
 
 extern "C" Box* intDivmod(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__divmod__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__divmod__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__divmod__", autoDecref(boxLong(lhs->n)), rhs);
 
     Box* divResult = intDiv(lhs, rhs);
 
@@ -849,9 +829,13 @@ extern "C" Box* intDivmod(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRDivmod(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rdivmod__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rdivmod__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rdivmod__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -872,8 +856,12 @@ extern "C" Box* intMulFloat(BoxedInt* lhs, BoxedFloat* rhs) {
 }
 
 extern "C" Box* intMul(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__mul__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__mul__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__mul__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
@@ -887,9 +875,13 @@ extern "C" Box* intMul(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRMul(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rmul__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rmul__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rmul__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs))
         return incref(NotImplemented);
@@ -909,7 +901,7 @@ static void _addFuncPow(const char* name, ConcreteCompilerType* rtn_type, void* 
 
 extern "C" Box* intPowLong(BoxedInt* lhs, BoxedLong* rhs, Box* mod) {
     assert(PyInt_Check(lhs));
-    assert(PyLong_Check(rhs));
+    assert(PyLongObject_Check(rhs));
     BoxedLong* lhs_long = boxLong(lhs->n);
     return longPow(autoDecref(lhs_long), rhs, mod);
 }
@@ -921,14 +913,18 @@ extern "C" Box* intPowFloat(BoxedInt* lhs, BoxedFloat* rhs, Box* mod) {
     if (mod != Py_None) {
         raiseExcHelper(TypeError, "pow() 3rd argument not allowed unless all arguments are integers");
     }
-    return boxFloat(pow_float_float(lhs->n, rhs->d));
+    return powFloatFloat(lhs->n, rhs->d);
 }
 
 extern "C" Box* intPow(BoxedInt* lhs, Box* rhs, Box* mod) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__pow__", lhs, rhs, mod);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__pow__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__pow__", autoDecref(boxLong(lhs->n)), rhs, mod);
 
-    if (PyLong_Check(rhs))
+    if (PyLongObject_Check(rhs))
         return intPowLong(lhs, static_cast<BoxedLong*>(rhs), mod);
     else if (PyFloat_CheckExact(rhs))
         return intPowFloat(lhs, static_cast<BoxedFloat*>(rhs), mod);
@@ -936,33 +932,32 @@ extern "C" Box* intPow(BoxedInt* lhs, Box* rhs, Box* mod) {
         return incref(NotImplemented);
 
     BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
-    if (mod != Py_None) {
-        if (rhs_int->n < 0)
-            raiseExcHelper(TypeError, "pow() 2nd argument "
-                                      "cannot be negative when 3rd argument specified");
-    }
+    // A negative exponent with a modulus needs the modular inverse, which the GMP version does.
+    if (mod != Py_None && rhs_int->n < 0)
+        return forwardToLong("__pow__", autoDecref(boxLong(lhs->n)), rhs, mod);
 
     Box* rtn = pow_i64_i64(lhs->n, rhs_int->n, mod);
-    if (PyLong_Check(rtn))
+    if (PyLongObject_Check(rtn))
         return longInt(autoDecref(rtn));
     return rtn;
 }
 
 Box* intRPow(BoxedInt* lhs, Box* rhs, Box* mod) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rpow__", lhs, rhs, mod);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rpow__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rpow__", autoDecref(boxLong(lhs->n)), rhs, mod);
 
     if (!PyInt_Check(rhs))
         return incref(NotImplemented);
     BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
-    if (mod != Py_None) {
-        if (lhs->n < 0)
-            raiseExcHelper(TypeError, "pow() 2nd argument "
-                                      "cannot be negative when 3rd argument specified");
-    }
+    if (mod != Py_None && lhs->n < 0)
+        return forwardToLong("__pow__", autoDecref(boxLong(rhs_int->n)), lhs, mod);
     Box* rtn = pow_i64_i64(rhs_int->n, lhs->n, mod);
-    if (PyLong_Check(rtn))
+    if (PyLongObject_Check(rtn))
         return longInt(autoDecref(rtn));
     return rtn;
 }
@@ -980,11 +975,15 @@ Box* intRShiftInt(BoxedInt* lhs, BoxedInt* rhs) {
 }
 
 extern "C" Box* intRShift(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rshift__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rshift__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rshift__", autoDecref(boxLong(lhs->n)), rhs);
 
-    if (PyLong_Check(rhs))
+    if (PyLongObject_Check(rhs))
         return longRShiftLong(autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
@@ -995,9 +994,13 @@ extern "C" Box* intRShift(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRRShift(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rrshift__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rrshift__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rrshift__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (!PyInt_Check(rhs)) {
         return incref(NotImplemented);
@@ -1019,8 +1022,12 @@ extern "C" Box* intSubFloat(BoxedInt* lhs, BoxedFloat* rhs) {
 }
 
 extern "C" Box* intSub(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__sub__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__sub__' requires a 'int' object but received a '%s'", getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__sub__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
@@ -1034,9 +1041,13 @@ extern "C" Box* intSub(BoxedInt* lhs, Box* rhs) {
 }
 
 Box* intRSub(BoxedInt* lhs, Box* rhs) {
+    if (unlikely(PyLongObject_Check(lhs)))
+        return forwardToLong("__rsub__", lhs, rhs);
     if (!PyInt_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rsub__' requires a 'int' object but received a '%s'",
                        getTypeName(lhs));
+    if (unlikely(PyLongObject_Check(rhs)))
+        return forwardToLong("__rsub__", autoDecref(boxLong(lhs->n)), rhs);
 
     if (PyInt_Check(rhs)) {
         BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
@@ -1047,6 +1058,8 @@ Box* intRSub(BoxedInt* lhs, Box* rhs) {
 }
 
 extern "C" Box* intInvert(BoxedInt* v) {
+    if (unlikely(PyLongObject_Check(v)))
+        return forwardToLong("__invert__", v);
     if (!PyInt_Check(v))
         raiseExcHelper(TypeError, "descriptor '__invert__' requires a 'int' object but received a '%s'",
                        getTypeName(v));
@@ -1055,6 +1068,8 @@ extern "C" Box* intInvert(BoxedInt* v) {
 }
 
 extern "C" Box* intPos(BoxedInt* v) {
+    if (unlikely(PyLongObject_Check(v)))
+        return forwardToLong("__pos__", v);
     if (!PyInt_Check(v))
         raiseExcHelper(TypeError, "descriptor '__pos__' requires a 'int' object but received a '%s'", getTypeName(v));
 
@@ -1064,6 +1079,8 @@ extern "C" Box* intPos(BoxedInt* v) {
 }
 
 extern "C" Box* intNeg(BoxedInt* v) {
+    if (unlikely(PyLongObject_Check(v)))
+        return forwardToLong("__neg__", v);
     if (!PyInt_Check(v))
         raiseExcHelper(TypeError, "descriptor '__neg__' requires a 'int' object but received a '%s'", getTypeName(v));
 
@@ -1081,14 +1098,22 @@ extern "C" Box* intNeg(BoxedInt* v) {
 }
 
 extern "C" Box* intNonzero(BoxedInt* v) {
+    if (unlikely(PyLongObject_Check(v)))
+        return forwardToLong("__bool__", v);
     if (!PyInt_Check(v))
-        raiseExcHelper(TypeError, "descriptor '__nonzero__' requires a 'int' object but received a '%s'",
+        raiseExcHelper(TypeError, "descriptor '__bool__' requires a 'int' object but received a '%s'",
                        getTypeName(v));
 
     return boxBool(v->n != 0);
 }
 
 extern "C" BoxedString* intRepr(BoxedInt* v) {
+    if (PyLongObject_Check(v)) {
+        Box* r = long_cls->tp_repr(v);
+        if (!r)
+            throwCAPIException();
+        return static_cast<BoxedString*>(r);
+    }
     if (!PyInt_Check(v))
         raiseExcHelper(TypeError, "descriptor '__repr__' requires a 'int' object but received a '%s'", getTypeName(v));
 
@@ -1097,20 +1122,31 @@ extern "C" BoxedString* intRepr(BoxedInt* v) {
     return static_cast<BoxedString*>(boxString(llvm::StringRef(buf, len)));
 }
 
+// Python 3 hashes ints modulo _PyHASH_MODULUS so that equal ints and floats hash the same.
+static int64_t hashInt64(int64_t n) {
+    uint64_t a = n < 0 ? -(uint64_t)n : (uint64_t)n;
+    int64_t x = (int64_t)(a % _PyHASH_MODULUS);
+    if (n < 0)
+        x = -x;
+    return x == -1 ? -2 : x;
+}
+
 extern "C" Box* intHash(BoxedInt* self) {
+    if (unlikely(PyLongObject_Check(self)))
+        return forwardToLong("__hash__", self);
     if (!PyInt_Check(self))
         raiseExcHelper(TypeError, "descriptor '__hash__' requires a 'int' object but received a '%s'",
                        getTypeName(self));
 
-    if (self->n == -1)
-        return boxInt(-2);
-
-    if (self->cls == int_cls)
+    int64_t h = hashInt64(self->n);
+    if (h == self->n && self->cls == int_cls)
         return incref(self);
-    return boxInt(self->n);
+    return boxInt(h);
 }
 
 Box* intAbs(BoxedInt* v) {
+    if (unlikely(PyLongObject_Check(v)))
+        return forwardToLong("__abs__", v);
     if (!PyInt_Check(v))
         raiseExcHelper(TypeError, "descriptor '__abs__' requires a 'int' object but received a '%s'", getTypeName(v));
 
@@ -1120,59 +1156,9 @@ Box* intAbs(BoxedInt* v) {
     return boxInt(std::abs(v->n));
 }
 
-extern "C" Box* intBin(BoxedInt* self) {
-    if (!PyInt_Check(self))
-        raiseExcHelper(TypeError, "descriptor '__bin__' requires a 'int' object but received a '%s'",
-                       getTypeName(self));
-
-    return _PyInt_Format(reinterpret_cast<PyIntObject*>(self), 2, 0);
-}
-
-Box* intCoerce(BoxedInt* lhs, Box* rhs) {
-    if (!PyInt_Check(lhs))
-        raiseExcHelper(TypeError, "descriptor '__coerce__' requires a 'int' object but received a '%s'",
-                       getTypeName(lhs));
-
-    if (!PyInt_Check(rhs)) {
-        return incref(NotImplemented);
-    }
-
-    BoxedInt* rhs_int = static_cast<BoxedInt*>(rhs);
-
-    return BoxedTuple::create({ lhs, rhs_int });
-}
-
-extern "C" Box* intHex(BoxedInt* self) {
-    if (!PyInt_Check(self))
-        raiseExcHelper(TypeError, "descriptor '__hex__' requires a 'int' object but received a '%s'",
-                       getTypeName(self));
-
-    char buf[80];
-    int len = 0;
-    bool is_negative = self->n < 0;
-    if (is_negative)
-        len = snprintf(buf, sizeof(buf), "-0x%lx", std::abs(self->n));
-    else
-        len = snprintf(buf, sizeof(buf), "0x%lx", self->n);
-    return boxString(llvm::StringRef(buf, len));
-}
-
-extern "C" Box* intOct(BoxedInt* self) {
-    if (!PyInt_Check(self))
-        raiseExcHelper(TypeError, "descriptor '__oct__' requires a 'int' object but received a '%s'",
-                       getTypeName(self));
-
-    char buf[80];
-    int len = 0;
-    bool is_negative = self->n < 0;
-    if (is_negative)
-        len = snprintf(buf, sizeof(buf), "-%#lo", std::abs(self->n));
-    else
-        len = snprintf(buf, sizeof(buf), "%#lo", self->n);
-    return boxString(llvm::StringRef(buf, len));
-}
-
 extern "C" Box* intTrunc(BoxedInt* self) {
+    if (unlikely(PyLongObject_Check(self)))
+        return forwardToLong("__trunc__", self);
     if (!PyInt_Check(self))
         raiseExcHelper(TypeError, "descriptor '__trunc__' requires a 'int' object but received a '%s'",
                        getTypeName(self));
@@ -1193,6 +1179,8 @@ static PyObject* int_long(BoxedInt* v) noexcept {
 }
 
 extern "C" Box* intInt(BoxedInt* self) {
+    if (unlikely(PyLongObject_Check(self)))
+        return forwardToLong("__int__", self);
     if (!PyInt_Check(self))
         raiseExcHelper(TypeError, "descriptor '__int__' requires a 'int' object but received a '%s'",
                        getTypeName(self));
@@ -1201,6 +1189,8 @@ extern "C" Box* intInt(BoxedInt* self) {
 }
 
 Box* intFloat(BoxedInt* self) {
+    if (unlikely(PyLongObject_Check(self)))
+        return forwardToLong("__float__", self);
     if (!PyInt_Check(self))
         raiseExcHelper(TypeError, "descriptor '__float__' requires a 'int' object but received a '%s'",
                        getTypeName(self));
@@ -1209,6 +1199,8 @@ Box* intFloat(BoxedInt* self) {
 }
 
 Box* intLong(BoxedInt* self) {
+    if (unlikely(PyLongObject_Check(self)))
+        return forwardToLong("__long__", self);
     if (!PyInt_Check(self))
         raiseExcHelper(TypeError, "descriptor '__long__' requires a 'int' object but received a '%s'",
                        getTypeName(self));
@@ -1217,89 +1209,47 @@ Box* intLong(BoxedInt* self) {
 }
 
 extern "C" Box* intIndex(BoxedInt* v) {
+    if (unlikely(PyLongObject_Check(v)))
+        return forwardToLong("__index__", v);
     if (PyInt_CheckExact(v))
         return incref(v);
     return boxInt(v->n);
 }
 
+static Box* intNewWithBase(Box* val, Box* _base) noexcept {
+    Py_ssize_t base = PyNumber_AsSsize_t(_base, NULL);
+    if (base == -1 && PyErr_Occurred())
+        return NULL;
+    if ((base != 0 && base < 2) || base > 36) {
+        PyErr_SetString(PyExc_ValueError, "int() base must be >= 2 and <= 36, or 0");
+        return NULL;
+    }
+    if (val == NULL) {
+        PyErr_SetString(PyExc_TypeError, "int() missing string argument");
+        return NULL;
+    }
+
+    if (PyUnicode_Check(val))
+        return PyLong_FromUnicodeObject(val, base);
+    if (PyBytes_Check(val))
+        return _PyLong_FromBytes(PyBytes_AS_STRING(val), PyBytes_GET_SIZE(val), base);
+    if (PyByteArray_Check(val))
+        return _PyLong_FromBytes(PyByteArray_AS_STRING(val), PyByteArray_GET_SIZE(val), base);
+    PyErr_SetString(PyExc_TypeError, "int() can't convert non-string with explicit base");
+    return NULL;
+}
+
 template <ExceptionStyle S> static Box* _intNew(Box* val, Box* _base) noexcept(S == CAPI) {
-    int base = 10;
-
-    if (_base) {
-        if (S == CAPI) {
-            if (!PyInt_Check(_base)) {
-                PyErr_SetString(PyExc_TypeError, "an integer is required");
-                return NULL;
-            }
-
-            if (val == NULL) {
-                PyErr_SetString(PyExc_TypeError, "int() missing string argument");
-                return NULL;
-            }
-
-            if (!PyString_Check(val) && !PyUnicode_Check(val)) {
-                PyErr_SetString(PyExc_TypeError, "int() can't convert non-string with explicit base");
-                return NULL;
-            }
-        } else {
-            if (!PyInt_Check(_base))
-                raiseExcHelper(TypeError, "an integer is required");
-
-            if (val == NULL)
-                raiseExcHelper(TypeError, "int() missing string argument");
-
-            if (!PyString_Check(val) && !PyUnicode_Check(val))
-                raiseExcHelper(TypeError, "int() can't convert non-string with explicit base");
-        }
-        base = static_cast<BoxedInt*>(_base)->n;
-    } else {
-        if (val == NULL)
-            return PyInt_FromLong(0L);
-
-        Box* r = PyNumber_Int(val);
-        if (!r) {
-            if (S == CAPI) {
-                return NULL;
-            } else
-                throwCAPIException();
-        }
-        return r;
-    }
-
-    if (PyString_Check(val)) {
-        BoxedString* s = static_cast<BoxedString*>(val);
-
-        if (s->size() != strlen(s->data())) {
-            Box* srepr = PyObject_Repr(val);
-            AUTO_DECREF(srepr);
-            if (S == CAPI) {
-                PyErr_Format(PyExc_ValueError, "invalid literal for int() with base %d: %s", base,
-                             PyString_AS_STRING(srepr));
-                return NULL;
-            } else {
-                raiseExcHelper(ValueError, "invalid literal for int() with base %d: %s", base,
-                               PyString_AS_STRING(srepr));
-            }
-        }
-        Box* r = PyInt_FromString(s->data(), NULL, base);
-        if (!r) {
-            if (S == CAPI)
-                return NULL;
-            else
-                throwCAPIException();
-        }
-        return r;
-    } else {
-        // only for unicode and its subtype. Other type will be filtered out in above.
-        Box* r = PyInt_FromUnicode(PyUnicode_AS_UNICODE(val), PyUnicode_GET_SIZE(val), base);
-        if (!r) {
-            if (S == CAPI)
-                return NULL;
-            else
-                throwCAPIException();
-        }
-        return r;
-    }
+    Box* r;
+    if (_base)
+        r = intNewWithBase(val, _base);
+    else if (val == NULL)
+        r = PyLong_FromLong(0L);
+    else
+        r = PyNumber_Long(val);
+    if (!r && S == CXX)
+        throwCAPIException();
+    return r;
 }
 
 template <ExceptionStyle S> Box* intNew(Box* _cls, Box* val, Box* base) noexcept(S == CAPI) {
@@ -1324,6 +1274,14 @@ template <ExceptionStyle S> Box* intNew(Box* _cls, Box* val, Box* base) noexcept
 
     if (cls == int_cls)
         return _intNew<S>(val, base);
+
+    if (cls == bool_cls) {
+        if (S == CAPI) {
+            PyErr_SetString(TypeError, "int.__new__(bool) is not safe, use bool.__new__()");
+            return NULL;
+        } else
+            raiseExcHelper(TypeError, "int.__new__(bool) is not safe, use bool.__new__()");
+    }
 
     BoxedInt* n = (BoxedInt*)_intNew<S>(val, base);
     if (!n) {
@@ -1352,18 +1310,12 @@ template <ExceptionStyle S> Box* intNew(Box* _cls, Box* val, Box* base) noexcept
 // The arguments need to be unpacked from args and kwds.
 static Box* intNewPacked(BoxedClass* type, Box* args, Box* kwds) noexcept {
     PyObject* x = NULL;
-    int base = -909;
-    static char* kwlist[3] = { NULL, NULL, NULL };
-    kwlist[0] = const_cast<char*>("x");
-    kwlist[1] = const_cast<char*>("base");
+    PyObject* base = NULL;
+    static const char* const kwlist[] = { "", "base", NULL };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|Oi:int", kwlist, &x, &base))
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|OO:int", const_cast<char**>(kwlist), &x, &base))
         return NULL;
-
-    if (base == -909)
-        return intNew<CAPI>(type, x, NULL);
-    else
-        return intNew<CAPI>(type, x, autoDecref(boxInt(base)));
+    return intNew<CAPI>(type, x, base);
 }
 
 static const unsigned char BitLengthTable[32]
@@ -1380,6 +1332,8 @@ static int bits_in_ulong(unsigned long d) noexcept {
 }
 
 extern "C" Box* intBitLength(BoxedInt* v) {
+    if (unlikely(PyLongObject_Check(v)))
+        return forwardToLong("bit_length", v);
     if (!PyInt_Check(v))
         raiseExcHelper(TypeError, "descriptor 'bit_length' requires a 'int' object but received a '%s'",
                        getTypeName(v));
@@ -1391,15 +1345,15 @@ extern "C" Box* intBitLength(BoxedInt* v) {
     else
         n = (unsigned long)v->n;
 
-    return PyInt_FromLong(bits_in_ulong(n));
+    return PyLong_FromLong(bits_in_ulong(n));
 }
 
 static void _addFuncIntFloatUnknown(const char* name, void* int_func, void* float_func, void* boxed_func) {
     std::vector<ConcreteCompilerType*> v_ii, v_if, v_iu;
     assert(BOXED_INT);
-    v_ii.push_back(UNKNOWN);
     v_ii.push_back(BOXED_INT);
-    v_if.push_back(UNKNOWN);
+    v_ii.push_back(BOXED_INT);
+    v_if.push_back(BOXED_INT);
     v_if.push_back(BOXED_FLOAT);
     // Only the unknown version can accept non-ints (ex if you access the function directly ex via int.__add__)
     v_iu.push_back(UNKNOWN);
@@ -1415,7 +1369,7 @@ static void _addFuncIntFloatUnknown(const char* name, void* int_func, void* floa
 static void _addFuncIntUnknown(const char* name, ConcreteCompilerType* rtn_type, void* int_func, void* boxed_func) {
     std::vector<ConcreteCompilerType*> v_ii, v_iu;
     assert(BOXED_INT);
-    v_ii.push_back(UNKNOWN);
+    v_ii.push_back(BOXED_INT);
     v_ii.push_back(BOXED_INT);
     v_iu.push_back(UNKNOWN);
     v_iu.push_back(UNKNOWN);
@@ -1427,7 +1381,7 @@ static void _addFuncIntUnknown(const char* name, ConcreteCompilerType* rtn_type,
 }
 
 static Box* int_int_getset(Box* b, void*) noexcept {
-    if (b->cls == int_cls) {
+    if (b->cls == int_cls || b->cls == long_cls) {
         return incref(b);
     } else {
         assert(PyInt_Check(b));
@@ -1444,13 +1398,19 @@ static Box* int1(Box*, void*) noexcept {
 }
 
 static int64_t int_hash(BoxedInt* o) noexcept {
-    int64_t n = o->n;
-    if (n == -1)
-        return -2;
-    return n;
+    if (PyLongObject_Check(o))
+        return long_cls->tp_hash(o);
+    return hashInt64(o->n);
 }
 
 static PyObject* int_richcompare(PyObject* v, PyObject* w, int op) noexcept {
+    if (PyLongObject_Check(v) || PyLongObject_Check(w)) {
+        static const int swapped_op[] = { Py_GT, Py_GE, Py_EQ, Py_NE, Py_LT, Py_LE };
+        if (PyLongObject_Check(v) && PyLong_Check(w))
+            return long_cls->tp_richcompare(v, w, op);
+        if (PyInt_Check(v) && PyLongObject_Check(w))
+            return long_cls->tp_richcompare(w, v, swapped_op[op]);
+    }
     if (!PyInt_Check(v) || !PyInt_Check(w)) {
         Py_INCREF(Py_NotImplemented);
         return Py_NotImplemented;
@@ -1494,7 +1454,7 @@ extern "C" int PyInt_ClearFreeList() noexcept {
     while (list != NULL) {
         u = 0;
         for (i = 0, p = &list->objects[0]; i < N_INTOBJECTS; i++, p++) {
-            if (PyInt_CheckExact((BoxedInt*)p) && p->ob_refcnt != 0)
+            if (PyInt_CheckExact((BoxedInt*)p) && Py_REFCNT(p) != 0)
                 u++;
         }
         next = list->next;
@@ -1502,8 +1462,8 @@ extern "C" int PyInt_ClearFreeList() noexcept {
             list->next = block_list;
             block_list = list;
             for (i = 0, p = &list->objects[0]; i < N_INTOBJECTS; i++, p++) {
-                if (!PyInt_CheckExact((BoxedInt*)p) || p->ob_refcnt == 0) {
-                    p->ob_type = (struct _typeobject*)BoxedInt::free_list;
+                if (!PyInt_CheckExact((BoxedInt*)p) || Py_REFCNT(p) == 0) {
+                    Py_TYPE(p) = (PyTypeObject*)BoxedInt::free_list;
                     BoxedInt::free_list = p;
                 }
 #if NSMALLNEGINTS + NSMALLPOSINTS > 0
@@ -1525,27 +1485,19 @@ extern "C" int PyInt_ClearFreeList() noexcept {
 }
 
 static Box* intFormat(PyObject* self, Box* format_spec) {
-    if (PyBytes_Check(format_spec)) {
-        Box* rtn = _PyInt_FormatAdvanced(self, PyBytes_AS_STRING(format_spec), PyBytes_GET_SIZE(format_spec));
-        if (!rtn)
-            throwCAPIException();
-        return rtn;
-    }
-    if (PyUnicode_Check(format_spec)) {
-        /* Convert format_spec to a str */
-        PyObject* result;
-        PyObject* str_spec = PyObject_Str(format_spec);
+    if (!PyUnicode_Check(format_spec))
+        raiseExcHelper(TypeError, "format() argument 2 must be str, not %s", getTypeName(format_spec));
 
-        if (str_spec == NULL)
-            throwCAPIException();
-
-        result = _PyInt_FormatAdvanced(self, PyBytes_AS_STRING(str_spec), PyBytes_GET_SIZE(str_spec));
-        Py_DECREF(str_spec);
-        if (!result)
-            throwCAPIException();
-        return result;
+    _PyUnicodeWriter writer;
+    _PyUnicodeWriter_Init(&writer);
+    if (_PyLong_FormatAdvancedWriter(&writer, self, format_spec, 0, PyUnicode_GET_LENGTH(format_spec)) == -1) {
+        _PyUnicodeWriter_Dealloc(&writer);
+        throwCAPIException();
     }
-    raiseExcHelper(TypeError, "__format__ requires str or unicode");
+    Box* rtn = _PyUnicodeWriter_Finish(&writer);
+    if (!rtn)
+        throwCAPIException();
+    return rtn;
 }
 
 void setupInt() {
@@ -1564,7 +1516,6 @@ void setupInt() {
     _addFuncIntUnknown("__or__", BOXED_INT, (void*)intOrInt, (void*)intOr);
     _addFuncIntUnknown("__xor__", BOXED_INT, (void*)intXorInt, (void*)intXor);
     _addFuncIntFloatUnknown("__sub__", (void*)intSubInt, (void*)intSubFloat, (void*)intSub);
-    _addFuncIntFloatUnknown("__div__", (void*)intDivInt, (void*)intDivFloat, (void*)intDiv);
     _addFuncIntFloatUnknown("__floordiv__", (void*)intFloordivInt, (void*)intFloordivFloat, (void*)intFloordiv);
     _addFuncIntFloatUnknown("__truediv__", (void*)intTruedivInt, (void*)intTruedivFloat, (void*)intTruediv);
     _addFuncIntFloatUnknown("__mul__", (void*)intMulInt, (void*)intMulFloat, (void*)intMul);
@@ -1578,7 +1529,6 @@ void setupInt() {
 
     int_cls->giveAttr("__rsub__", new BoxedFunction(BoxedCode::create((void*)intRSub, UNKNOWN, 2, "int.__rsub__")));
     int_cls->giveAttr("__rmul__", new BoxedFunction(BoxedCode::create((void*)intRMul, UNKNOWN, 2, "int.__rmul__")));
-    int_cls->giveAttr("__rdiv__", new BoxedFunction(BoxedCode::create((void*)intRDiv, UNKNOWN, 2, "int.__rdiv__")));
     int_cls->giveAttr("__rfloordiv__",
                       new BoxedFunction(BoxedCode::create((void*)intRFloordiv, UNKNOWN, 2, "int.__rfloordiv__")));
     int_cls->giveAttr("__rtruediv__",
@@ -1600,32 +1550,24 @@ void setupInt() {
     _addFuncIntUnknown("__rshift__", UNKNOWN, (void*)intRShiftInt, (void*)intRShift);
 
     int_cls->giveAttr("__invert__",
-                      new BoxedFunction(BoxedCode::create((void*)intInvert, BOXED_INT, 1, "int.__invert__")));
-    int_cls->giveAttr("__pos__", new BoxedFunction(BoxedCode::create((void*)intPos, BOXED_INT, 1, "int.__pos__")));
+                      new BoxedFunction(BoxedCode::create((void*)intInvert, UNKNOWN, 1, "int.__invert__")));
+    int_cls->giveAttr("__pos__", new BoxedFunction(BoxedCode::create((void*)intPos, UNKNOWN, 1, "int.__pos__")));
     int_cls->giveAttr("__neg__", new BoxedFunction(BoxedCode::create((void*)intNeg, UNKNOWN, 1, "int.__neg__")));
-    int_cls->giveAttr("__nonzero__",
-                      new BoxedFunction(BoxedCode::create((void*)intNonzero, BOXED_BOOL, 1, "int.__nonzero__")));
+    int_cls->giveAttr("__bool__",
+                      new BoxedFunction(BoxedCode::create((void*)intNonzero, BOXED_BOOL, 1, "int.__bool__")));
     int_cls->giveAttr("__repr__", new BoxedFunction(BoxedCode::create((void*)intRepr, STR, 1, "int.__repr__")));
     int_cls->tp_hash = (hashfunc)int_hash;
     int_cls->giveAttr("__divmod__",
                       new BoxedFunction(BoxedCode::create((void*)intDivmod, UNKNOWN, 2, "int.__divmod__")));
-
-
-    int_cls->giveAttr("__coerce__",
-                      new BoxedFunction(BoxedCode::create((void*)intCoerce, UNKNOWN, 2, "int.__coerce__")));
     int_cls->giveAttr("__abs__", new BoxedFunction(BoxedCode::create((void*)intAbs, UNKNOWN, 1, "int.__abs__")));
-    int_cls->giveAttr("__bin__", new BoxedFunction(BoxedCode::create((void*)intBin, STR, 1, "int.__bin__")));
-    int_cls->giveAttr("__hex__", new BoxedFunction(BoxedCode::create((void*)intHex, STR, 1, "int.__hex__")));
-    int_cls->giveAttr("__oct__", new BoxedFunction(BoxedCode::create((void*)intOct, STR, 1, "int.__oct__")));
 
     int_cls->giveAttr("__trunc__",
-                      new BoxedFunction(BoxedCode::create((void*)intTrunc, BOXED_INT, 1, "int.__trunc__")));
+                      new BoxedFunction(BoxedCode::create((void*)intTrunc, UNKNOWN, 1, "int.__trunc__")));
     int_cls->giveAttr("__index__",
-                      new BoxedFunction(BoxedCode::create((void*)intIndex, BOXED_INT, 1, "int.__index__")));
-    int_cls->giveAttr("__int__", new BoxedFunction(BoxedCode::create((void*)intInt, BOXED_INT, 1, "int.__int__")));
+                      new BoxedFunction(BoxedCode::create((void*)intIndex, UNKNOWN, 1, "int.__index__")));
+    int_cls->giveAttr("__int__", new BoxedFunction(BoxedCode::create((void*)intInt, UNKNOWN, 1, "int.__int__")));
     int_cls->giveAttr("__float__",
                       new BoxedFunction(BoxedCode::create((void*)intFloat, BOXED_FLOAT, 1, "int.__float__")));
-    int_cls->giveAttr("__long__", new BoxedFunction(BoxedCode::create((void*)intLong, LONG, 1, "int.__long__")));
 
     int_cls->giveAttr("__format__", new BoxedFunction(BoxedCode::create((void*)intFormat, STR, 2, "int.__format__")));
 
@@ -1646,19 +1588,19 @@ void setupInt() {
                                 "4"));
 
     auto int_new = BoxedCode::create((void*)intNew<CXX>, UNKNOWN, 3, false, false, "int.__new__", "",
-                                     ParamNames({ "", "x", "base" }, "", ""), CXX);
+                                     ParamNames({ "", "x", "base" }, "", "", 2), CXX);
     int_new->addVersion((void*)intNew<CAPI>, UNKNOWN, CAPI);
     int_cls->giveAttr("__new__", new BoxedFunction(int_new, { NULL, NULL }));
 
 
     int_cls->giveAttr("bit_length",
-                      new BoxedFunction(BoxedCode::create((void*)intBitLength, BOXED_INT, 1, "int.bit_length")));
+                      new BoxedFunction(BoxedCode::create((void*)intBitLength, UNKNOWN, 1, "int.bit_length")));
 
     // int_int_getset doesn't throw at all, so we can cheat and use it as both a CAPI and CXX style function.
     int_cls->giveAttrDescriptor("real", int_int_getset, NULL);
     int_cls->giveAttrDescriptor("imag", int0, NULL);
     int_cls->giveAttr("conjugate",
-                      new BoxedFunction(BoxedCode::create((void*)int_int_getset, BOXED_INT, 1, "int.conjugate")));
+                      new BoxedFunction(BoxedCode::create((void*)int_int_getset, UNKNOWN, 1, "int.conjugate")));
     int_cls->giveAttrDescriptor("numerator", int_int_getset, NULL);
     int_cls->giveAttrDescriptor("denominator", int1, NULL);
 
@@ -1668,6 +1610,5 @@ void setupInt() {
     int_cls->tp_repr = (reprfunc)int_to_decimal_string;
     int_cls->tp_new = (newfunc)intNewPacked;
     int_as_number.nb_int = (unaryfunc)int_int;
-    int_as_number.nb_long = (unaryfunc)int_long;
 }
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "capi/typeobject.h"
+#include "capi/types.h"
 #include "codegen/compvars.h"
 #include "runtime/objmodel.h"
 #include "runtime/rewrite_args.h"
@@ -223,7 +224,7 @@ static Box* classmethodGet(Box* self, Box* obj, Box* type) {
         type = obj->cls;
     }
 
-    return new BoxedInstanceMethod(type, cm->cm_callable, type);
+    return new BoxedInstanceMethod(type, cm->cm_callable);
 }
 
 template <ExceptionStyle S>
@@ -262,6 +263,10 @@ Box* methodDescrTppCall(Box* _self, CallRewriteArgs* rewrite_args, ArgPassSpec a
         paramspec = ParamReceiveSpec(1, 0, true, true);
     } else if (call_flags == METH_O) {
         paramspec = ParamReceiveSpec(2, 0, false, false);
+    } else if (call_flags == METH_FASTCALL) {
+        paramspec = ParamReceiveSpec(1, 0, true, false);
+    } else if (call_flags == (METH_FASTCALL | METH_KEYWORDS)) {
+        paramspec = ParamReceiveSpec(1, 0, true, true);
     } else if ((call_flags & ~(METH_O3 | METH_D3)) == 0) {
         int num_args = 0;
         if (call_flags & METH_O)
@@ -299,9 +304,9 @@ Box* methodDescrTppCall(Box* _self, CallRewriteArgs* rewrite_args, ArgPassSpec a
                 raiseExcHelper(TypeError, "descriptor '%s' requires a type but received a '%s'",
                                self->d_method->ml_name, getFullTypeName(arg1).c_str());
         } else {
-            if (!isSubclass(arg1->cls, self->d_type))
+            if (!isSubclass(arg1->cls, self->d_common.d_type))
                 raiseExcHelper(TypeError, "descriptor '%s' requires a '%s' arg1 but received a '%s'",
-                               self->d_method->ml_name, self->d_type->tp_name, getFullTypeName(arg1).c_str());
+                               self->d_method->ml_name, self->d_common.d_type->tp_name, getFullTypeName(arg1).c_str());
         }
 
         if (rewrite_args && !arg1_class_guarded) {
@@ -346,6 +351,22 @@ Box* methodDescrTppCall(Box* _self, CallRewriteArgs* rewrite_args, ArgPassSpec a
                 rewrite_args->out_rtn
                     = rewrite_args->rewriter->call(true, (void*)self->d_method->ml_meth, rewrite_args->arg1,
                                                    rewrite_args->arg2)->setType(RefType::OWNED);
+        } else if (call_flags == METH_FASTCALL) {
+            rtn = capiCallFastcall(arg1, self->d_method->ml_meth, arg2);
+            if (rewrite_args)
+                rewrite_args->out_rtn
+                    = rewrite_args->rewriter->call(true, (void*)capiCallFastcall, rewrite_args->arg1,
+                                                   rewrite_args->rewriter->loadConst((intptr_t)self->d_method->ml_meth,
+                                                                                     Location::forArg(1)),
+                                                   rewrite_args->arg2)->setType(RefType::OWNED);
+        } else if (call_flags == (METH_FASTCALL | METH_KEYWORDS)) {
+            rtn = capiCallFastcallKeywords(arg1, self->d_method->ml_meth, arg2, arg3);
+            if (rewrite_args)
+                rewrite_args->out_rtn
+                    = rewrite_args->rewriter->call(true, (void*)capiCallFastcallKeywords, rewrite_args->arg1,
+                                                   rewrite_args->rewriter->loadConst((intptr_t)self->d_method->ml_meth,
+                                                                                     Location::forArg(1)),
+                                                   rewrite_args->arg2, rewrite_args->arg3)->setType(RefType::OWNED);
         } else if ((call_flags & ~(METH_O3 | METH_D3)) == 0) {
             {
                 UNAVOIDABLE_STAT_TIMER(t0, "us_timer_in_builtins");
@@ -568,7 +589,7 @@ Box* wrapperObjectTppCall(Box* _self, CallRewriteArgs* rewrite_args, ArgPassSpec
                           Box* arg3, Box** args, const std::vector<BoxedString*>* keyword_names) noexcept(S == CAPI) {
     STAT_TIMER(t0, "us_timer_boxedwrapperobject_call", (_self->cls->is_user_defined ? 10 : 20));
 
-    assert(_self->cls == &wrappertype);
+    assert(_self->cls == &_PyMethodWrapper_Type);
     wrapperobject* self = reinterpret_cast<wrapperobject*>(_self);
 
     RewriterVar* r_obj = NULL;
@@ -587,6 +608,32 @@ Box* wrapperObjectTppCall(Box* _self, CallRewriteArgs* rewrite_args, ArgPassSpec
 
 extern "C" PyObject* PyStaticMethod_New(PyObject* callable) noexcept {
     return new BoxedStaticmethod(callable);
+}
+
+static Box* boxIsAbstract(std::initializer_list<Box*> objs) noexcept {
+    for (Box* o : objs) {
+        if (!o)
+            continue;
+        int r = _PyObject_IsAbstract(o);
+        if (r < 0)
+            return NULL;
+        if (r)
+            Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+static Box* propertyIsAbstract(Box* self, void*) noexcept {
+    BoxedProperty* prop = static_cast<BoxedProperty*>(self);
+    return boxIsAbstract({ prop->prop_get, prop->prop_set, prop->prop_del });
+}
+
+static Box* staticmethodIsAbstract(Box* self, void*) noexcept {
+    return boxIsAbstract({ static_cast<BoxedStaticmethod*>(self)->sm_callable });
+}
+
+static Box* classmethodIsAbstract(Box* self, void*) noexcept {
+    return boxIsAbstract({ static_cast<BoxedClassmethod*>(self)->cm_callable });
 }
 
 void setupDescr() {
@@ -612,6 +659,7 @@ void setupDescr() {
                            new BoxedFunction(BoxedCode::create((void*)propertySetter, UNKNOWN, 2, "property.setter")));
     property_cls->giveAttr(
         "deleter", new BoxedFunction(BoxedCode::create((void*)propertyDeleter, UNKNOWN, 2, "property.deleter")));
+    property_cls->giveAttrDescriptor("__isabstractmethod__", propertyIsAbstract, NULL);
     property_cls->giveAttrMember("fget", T_OBJECT, offsetof(BoxedProperty, prop_get));
     property_cls->giveAttrMember("fset", T_OBJECT, offsetof(BoxedProperty, prop_set));
     property_cls->giveAttrMember("fdel", T_OBJECT, offsetof(BoxedProperty, prop_del));
@@ -619,6 +667,7 @@ void setupDescr() {
     property_cls->freeze();
 
     staticmethod_cls->giveAttrMember("__func__", T_OBJECT, offsetof(BoxedStaticmethod, sm_callable));
+    staticmethod_cls->giveAttrDescriptor("__isabstractmethod__", staticmethodIsAbstract, NULL);
     staticmethod_cls->giveAttr("__init__", new BoxedFunction(BoxedCode::create((void*)staticmethodInit, UNKNOWN, 5,
                                                                                false, false, "staticmethod.__init__"),
                                                              { Py_None, Py_None, Py_None, Py_None }));
@@ -629,6 +678,7 @@ void setupDescr() {
 
 
     classmethod_cls->giveAttrMember("__func__", T_OBJECT, offsetof(BoxedClassmethod, cm_callable));
+    classmethod_cls->giveAttrDescriptor("__isabstractmethod__", classmethodIsAbstract, NULL);
     classmethod_cls->giveAttr("__init__", new BoxedFunction(BoxedCode::create((void*)classmethodInit, UNKNOWN, 5, false,
                                                                               false, "classmethod.__init__"),
                                                             { Py_None, Py_None, Py_None, Py_None }));
@@ -640,10 +690,10 @@ void setupDescr() {
     PyType_Ready(&PyGetSetDescr_Type);
     PyType_Ready(&PyMemberDescr_Type);
 
-    wrappertype.tpp_call.capi_val = wrapperObjectTppCall<CAPI>;
-    wrappertype.tpp_call.cxx_val = wrapperObjectTppCall<CXX>;
-    wrappertype.tp_call = proxyToTppCall;
-    PyType_Ready(&wrappertype);
+    _PyMethodWrapper_Type.tpp_call.capi_val = wrapperObjectTppCall<CAPI>;
+    _PyMethodWrapper_Type.tpp_call.cxx_val = wrapperObjectTppCall<CXX>;
+    _PyMethodWrapper_Type.tp_call = proxyToTppCall;
+    PyType_Ready(&_PyMethodWrapper_Type);
 
     PyWrapperDescr_Type.tpp_call.capi_val = wrapperDescrTppCall<CAPI>;
     PyWrapperDescr_Type.tpp_call.cxx_val = wrapperDescrTppCall<CXX>;

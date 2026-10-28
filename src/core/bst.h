@@ -617,6 +617,7 @@ public:
     int vreg_code_obj = VREG_UNDEFINED;
 
     int vreg_bases_tuple = VREG_UNDEFINED;
+    int vreg_kwargs = VREG_UNDEFINED; // dict of the class keyword arguments, or undefined if there are none
     const int num_decorator;
     int decorator[1];
 

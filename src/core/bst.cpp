@@ -701,6 +701,7 @@ void BST_MakeClass::accept(BSTVisitor* v) {
         return;
 
     v->visit_vreg(&vreg_bases_tuple);
+    v->visit_vreg(&vreg_kwargs);
     for (int i = 0; i < num_decorator; ++i) {
         v->visit_vreg(&decorator[i]);
     }
@@ -1434,6 +1435,10 @@ bool PrintVisitor::visit_makeclass(BST_MakeClass* node) {
     }
     stream << code_constants.getInternedString(node->index_name).s() << "(";
     visit_vreg(&node->vreg_bases_tuple);
+    if (node->vreg_kwargs != VREG_UNDEFINED) {
+        stream << ", **";
+        visit_vreg(&node->vreg_kwargs);
+    }
     stream << ")\n";
 
     indent += 4;

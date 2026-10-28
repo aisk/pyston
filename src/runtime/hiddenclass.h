@@ -20,6 +20,7 @@
 #include "Python.h"
 
 #include "core/from_llvm/DenseMap.h"
+#include "core/ordered_dense_map.h"
 #include "core/types.h"
 
 namespace pyston {
@@ -100,8 +101,11 @@ protected:
     // If >= 0, is the offset where we stored an attrwrapper object
     int attrwrapper_offset = -1;
 
-    typedef pyston::DenseMap<BoxedString*, int, pyston::DenseMapInfo<BoxedString*>,
-                             pyston::detail::DenseMapPair<BoxedString*, int>, 16> Map;
+public:
+    // Ordered by when the attribute was added, which is the order __dict__ iterates in.
+    typedef pyston::OrderedDenseMap<BoxedString*, int, pyston::DenseMapInfo<BoxedString*>> Map;
+
+protected:
     Map attr_offsets;
 
 public:

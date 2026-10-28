@@ -93,8 +93,8 @@ void setupBool() {
     static PyNumberMethods bool_as_number;
     bool_cls->tp_as_number = &bool_as_number;
 
-    bool_cls->giveAttr("__nonzero__",
-                       new BoxedFunction(BoxedCode::create((void*)boolNonzero, BOXED_BOOL, 1, "bool.__nonzero__")));
+    bool_cls->giveAttr("__bool__",
+                       new BoxedFunction(BoxedCode::create((void*)boolNonzero, BOXED_BOOL, 1, "bool.__bool__")));
     bool_cls->giveAttr("__repr__", new BoxedFunction(BoxedCode::create((void*)boolRepr<CXX>, STR, 1, "bool.__repr__")));
     bool_cls->giveAttr("__hash__",
                        new BoxedFunction(BoxedCode::create((void*)boolHash, BOXED_INT, 1, "bool.__hash__")));

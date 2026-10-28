@@ -19,7 +19,7 @@
 
 namespace pyston {
 
-BoxedDictIterator::BoxedDictIterator(BoxedDict* d) : d(d), it(d->d.begin()), itEnd(d->d.end()) {
+BoxedDictIterator::BoxedDictIterator(BoxedDict* d) : d(d), it(d->d.begin()), itEnd(d->d.end()), size(d->d.size()) {
     Py_INCREF(d);
 }
 
@@ -52,6 +52,9 @@ Box* dictIterIter(Box* s) {
 llvm_compat_bool dictIterHasnextUnboxed(Box* s) {
     BoxedDictIterator* self = static_cast<BoxedDictIterator*>(s);
 
+    // A size change is reported by the next call to next().
+    if (self->size != -1 && self->size != self->d->d.size())
+        return true;
     return self->it != self->itEnd;
 }
 
@@ -62,6 +65,13 @@ Box* dictIterHasnext(Box* s) {
 Box* dictiter_next(Box* s) noexcept {
     BoxedDictIterator* self = static_cast<BoxedDictIterator*>(s);
 
+    if (self->size == -1)
+        return NULL;
+    if (self->size != self->d->d.size()) {
+        self->size = -1;
+        PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
+        return NULL;
+    }
     if (self->it == self->itEnd)
         return NULL;
 
@@ -81,8 +91,11 @@ Box* dictiter_next(Box* s) noexcept {
 
 Box* dictIterNext(Box* s) {
     auto* rtn = dictiter_next(s);
-    if (!rtn)
+    if (!rtn) {
+        if (PyErr_Occurred())
+            throwCAPIException();
         raiseExcHelper(StopIteration, "");
+    }
     return rtn;
 }
 }

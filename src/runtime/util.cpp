@@ -25,38 +25,13 @@
 namespace pyston {
 
 void parseSlice(BoxedSlice* slice, int size, i64* out_start, i64* out_stop, i64* out_step, i64* out_length) {
-    int ret = PySlice_GetIndicesEx((PySliceObject*)slice, size, out_start, out_stop, out_step, out_length);
+    int ret = PySlice_GetIndicesEx((PyObject*)slice, size, out_start, out_stop, out_step, out_length);
     if (ret == -1)
         throwCAPIException();
 }
 
 bool isSliceIndex(Box* b) noexcept {
     return b->cls == none_cls || b->cls == int_cls || PyIndex_Check(b);
-}
-
-void adjustNegativeIndicesOnObject(Box* obj, i64* start_out, i64* stop_out) noexcept {
-    i64 start = *start_out;
-    i64 stop = *stop_out;
-    PySequenceMethods* m;
-
-    // Logic from PySequence_GetSlice:
-    m = obj->cls->tp_as_sequence;
-    if (m && m->sq_slice) {
-        if (start < 0 || stop < 0) {
-            if (m->sq_length) {
-                Py_ssize_t l = (*m->sq_length)(obj);
-                if (l >= 0) {
-                    if (start < 0)
-                        start += l;
-                    if (stop < 0)
-                        stop += l;
-                }
-            }
-        }
-    }
-
-    *start_out = start;
-    *stop_out = stop;
 }
 
 void boundSliceWithLength(i64* start_out, i64* stop_out, i64 start, i64 stop, i64 size) {
@@ -92,21 +67,15 @@ BORROWED(Box*) noneIfNull(Box* b) {
     }
 }
 
+// TODO: remove this.  In Python 2 attribute names could be unicode objects, which had to be
+// converted to str; in Python 3 they are always str.
+// Attribute names have to be exact (and so internable) strs, so this turns str subclasses into strs.
 template <ExceptionStyle S> Box* coerceUnicodeToStr(Box* unicode) noexcept(S == CAPI) {
-    if (!isSubclass(unicode->cls, unicode_cls))
+    if (!PyUnicode_Check(unicode) || PyUnicode_CheckExact(unicode))
         return incref(unicode);
-
-    Box* r = PyUnicode_AsASCIIString(unicode);
-    if (!r) {
-        if (S == CAPI) {
-            PyErr_SetString(TypeError, "Cannot use non-ascii unicode strings as attribute names or keywords");
-            return NULL;
-        } else {
-            PyErr_Clear();
-            raiseExcHelper(TypeError, "Cannot use non-ascii unicode strings as attribute names or keywords");
-        }
-    }
-
+    Box* r = _PyUnicode_Copy(unicode);
+    if (S == CXX && !r)
+        throwCAPIException();
     return r;
 }
 
@@ -189,7 +158,7 @@ extern "C" void dumpEx(void* p, int levels) {
             printf("\n");
         }
 
-        if (PyString_Check(b)) {
+        if (PyUnicode_Check(b)) {
             printf("String value: %s\n", static_cast<BoxedString*>(b)->data());
         }
 

@@ -7,7 +7,6 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "")
 
 set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 
-include(pyconfig)
 include(ExternalProject)
 
 set(DEPS_DIR $ENV{HOME}/pyston_deps)
@@ -93,13 +92,13 @@ else()
   find_program(PYTHON_EXE python3)
 endif()
 
-# Pyston implements Python 2.7 semantics, so the tests compare its output against
-# a real CPython 2.7.  Modern distributions no longer ship one; build it from
-# source into ${DEPS_DIR}/python2.7 or point REFERENCE_PYTHON at an existing one.
-find_program(REFERENCE_PYTHON NAMES python2.7 python2 HINTS ${DEPS_DIR}/python2.7/bin
-             DOC "CPython 2.7 interpreter that the tests compare against")
+# Pyston implements Python 3.8 semantics, so the tests compare its output against
+# a real CPython 3.8.  Build it from the v3.8.20 tag into ${DEPS_DIR}/python3.8
+# or point REFERENCE_PYTHON at an existing one.
+find_program(REFERENCE_PYTHON NAMES python3.8 HINTS ${DEPS_DIR}/python3.8/bin NO_DEFAULT_PATH
+             DOC "CPython 3.8 interpreter that the tests compare against")
 if(NOT REFERENCE_PYTHON)
-  message(WARNING "CPython 2.7 not found; set REFERENCE_PYTHON to run the tests")
+  message(WARNING "CPython 3.8 not found; set REFERENCE_PYTHON to run the tests")
 endif()
 
 # initial clang flags (set here so they're used when building llvm)
@@ -339,9 +338,10 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${NO_PUSH_ARGS_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${NO_PUSH_ARGS_FLAGS}")
 
 add_definitions(${LLVM_DEFINITIONS})
-add_definitions(-DDEFAULT_PYTHON_MAJOR_VERSION=2 -DDEFAULT_PYTHON_MINOR_VERSION=7 -DDEFAULT_PYTHON_MICRO_VERSION=8) # Python 2.7.8
+add_definitions(-DDEFAULT_PYTHON_MAJOR_VERSION=3 -DDEFAULT_PYTHON_MINOR_VERSION=8 -DDEFAULT_PYTHON_MICRO_VERSION=20) # Python 3.8.20
 
-include_directories(${CMAKE_BINARY_DIR}/include/python2.7)
+include_directories(${CMAKE_BINARY_DIR}/include/python3.8)
+include_directories(${CMAKE_BINARY_DIR}/include/python3.8/internal)
 include_directories(${LLVM_INCLUDE_DIRS})
 
 find_package(LibLZMA REQUIRED)
@@ -369,7 +369,7 @@ add_executable(pyston $<TARGET_OBJECTS:PYSTON_MAIN_OBJECT> $<TARGET_OBJECTS:PYST
 add_custom_command(TARGET pyston POST_BUILD COMMAND ${CMAKE_COMMAND} -E create_symlink ${CMAKE_BINARY_DIR}/pyston ${CMAKE_BINARY_DIR}/python DEPENDS pyston)
 
 # Wrap the stdlib in --whole-archive to force all the symbols to be included and eventually exported
-target_link_libraries(pyston -Wl,--whole-archive stdlib -Wl,--no-whole-archive pthread m z readline sqlite3 gmp mpfr ssl crypto liblz4 util ${LLVM_LIBS} ${LIBLZMA_LIBRARIES} ${OPTIONAL_LIBRARIES} ${CMAKE_BINARY_DIR}/jemalloc/lib/libjemalloc.a unwind)
+target_link_libraries(pyston -Wl,--whole-archive stdlib -Wl,--no-whole-archive pthread m readline gmp mpfr crypto liblz4 util ${LLVM_LIBS} ${LIBLZMA_LIBRARIES} ${OPTIONAL_LIBRARIES} ${CMAKE_BINARY_DIR}/jemalloc/lib/libjemalloc.a unwind)
 add_dependencies(pyston libjemalloc)
 
 # test
@@ -381,6 +381,14 @@ add_test(NAME lint COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/lint.py WORKI
 add_test(NAME check-format COMMAND ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_CLANG_FORMAT} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME analysis_unittest COMMAND analysis_unittest)
 
+# test/py38 compares the output with CPython 3.8, in each execution tier
+macro(add_py38_test testname)
+  add_test(NAME py38_${testname} COMMAND ${CMAKE_SOURCE_DIR}/test/py38/run.sh ${ARGN})
+  set_tests_properties(py38_${testname} PROPERTIES ENVIRONMENT "PYSTON=${CMAKE_BINARY_DIR}/pyston;CPYTHON=${REFERENCE_PYTHON}")
+endmacro()
+add_py38_test(defaults)
+add_py38_test(interpreter -Y)
+add_py38_test(force_llvm -n)
 
 
 # format

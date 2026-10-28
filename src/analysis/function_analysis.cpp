@@ -228,12 +228,12 @@ public:
     }
 
     bool visit_deletename(BST_DeleteName* node) override {
-        if (node->lookup_type != ScopeInfo::VarScopeType::GLOBAL
-            && node->lookup_type != ScopeInfo::VarScopeType::NAME) {
+        if (node->lookup_type != ScopeInfo::VarScopeType::GLOBAL && node->lookup_type != ScopeInfo::VarScopeType::NAME
+            && node->lookup_type != ScopeInfo::VarScopeType::DEREF) {
             assert(node->vreg >= 0);
             state[node->vreg] = DefinednessAnalysis::Undefined;
         } else
-            assert(node->vreg == VREG_UNDEFINED);
+            assert(node->vreg == VREG_UNDEFINED || node->lookup_type == ScopeInfo::VarScopeType::DEREF);
         return true;
     }
 

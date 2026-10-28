@@ -64,19 +64,11 @@ static Box* dumpStats(Box* includeZeros) {
     Py_RETURN_NONE;
 }
 
-static Box* pyCompile(Box* fname, Box* force) {
-    if (fname->cls != str_cls)
-        raiseExcHelper(TypeError, "py_compile takes a string for the filename");
+} // namespace pyston
 
-    if (force->cls != bool_cls)
-        raiseExcHelper(TypeError, "py_compile takes a bool for 'force' argument");
+using namespace pyston;
 
-    caching_parse_file(static_cast<BoxedString*>(fname)->c_str(), /* future flags */ 0, force == Py_True);
-
-    Py_RETURN_NONE;
-}
-
-void setupPyston() {
+extern "C" PyObject* PyInit___pyston__() {
     pyston_module = createModule(autoDecref(boxString("__pyston__")));
 
     pyston_module->giveAttr(
@@ -88,7 +80,6 @@ void setupPyston() {
                             new BoxedBuiltinFunctionOrMethod(
                                 BoxedCode::create((void*)dumpStats, NONE, 1, false, false, "dumpStats"), { Py_False }));
 
-    pyston_module->giveAttr(
-        "py_compile", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)pyCompile, UNKNOWN, 2, "pyCompile")));
+    return incref(pyston_module);
 }
-}
+

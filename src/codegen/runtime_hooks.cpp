@@ -168,6 +168,7 @@ void initGlobalFuncs(GlobalState& g) {
 
     GET(createFunctionFromMetadata);
     GET(createUserClass);
+    GET(createClassNamespace);
     GET(boxInt);
     GET(unboxInt);
     GET(boxFloat);
@@ -227,6 +228,7 @@ void initGlobalFuncs(GlobalState& g) {
     GET(raiseIndexErrorStrCapi);
     GET(raiseNotIterableError);
     GET(assertNameDefined);
+    GET(delClosureVar);
     GET(assertFailDerefNameDefined);
     GET(assertFail);
     GET(printExprHelper);
@@ -317,7 +319,6 @@ void initGlobalFuncs(GlobalState& g) {
     GET(div_float_float);
     GET(floordiv_float_float);
     GET(mod_float_float);
-    GET(pow_float_float);
 
     GET(dump);
 

@@ -20,7 +20,7 @@ sudo apt-get install -yq git cmake ninja-build ccache clang-21 llvm-21-dev clang
 
 ### Building and testing
 
-`tools/setup_deps.sh` builds CPython 2.7.8 into `~/pyston_deps`, which the tests compare Pyston's output against (with the patches in `reference_python_patches/`).
+The tests in `test/py38` compare Pyston's output against CPython 3.8, which CMake looks for in `~/pyston_deps/python3.8` (see docs/PY38_PORT.md). `tools/setup_deps.sh` still builds the CPython 2.7.8 reference from before the port.
 
 ```
 git clone https://github.com/dropbox/pyston.git ~/pyston
@@ -44,7 +44,7 @@ See the main README for more information about available make targets and option
 - `-DCMAKE_BUILD_TYPE=Debug` (defaults to Release)
 - `-DENABLE_LLVM_DEBUG=1` for full LLVM debug
 - `-DENABLE_CCACHE=0` to disable ccache
-- `-DREFERENCE_PYTHON=/path/to/python2.7` to use a different CPython 2.7 for the tests
+- `-DREFERENCE_PYTHON=/path/to/python3.8` to use a different CPython 3.8 for the tests
 
 # Optional dependencies
 

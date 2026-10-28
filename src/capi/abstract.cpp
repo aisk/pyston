@@ -22,7 +22,6 @@
 #include "core/ast.h"
 #include "core/threading.h"
 #include "core/types.h"
-#include "runtime/classobj.h"
 #include "runtime/import.h"
 #include "runtime/objmodel.h"
 #include "runtime/types.h"
@@ -31,9 +30,28 @@ extern "C" int recursive_issubclass(PyObject* derived, PyObject* cls) noexcept;
 extern "C" int check_class(PyObject* cls, const char* error) noexcept;
 extern "C" PyObject* abstract_get_bases(PyObject* cls) noexcept;
 extern "C" PyObject* null_error(void) noexcept;
-extern "C" PyObject* objargs_mktuple(va_list va) noexcept;
 
 namespace pyston {
+
+static PyObject* objargs_mktuple(va_list va) noexcept {
+    int i, n = 0;
+    va_list countva;
+    PyObject* result, *tmp;
+
+    va_copy(countva, va);
+    while (((PyObject*)va_arg(countva, PyObject*)) != NULL)
+        ++n;
+    va_end(countva);
+    result = PyTuple_New(n);
+    if (result != NULL && n > 0) {
+        for (i = 0; i < n; ++i) {
+            tmp = (PyObject*)va_arg(va, PyObject*);
+            PyTuple_SET_ITEM(result, i, tmp);
+            Py_INCREF(tmp);
+        }
+    }
+    return result;
+}
 
 static int abstract_issubclass(PyObject* derived, PyObject* cls) noexcept {
     PyObject* bases = NULL;
@@ -81,10 +99,7 @@ static int recursive_isinstance(PyObject* inst, PyObject* cls) noexcept {
             return -1;
     }
 
-    if (PyClass_Check(cls) && PyInstance_Check(inst)) {
-        PyObject* inclass = static_cast<BoxedInstance*>(inst)->inst_cls;
-        retval = PyClass_IsSubclass(inclass, cls);
-    } else if (PyType_Check(cls)) {
+    if (PyType_Check(cls)) {
         retval = PyObject_TypeCheck(inst, (PyTypeObject*)cls);
         if (retval == 0) {
             PyObject* c = NULL;
@@ -97,7 +112,7 @@ static int recursive_isinstance(PyObject* inst, PyObject* cls) noexcept {
             // We don't need to worry about __getattr__, since the default __class__ will always resolve.
             bool has_custom_class = inst->cls->has___class__ || inst->cls->has_getattribute;
             if (!has_custom_class) {
-                assert(autoDecref(PyObject_GetAttr(inst, __class__)) == inst->cls);
+                assert(autoDecref(PyObject_GetAttr(inst, __class__)) == visibleClass(inst));
             } else {
                 c = PyObject_GetAttr(inst, __class__);
                 if (!c)
@@ -155,7 +170,7 @@ extern "C" int PyObject_IsInstance(PyObject* inst, PyObject* cls) noexcept {
         return r;
     }
 
-    if (!(PyClass_Check(cls) || PyInstance_Check(cls))) {
+    {
         PyObject* checker = NULL;
         if (cls->cls->has_instancecheck) {
             checker = _PyObject_LookupSpecial(cls, "__instancecheck__", &name);
@@ -211,7 +226,7 @@ extern "C" int PyObject_IsSubclass(PyObject* derived, PyObject* cls) noexcept {
         Py_LeaveRecursiveCall();
         return r;
     }
-    if (!(PyClass_Check(cls) || PyInstance_Check(cls))) {
+    {
         PyObject* checker = NULL;
         if (cls->cls->has_subclasscheck) {
             checker = _PyObject_LookupSpecial(cls, "__subclasscheck__", &name);
@@ -305,15 +320,9 @@ extern "C" PyObject* PyObject_CallMethodObjArgs(PyObject* callable, PyObject* na
     }
 
     BoxedString* attr = (BoxedString*)name;
-    if (!PyString_Check(attr)) {
-        if (PyUnicode_Check(attr)) {
-            attr = (BoxedString*)_PyUnicode_AsDefaultEncodedString(attr, NULL);
-            if (attr == NULL)
-                return NULL;
-        } else {
-            PyErr_Format(TypeError, "attribute name must be string, not '%.200s'", Py_TYPE(attr)->tp_name);
-            return NULL;
-        }
+    if (!PyUnicode_Check(attr)) {
+        PyErr_Format(TypeError, "attribute name must be string, not '%.200s'", Py_TYPE(attr)->tp_name);
+        return NULL;
     }
 
     Py_INCREF(attr);
@@ -323,7 +332,7 @@ extern "C" PyObject* PyObject_CallMethodObjArgs(PyObject* callable, PyObject* na
         callable, attr, CLASS_OR_INST, NULL, ArgPassSpec(0, 0, true, false), args, NULL, NULL, NULL, NULL);
     if (!tmp && !PyErr_Occurred())
         PyErr_Format(PyExc_AttributeError, "'%.50s' object has no attribute '%.400s'", callable->cls->tp_name,
-                     PyString_AS_STRING(attr));
+                     PyUnicode_AsUTF8(attr));
 
 
     Py_DECREF(args);

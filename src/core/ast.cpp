@@ -56,6 +56,8 @@ llvm::StringRef getOpSymbol(int op_type) {
             return "==";
         case AST_TYPE::FloorDiv:
             return "//";
+        case AST_TYPE::MatMult:
+            return "@";
         case AST_TYPE::LShift:
             return "<<";
         case AST_TYPE::Lt:
@@ -110,7 +112,7 @@ BORROWED(BoxedString*) getOpName(int op_type) {
 
     static BoxedString* strAdd, *strBitAnd, *strBitOr, *strBitXor, *strDiv, *strTrueDiv, *strDivMod, *strEq,
         *strFloorDiv, *strLShift, *strLt, *strLtE, *strGt, *strGtE, *strIn, *strInvert, *strMod, *strMult, *strNot,
-        *strNotEq, *strPow, *strRShift, *strSub, *strUAdd, *strUSub;
+        *strNotEq, *strPow, *strRShift, *strSub, *strUAdd, *strUSub, *strMatMult;
 
     static bool initialized = false;
     if (!initialized) {
@@ -132,13 +134,14 @@ BORROWED(BoxedString*) getOpName(int op_type) {
         strInvert = getStaticString("__invert__");
         strMod = getStaticString("__mod__");
         strMult = getStaticString("__mul__");
-        strNot = getStaticString("__nonzero__");
+        strNot = getStaticString("__bool__");
         strNotEq = getStaticString("__ne__");
         strPow = getStaticString("__pow__");
         strRShift = getStaticString("__rshift__");
         strSub = getStaticString("__sub__");
         strUAdd = getStaticString("__pos__");
         strUSub = getStaticString("__neg__");
+        strMatMult = getStaticString("__matmul__");
 
         initialized = true;
     }
@@ -194,6 +197,8 @@ BORROWED(BoxedString*) getOpName(int op_type) {
             return strUAdd;
         case AST_TYPE::USub:
             return strUSub;
+        case AST_TYPE::MatMult:
+            return strMatMult;
         default:
             fprintf(stderr, "Unknown op type (" __FILE__ ":" STRINGIFY(__LINE__) "): %d\n", op_type);
             abort();
@@ -255,7 +260,12 @@ void AST_arguments::accept(ASTVisitor* v) {
         return;
 
     visitVector(defaults, v);
+    for (auto e : kw_defaults) {
+        if (e)
+            e->accept(v);
+    }
     visitVector(args, v);
+    visitVector(kwonlyargs, v);
     if (kwarg)
         kwarg->accept(v);
     if (vararg)
@@ -393,6 +403,7 @@ void AST_ClassDef::accept(ASTVisitor* v) {
         return;
 
     visitVector(this->bases, v);
+    visitVector(this->keywords, v);
     visitVector(this->decorator_list, v);
     visitVector(this->body, v);
 }
@@ -429,7 +440,8 @@ void AST_Dict::accept(ASTVisitor* v) {
         return;
 
     for (int i = 0; i < keys.size(); i++) {
-        keys[i]->accept(v);
+        if (keys[i])
+            keys[i]->accept(v);
         values[i]->accept(v);
     }
 }
@@ -575,6 +587,15 @@ void AST_IfExp::accept(ASTVisitor* v) {
     this->test->accept(v);
     this->body->accept(v);
     this->orelse->accept(v);
+}
+
+void AST_NamedExpr::accept(ASTVisitor* v) {
+    bool skip = v->visit_namedexpr(this);
+    if (skip)
+        return;
+
+    this->value->accept(v);
+    this->target->accept(v);
 }
 
 void AST_Import::accept(ASTVisitor* v) {
@@ -1152,8 +1173,12 @@ bool ASTPrintVisitor::visit_dict(AST_Dict* node) {
     for (int i = 0; i < node->keys.size(); i++) {
         if (i > 0)
             stream << ", ";
-        node->keys[i]->accept(this);
-        stream << ":";
+        if (node->keys[i]) {
+            node->keys[i]->accept(this);
+            stream << ":";
+        } else {
+            stream << "**";
+        }
         node->values[i]->accept(this);
     }
     stream << "}";
@@ -1330,6 +1355,15 @@ bool ASTPrintVisitor::visit_ifexp(AST_IfExp* node) {
     return true;
 }
 
+bool ASTPrintVisitor::visit_namedexpr(AST_NamedExpr* node) {
+    stream << "(";
+    node->target->accept(this);
+    stream << " := ";
+    node->value->accept(this);
+    stream << ")";
+    return true;
+}
+
 bool ASTPrintVisitor::visit_import(AST_Import* node) {
     stream << "import ";
     for (int i = 0; i < node->names.size(); i++) {
@@ -1409,6 +1443,9 @@ bool ASTPrintVisitor::visit_langprimitive(AST_LangPrimitive* node) {
             break;
         case AST_LangPrimitive::PRINT_EXPR:
             stream << "PRINT_EXPR";
+            break;
+        case AST_LangPrimitive::SETUP_ANNOTATIONS:
+            stream << "SETUP_ANNOTATIONS";
             break;
         default:
             RELEASE_ASSERT(0, "%d", node->opcode);
@@ -1616,8 +1653,8 @@ bool ASTPrintVisitor::visit_slice(AST_Slice* node) {
 bool ASTPrintVisitor::visit_str(AST_Str* node) {
     if (node->str_type == AST_Str::STR) {
         stream << "\"" << node->str_data << "\"";
-    } else if (node->str_type == AST_Str::UNICODE) {
-        stream << "<unicode value>";
+    } else if (node->str_type == AST_Str::BYTES) {
+        stream << "<bytes value>";
     } else {
         RELEASE_ASSERT(0, "%d", node->str_type);
     }
@@ -1922,6 +1959,10 @@ public:
         return false;
     }
     virtual bool visit_ifexp(AST_IfExp* node) {
+        output->push_back(node);
+        return false;
+    }
+    virtual bool visit_namedexpr(AST_NamedExpr* node) {
         output->push_back(node);
         return false;
     }

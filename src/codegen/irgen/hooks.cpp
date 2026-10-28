@@ -125,7 +125,7 @@ CompiledFunction* compileFunction(BoxedCode* code, FunctionSpecialization* spec,
         exception_style = forced_exception_style;
     else if (FORCE_LLVM_CAPI_THROWS)
         exception_style = CAPI;
-    else if (name->s() == "next")
+    else if (name->s() == "__next__")
         exception_style = CAPI;
     else if (code->propagated_cxx_exceptions >= 100)
         exception_style = CAPI;
@@ -244,7 +244,12 @@ void compileAndRunModule(AST_Module* m, BoxedModule* bm) {
 }
 
 Box* evalOrExec(BoxedCode* code, Box* globals, Box* boxedLocals) {
-    RELEASE_ASSERT(!code->source->scoping.areGlobalsFromModule(), "");
+    if (code->source->scoping.areGlobalsFromModule()) {
+        if (code->source->scoping.takesClosure())
+            raiseExcHelper(TypeError, "code object passed to exec() may not contain free variables");
+        // Pyston only compiles function bodies to run as functions.
+        raiseExcHelper(TypeError, "exec() of a function's code object is not supported");
+    }
 
     assert(globals && (globals->cls == module_cls || globals->cls == dict_cls));
 
@@ -284,10 +289,13 @@ static BoxedCode* compileEval(AST_Expression* parsedExpr, BoxedString* fn, PyCom
     return compileForEvalOrExec(parsedExpr, parsedExpr->body, fn, flags);
 }
 
-extern "C" PyCodeObject* PyAST_Compile(struct _mod* _mod, const char* filename, PyCompilerFlags* flags,
-                                       PyArena* arena) noexcept {
+extern "C" PyCodeObject* PyAST_CompileObject(struct _mod* _mod, PyObject* filename_obj, PyCompilerFlags* flags,
+                                             int optimize, PyArena* arena) noexcept {
     try {
         mod_ty mod = _mod;
+        const char* filename = PyUnicode_AsUTF8(filename_obj);
+        if (!filename)
+            return NULL;
         std::unique_ptr<ASTAllocator> ast_allocator;
         AST* parsed;
         std::tie(parsed, ast_allocator) = cpythonToPystonAST(mod, filename);
@@ -298,13 +306,13 @@ extern "C" PyCodeObject* PyAST_Compile(struct _mod* _mod, const char* filename, 
                 if (parsed->type != AST_TYPE::Module) {
                     raiseExcHelper(TypeError, "expected Module node, got %s", AST_TYPE::stringify(parsed->type));
                 }
-                code = compileExec(static_cast<AST_Module*>(parsed), autoDecref(boxString(filename)), flags);
+                code = compileExec(static_cast<AST_Module*>(parsed), (BoxedString*)filename_obj, flags);
                 break;
             case Expression_kind:
                 if (parsed->type != AST_TYPE::Expression) {
                     raiseExcHelper(TypeError, "expected Expression node, got %s", AST_TYPE::stringify(parsed->type));
                 }
-                code = compileEval(static_cast<AST_Expression*>(parsed), autoDecref(boxString(filename)), flags);
+                code = compileEval(static_cast<AST_Expression*>(parsed), (BoxedString*)filename_obj, flags);
                 break;
             case Suite_kind:
                 PyErr_SetString(PyExc_SystemError, "suite should not be possible");
@@ -319,6 +327,16 @@ extern "C" PyCodeObject* PyAST_Compile(struct _mod* _mod, const char* filename, 
         setCAPIException(e);
         return NULL;
     }
+}
+
+extern "C" PyCodeObject* PyAST_CompileEx(struct _mod* mod, const char* filename, PyCompilerFlags* flags,
+                                         int optimize, PyArena* arena) noexcept {
+    PyObject* filename_obj = PyUnicode_DecodeFSDefault(filename);
+    if (!filename_obj)
+        return NULL;
+    PyCodeObject* co = PyAST_CompileObject(mod, filename_obj, flags, optimize, arena);
+    Py_DECREF(filename_obj);
+    return co;
 }
 
 extern "C" int PyEval_MergeCompilerFlags(PyCompilerFlags* cf) noexcept {
@@ -390,16 +408,13 @@ static void pickGlobalsAndLocals(Box*& globals, Box*& locals) {
             globals_dict = globals;
 
         auto requested_builtins = PyDict_GetItemString(globals_dict, "__builtins__");
+        // Overriding __builtins__ isn't supported: such code still sees the real builtins.
         if (requested_builtins == NULL)
             PyDict_SetItemString(globals_dict, "__builtins__", PyEval_GetBuiltins());
-        else
-            RELEASE_ASSERT(requested_builtins == builtins_module
-                               || requested_builtins == builtins_module->getAttrWrapper(),
-                           "we don't support overriding __builtins__");
     }
 }
 
-extern "C" PyObject* PyEval_EvalCode(PyCodeObject* co, PyObject* globals, PyObject* locals) noexcept {
+extern "C" PyObject* PyEval_EvalCode(PyObject* co, PyObject* globals, PyObject* locals) noexcept {
     try {
         pickGlobalsAndLocals(globals, locals);
         return evalOrExec((BoxedCode*)co, globals, locals);
@@ -415,42 +430,24 @@ void exec(Box* boxedCode, Box* globals, Box* locals, FutureFlags caller_future_f
     if (!locals)
         locals = Py_None;
 
-    // this is based on cpythons exec_statement() but (heavily) adopted
+    // this is based on CPython's builtin_exec_impl()
     Box* v = NULL;
-    int plain = 0;
-    int n;
     PyObject* prog = boxedCode;
-    if (PyTuple_Check(prog) && globals == Py_None && locals == Py_None && ((n = PyTuple_Size(prog)) == 2 || n == 3)) {
-        /* Backward compatibility hack */
-        globals = PyTuple_GetItem(prog, 1);
-        if (n == 3)
-            locals = PyTuple_GetItem(prog, 2);
-        prog = PyTuple_GetItem(prog, 0);
-    }
     if (globals == Py_None) {
         globals = PyEval_GetGlobals();
-        if (locals == Py_None) {
+        if (locals == Py_None)
             locals = PyEval_GetLocals();
-            plain = 1;
-        }
         if (!globals || !locals) {
             raiseExcHelper(SystemError, "globals and locals cannot be NULL");
         }
     } else if (locals == Py_None)
         locals = globals;
-    if (!PyString_Check(prog) &&
-#ifdef Py_USING_UNICODE
-        !PyUnicode_Check(prog) &&
-#endif
-        !PyCode_Check(prog) && !PyFile_Check(prog)) {
-        raiseExcHelper(TypeError, "exec: arg 1 must be a string, file, or code object");
-    }
 
     if (!PyDict_Check(globals) && globals->cls != attrwrapper_cls) {
-        raiseExcHelper(TypeError, "exec: arg 2 must be a dictionary or None");
+        raiseExcHelper(TypeError, "exec() globals must be a dict, not %s", getTypeName(globals));
     }
     if (!PyMapping_Check(locals))
-        raiseExcHelper(TypeError, "exec: arg 3 must be a mapping or None");
+        raiseExcHelper(TypeError, "locals must be a mapping or None, not %s", getTypeName(locals));
 
     if (PyDict_GetItemString(globals, "__builtins__") == NULL)
         // Pyston change:
@@ -458,47 +455,17 @@ void exec(Box* boxedCode, Box* globals, Box* locals, FutureFlags caller_future_f
         PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins());
 
     if (PyCode_Check(prog)) {
-        /* Pyston change:
-        if (PyCode_GetNumFree((PyCodeObject *)prog) > 0) {
-            PyErr_SetString(PyExc_TypeError,
-        "code object passed to exec may not contain free variables");
-            return -1;
-        }
-        */
-        v = PyEval_EvalCode((PyCodeObject*)prog, globals, locals);
-    } else if (PyFile_Check(prog)) {
-        FILE* fp = PyFile_AsFile(prog);
-        char* name = PyString_AsString(PyFile_Name(prog));
-        PyCompilerFlags cf;
-        if (name == NULL)
-            throwCAPIException();
-        cf.cf_flags = caller_future_flags & PyCF_MASK;
-        if (cf.cf_flags)
-            v = PyRun_FileFlags(fp, name, Py_file_input, globals, locals, &cf);
-        else
-            v = PyRun_File(fp, name, Py_file_input, globals, locals);
+        v = PyEval_EvalCode(prog, globals, locals);
     } else {
-        PyObject* tmp = NULL;
-        char* str;
-        PyCompilerFlags cf;
-        cf.cf_flags = 0;
-#ifdef Py_USING_UNICODE
-        if (PyUnicode_Check(prog)) {
-            tmp = PyUnicode_AsUTF8String(prog);
-            if (tmp == NULL)
-                throwCAPIException();
-            prog = tmp;
-            cf.cf_flags |= PyCF_SOURCE_IS_UTF8;
-        }
-#endif
-        if (PyString_AsStringAndSize(prog, &str, NULL))
+        PyObject* source_copy;
+        const char* str;
+        PyCompilerFlags cf = _PyCompilerFlags_INIT;
+        cf.cf_flags = PyCF_SOURCE_IS_UTF8 | (caller_future_flags & PyCF_MASK);
+        str = _Py_SourceAsString(prog, "exec", "string, bytes or code", &cf, &source_copy);
+        if (str == NULL)
             throwCAPIException();
-        cf.cf_flags |= caller_future_flags & PyCF_MASK;
-        if (cf.cf_flags)
-            v = PyRun_StringFlags(str, Py_file_input, globals, locals, &cf);
-        else
-            v = PyRun_String(str, Py_file_input, globals, locals);
-        Py_XDECREF(tmp);
+        v = PyRun_StringFlags(str, Py_file_input, globals, locals, &cf);
+        Py_XDECREF(source_copy);
     }
 
     if (!v)

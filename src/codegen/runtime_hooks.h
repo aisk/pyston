@@ -31,7 +31,7 @@ struct GlobalFuncs {
     llvm::FunctionCallee printf, my_assert, malloc, free;
 
     llvm::FunctionCallee boxInt, unboxInt, boxFloat, unboxFloat, createFunctionFromMetadata, boxInstanceMethod, boxBool,
-        unboxBool, createTuple, createDict, createList, createSlice, createUserClass, createClosure,
+        unboxBool, createTuple, createDict, createList, createSlice, createUserClass, createClassNamespace, createClosure,
         createGenerator, createSet, initFrame, deinitFrame, deinitFrameMaybe, makePendingCalls, setFrameExcInfo;
     llvm::FunctionCallee getattr, getattr_capi, setattr, delattr, delitem, delGlobal, nonzero, binop, compare,
         augbinop, unboxedLen, getitem, getitem_capi, getclsattr, getGlobal, setitem, unaryop, import,
@@ -40,7 +40,7 @@ struct GlobalFuncs {
 
     llvm::FunctionCallee unpackIntoArray, raiseAttributeError, raiseAttributeErrorStr, raiseAttributeErrorCapi,
         raiseAttributeErrorStrCapi, raiseNotIterableError, raiseIndexErrorStr, raiseIndexErrorStrCapi,
-        assertNameDefined, assertFail, assertFailDerefNameDefined, printExprHelper, printHelper;
+        assertNameDefined, assertFail, assertFailDerefNameDefined, printExprHelper, printHelper, delClosureVar;
     llvm::FunctionCallee listAppendInternal, dictSetInternal;
     ExceptionSwitchable<llvm::FunctionCallee> runtimeCall0, runtimeCall1, runtimeCall2, runtimeCall3, runtimeCall, runtimeCallN;
     ExceptionSwitchable<llvm::FunctionCallee> callattr0, callattr1, callattr2, callattr3, callattr, callattrN;
@@ -54,7 +54,7 @@ struct GlobalFuncs {
     llvm::FunctionCallee deopt;
     llvm::FunctionCallee checkRefs, xdecrefAndRethrow;
 
-    llvm::FunctionCallee div_float_float, floordiv_float_float, mod_float_float, pow_float_float;
+    llvm::FunctionCallee div_float_float, floordiv_float_float, mod_float_float;
 
     llvm::FunctionCallee dump;
 

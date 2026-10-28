@@ -47,7 +47,7 @@ BoxedClass* long_cls;
  * base B digit iff _PyLong_DigitValue[Py_CHARMASK(c)] < B.
  */
 extern "C" {
-int _PyLong_DigitValue[256] = {
+unsigned char _PyLong_DigitValue[256] = {
     37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37,
     37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,
     37, 37, 37, 37, 37, 37, 37, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
@@ -68,11 +68,317 @@ void BoxedLong::tp_dealloc(Box* b) noexcept {
     b->cls->tp_free(b);
 }
 
+namespace {
+// An mpz view of either int representation (BoxedInt or BoxedLong).
+class MPZView {
+private:
+    mpz_t tmp;
+    mpz_srcptr p;
+    bool owned;
+
+public:
+    explicit MPZView(Box* v) {
+        if (PyLongObject_Check(v)) {
+            p = static_cast<BoxedLong*>(v)->n;
+            owned = false;
+        } else {
+            assert(PyInt_Check(v));
+            mpz_init_set_si(tmp, PyInt_AS_LONG(v));
+            p = tmp;
+            owned = true;
+        }
+    }
+    ~MPZView() {
+        if (owned)
+            mpz_clear(tmp);
+    }
+    mpz_srcptr get() const { return p; }
+};
+}
+
+// Boxes an mpz value, using the small int representation when it fits.
+static Box* boxMPZ(mpz_srcptr n) {
+    if (mpz_fits_slong_p(n))
+        return boxInt(mpz_get_si(n));
+    BoxedLong* rtn = new BoxedLong();
+    mpz_init_set(rtn->n, n);
+    return rtn;
+}
+
+// Returns small values as BoxedInt, so that only ints outside 64 bits are BoxedLong.
+static Box* normalizeLong(BoxedLong* l) {
+    if (!mpz_fits_slong_p(l->n))
+        return l;
+    Box* rtn = boxInt(mpz_get_si(l->n));
+    Py_DECREF(l);
+    return rtn;
+}
+
+extern "C" {
+PyObject* _PyLong_Zero;
+PyObject* _PyLong_One;
+}
+
+extern "C" size_t PyLong_AsSize_t(PyObject* vv) noexcept {
+    if (vv == NULL) {
+        PyErr_BadInternalCall();
+        return (size_t)-1;
+    }
+    if (!PyLong_Check(vv)) {
+        PyErr_SetString(PyExc_TypeError, "an integer is required");
+        return (size_t)-1;
+    }
+    MPZView v(vv);
+    if (mpz_sgn(v.get()) < 0) {
+        PyErr_SetString(PyExc_OverflowError, "can't convert negative value to size_t");
+        return (size_t)-1;
+    }
+    if (!mpz_fits_ulong_p(v.get())) {
+        PyErr_SetString(PyExc_OverflowError, "Python int too large to convert to C size_t");
+        return (size_t)-1;
+    }
+    return mpz_get_ui(v.get());
+}
+
+extern "C" PyObject* _PyLong_Lshift(PyObject* a, size_t shiftby) noexcept {
+    mpz_t r;
+    mpz_init(r);
+    mpz_mul_2exp(r, MPZView(a).get(), shiftby);
+    Box* rtn = boxMPZ(r);
+    mpz_clear(r);
+    return rtn;
+}
+
+extern "C" PyObject* _PyLong_Rshift(PyObject* a, size_t shiftby) noexcept {
+    mpz_t r;
+    mpz_init(r);
+    mpz_fdiv_q_2exp(r, MPZView(a).get(), shiftby);
+    Box* rtn = boxMPZ(r);
+    mpz_clear(r);
+    return rtn;
+}
+
+extern "C" PyObject* _PyLong_GCD(PyObject* a, PyObject* b) noexcept {
+    mpz_t r;
+    mpz_init(r);
+    mpz_gcd(r, MPZView(a).get(), MPZView(b).get());
+    Box* rtn = boxMPZ(r);
+    mpz_clear(r);
+    return rtn;
+}
+
+// Returns (q, r) where q is a / b rounded to the nearest integer (ties to even) and r = a - q * b.
+extern "C" PyObject* _PyLong_DivmodNear(PyObject* a, PyObject* b) noexcept {
+    if (!PyLong_Check(a) || !PyLong_Check(b)) {
+        PyErr_SetString(PyExc_TypeError, "non-integer arguments in division");
+        return NULL;
+    }
+    MPZView av(a), bv(b);
+    if (mpz_sgn(bv.get()) == 0) {
+        PyErr_SetString(PyExc_ZeroDivisionError, "division by zero");
+        return NULL;
+    }
+    mpz_t q, r, twice_r;
+    mpz_inits(q, r, twice_r, NULL);
+    // With floor division r has the sign of b, so r / b is in [0, 1).
+    mpz_fdiv_qr(q, r, av.get(), bv.get());
+    mpz_mul_2exp(twice_r, r, 1);
+    int cmp = mpz_cmpabs(twice_r, bv.get());
+    if (cmp > 0 || (cmp == 0 && mpz_odd_p(q))) {
+        mpz_add_ui(q, q, 1);
+        mpz_sub(r, r, bv.get());
+    }
+    Box* qb = boxMPZ(q);
+    Box* rb = boxMPZ(r);
+    mpz_clears(q, r, twice_r, NULL);
+    return BoxedTuple::create({ autoDecref(qb), autoDecref(rb) });
+}
+
+extern "C" PyObject* _PyLong_FromNbInt(PyObject* integral) noexcept {
+    PyNumberMethods* nb;
+    PyObject* result;
+
+    /* Fast path for the case that we already have an int. */
+    if (PyLong_CheckExact(integral)) {
+        Py_INCREF(integral);
+        return integral;
+    }
+
+    nb = Py_TYPE(integral)->tp_as_number;
+    if (nb == NULL || nb->nb_int == NULL) {
+        PyErr_Format(PyExc_TypeError, "an integer is required (got type %.200s)", Py_TYPE(integral)->tp_name);
+        return NULL;
+    }
+
+    result = nb->nb_int(integral);
+    if (!result || PyLong_CheckExact(result))
+        return result;
+    if (!PyLong_Check(result)) {
+        PyErr_Format(PyExc_TypeError, "__int__ returned non-int (type %.200s)", Py_TYPE(result)->tp_name);
+        Py_DECREF(result);
+        return NULL;
+    }
+    /* Issue #17576: warn if 'result' not of exact type int. */
+    if (PyErr_WarnFormat(PyExc_DeprecationWarning, 1,
+                         "__int__ returned non-int (type %.200s).  "
+                         "The ability to return an instance of a strict subclass of int "
+                         "is deprecated, and may be removed in a future version of Python.",
+                         Py_TYPE(result)->tp_name)) {
+        Py_DECREF(result);
+        return NULL;
+    }
+    return result;
+}
+
+extern "C" PyObject* _PyLong_FromNbIndexOrNbInt(PyObject* integral) noexcept {
+    if (PyLong_Check(integral)) {
+        Py_INCREF(integral);
+        return integral;
+    }
+
+    PyNumberMethods* nb = Py_TYPE(integral)->tp_as_number;
+    if (nb == NULL || (nb->nb_index == NULL && nb->nb_int == NULL)) {
+        PyErr_Format(PyExc_TypeError, "an integer is required (got type %.200s)", Py_TYPE(integral)->tp_name);
+        return NULL;
+    }
+
+    if (nb->nb_index)
+        return PyNumber_Index(integral);
+    return _PyLong_FromNbInt(integral);
+}
+
+extern "C" PyObject* PyLong_FromUnicodeObject(PyObject* u, int base) noexcept {
+    PyObject* result, *asciidig;
+    const char* buffer;
+    char* end = NULL;
+    Py_ssize_t buflen;
+
+    asciidig = _PyUnicode_TransformDecimalAndSpaceToASCII(u);
+    if (asciidig == NULL)
+        return NULL;
+    assert(PyUnicode_IS_ASCII(asciidig));
+    /* Simply get a pointer to existing ASCII characters. */
+    buffer = PyUnicode_AsUTF8AndSize(asciidig, &buflen);
+    assert(buffer != NULL);
+
+    result = PyLong_FromString(buffer, &end, base);
+    if (end == NULL || (result != NULL && end == buffer + buflen)) {
+        Py_DECREF(asciidig);
+        return result;
+    }
+    Py_DECREF(asciidig);
+    Py_XDECREF(result);
+    PyErr_Format(PyExc_ValueError, "invalid literal for int() with base %d: %.200R", base, u);
+    return NULL;
+}
+
+extern "C" PyObject* _PyLong_FromBytes(const char* s, Py_ssize_t len, int base) noexcept {
+    PyObject* result, *strobj;
+    char* end = NULL;
+
+    result = PyLong_FromString(s, &end, base);
+    if (end == NULL || (result != NULL && end == s + len))
+        return result;
+    Py_XDECREF(result);
+    strobj = PyBytes_FromStringAndSize(s, Py_MIN(len, 200));
+    if (strobj != NULL) {
+        PyErr_Format(PyExc_ValueError, "invalid literal for int() with base %d: %.200R", base, strobj);
+        Py_DECREF(strobj);
+    }
+    return NULL;
+}
+
+// Formats obj in the given base, without the 0x/0o/0b prefix unless alternate is set.
+static PyObject* formatNoPrefix(PyObject* obj, int base, int alternate) noexcept {
+    PyObject* s = _PyLong_Format(obj, base);
+    if (s == NULL || base == 10 || alternate)
+        return s;
+    Py_ssize_t len;
+    const char* data = PyUnicode_AsUTF8AndSize(s, &len);
+    std::string r;
+    if (data[0] == '-') {
+        r = "-";
+        r.append(data + 3, len - 3);
+    } else {
+        r.append(data + 2, len - 2);
+    }
+    Py_DECREF(s);
+    return PyUnicode_FromStringAndSize(r.data(), r.size());
+}
+
+extern "C" int _PyLong_FormatWriter(_PyUnicodeWriter* writer, PyObject* obj, int base, int alternate) noexcept {
+    PyObject* s = formatNoPrefix(obj, base, alternate);
+    if (s == NULL)
+        return -1;
+    int r = _PyUnicodeWriter_WriteStr(writer, s);
+    Py_DECREF(s);
+    return r;
+}
+
+extern "C" char* _PyLong_FormatBytesWriter(_PyBytesWriter* writer, char* str, PyObject* obj, int base,
+                                           int alternate) noexcept {
+    PyObject* s = formatNoPrefix(obj, base, alternate);
+    if (s == NULL)
+        return NULL;
+    Py_ssize_t len;
+    const char* data = PyUnicode_AsUTF8AndSize(s, &len);
+    str = (char*)_PyBytesWriter_WriteBytes(writer, str, data, len);
+    Py_DECREF(s);
+    return str;
+}
+
+extern "C" int _PyLong_UnsignedShort_Converter(PyObject* obj, void* ptr) noexcept {
+    unsigned long uval;
+
+    if (PyLong_Check(obj) && _PyLong_Sign(obj) < 0) {
+        PyErr_SetString(PyExc_ValueError, "value must be positive");
+        return 0;
+    }
+    uval = PyLong_AsUnsignedLong(obj);
+    if (uval == (unsigned long)-1 && PyErr_Occurred())
+        return 0;
+    if (uval > USHRT_MAX) {
+        PyErr_SetString(PyExc_OverflowError, "Python int too large for C unsigned short");
+        return 0;
+    }
+
+    *(unsigned short*)ptr = Py_SAFE_DOWNCAST(uval, unsigned long, unsigned short);
+    return 1;
+}
+
+#define UNSIGNED_CONVERTER(NAME, TYPE, AS_FUNC, AS_TYPE, MAX, MSG)                                               \
+    extern "C" int NAME(PyObject* obj, void* ptr) noexcept {                                                       \
+        if (PyLong_Check(obj) && _PyLong_Sign(obj) < 0) {                                                          \
+            PyErr_SetString(PyExc_ValueError, "value must be positive");                                           \
+            return 0;                                                                                              \
+        }                                                                                                          \
+        AS_TYPE uval = AS_FUNC(obj);                                                                               \
+        if (uval == (AS_TYPE)-1 && PyErr_Occurred())                                                               \
+            return 0;                                                                                              \
+        if (uval > MAX) {                                                                                          \
+            PyErr_SetString(PyExc_OverflowError, MSG);                                                             \
+            return 0;                                                                                              \
+        }                                                                                                          \
+        *(TYPE*)ptr = (TYPE)uval;                                                                                  \
+        return 1;                                                                                                  \
+    }
+
+UNSIGNED_CONVERTER(_PyLong_UnsignedInt_Converter, unsigned int, PyLong_AsUnsignedLong, unsigned long, UINT_MAX,
+                   "Python int too large for C unsigned int")
+UNSIGNED_CONVERTER(_PyLong_UnsignedLong_Converter, unsigned long, PyLong_AsUnsignedLong, unsigned long, ULONG_MAX,
+                   "Python int too large for C unsigned long")
+UNSIGNED_CONVERTER(_PyLong_UnsignedLongLong_Converter, unsigned long long, PyLong_AsUnsignedLongLong,
+                   unsigned long long, ULLONG_MAX, "Python int too large for C unsigned long long")
+UNSIGNED_CONVERTER(_PyLong_Size_t_Converter, size_t, PyLong_AsSize_t, size_t, SIZE_MAX,
+                   "Python int too large for C size_t")
+
 extern "C" int _PyLong_Sign(PyObject* l) noexcept {
-    return mpz_sgn(static_cast<BoxedLong*>(l)->n);
+    return mpz_sgn(MPZView(l).get());
 }
 
 extern "C" PyObject* _PyLong_Copy(PyLongObject* src) noexcept {
+    if (PyInt_Check(src))
+        return PyLong_FromLong(PyInt_AS_LONG(src));
     BoxedLong* rtn = new BoxedLong();
     mpz_init_set(rtn->n, ((BoxedLong*)src)->n);
     return rtn;
@@ -110,7 +416,9 @@ extern "C" int _PyLong_AsInt(PyObject* obj) noexcept {
 }
 
 extern "C" unsigned long PyLong_AsUnsignedLongMask(PyObject* vv) noexcept {
-    if (PyLong_Check(vv)) {
+    if (PyInt_Check(vv))
+        return (unsigned long)PyInt_AS_LONG(vv);
+    if (PyLongObject_Check(vv)) {
         BoxedLong* l = static_cast<BoxedLong*>(vv);
         auto v = mpz_get_ui(l->n);
         if (mpz_sgn(l->n) == -1)
@@ -135,11 +443,11 @@ extern "C" PY_LONG_LONG PyLong_AsLongLong(PyObject* vv) noexcept {
         PyErr_BadInternalCall();
         return -1;
     }
-    if (!PyLong_Check(vv)) {
+    if (!PyLongObject_Check(vv)) {
         PyNumberMethods* nb;
         PyObject* io;
         if (PyInt_Check(vv))
-            return (PY_LONG_LONG)PyInt_AsLong(vv);
+            return (PY_LONG_LONG)PyInt_AS_LONG(vv);
         if ((nb = vv->cls->tp_as_number) == NULL || nb->nb_int == NULL) {
             PyErr_SetString(PyExc_TypeError, "an integer is required");
             return -1;
@@ -148,11 +456,11 @@ extern "C" PY_LONG_LONG PyLong_AsLongLong(PyObject* vv) noexcept {
         if (io == NULL)
             return -1;
         if (PyInt_Check(io)) {
-            bytes = PyInt_AsLong(io);
+            bytes = PyInt_AS_LONG(io);
             Py_DECREF(io);
             return bytes;
         }
-        if (PyLong_Check(io)) {
+        if (PyLongObject_Check(io)) {
             bytes = PyLong_AsLongLong(io);
             Py_DECREF(io);
             return bytes;
@@ -172,16 +480,36 @@ extern "C" PY_LONG_LONG PyLong_AsLongLong(PyObject* vv) noexcept {
 }
 
 extern "C" PY_LONG_LONG PyLong_AsLongLongAndOverflow(PyObject* obj, int* overflow) noexcept {
-    Py_FatalError("unimplemented");
+    static_assert(sizeof(PY_LONG_LONG) == sizeof(long), "");
+    return PyLong_AsLongAndOverflow(obj, overflow);
 }
 
+// The limit on decimal digits for int <-> str conversions (sys.set_int_max_str_digits, added in
+// 3.8.14 against quadratic time conversions). 0 means no limit.
+extern "C" int _Py_int_max_str_digits = 4300;
+// The value given with -X int_max_str_digits or PYTHONINTMAXSTRDIGITS, -1 if none (sys.flags).
+extern "C" int _Py_global_config_int_max_str_digits = -1;
+
+static bool isBinaryBase(int base) {
+    return (base & (base - 1)) == 0;
+}
+
+#define MAX_STR_DIGITS_ERROR_FMT_TO_INT                                                                                \
+    "Exceeds the limit (%d) for integer string conversion: value has %zd digits; use sys.set_int_max_str_digits() "   \
+    "to increase the limit"
+#define MAX_STR_DIGITS_ERROR_FMT_TO_STR                                                                                \
+    "Exceeds the limit (%d) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+
+// Follows the syntax rules of CPython 3.8's PyLong_FromString, including underscores between digits.
 extern "C" PyObject* PyLong_FromString(const char* str, char** pend, int base) noexcept {
+    const char* orig_str = str;
     int sign = 1;
+    bool error_if_nonzero = false;
     if ((base != 0 && base < 2) || base > 36) {
-        PyErr_SetString(PyExc_ValueError, "long() arg 2 must be >= 2 and <= 36");
+        PyErr_SetString(PyExc_ValueError, "int() arg 2 must be >= 2 and <= 36");
         return NULL;
     }
-    while (*str != '\0' && isspace(Py_CHARMASK(*str)))
+    while (*str != '\0' && Py_ISSPACE(Py_CHARMASK(*str)))
         str++;
     if (*str == '+')
         ++str;
@@ -189,11 +517,7 @@ extern "C" PyObject* PyLong_FromString(const char* str, char** pend, int base) n
         ++str;
         sign = -1;
     }
-    while (*str != '\0' && isspace(Py_CHARMASK(*str)))
-        str++;
     if (base == 0) {
-        /* No base given.  Deduce the base from the contents
-           of the string */
         if (str[0] != '0')
             base = 10;
         else if (str[1] == 'x' || str[1] == 'X')
@@ -202,40 +526,88 @@ extern "C" PyObject* PyLong_FromString(const char* str, char** pend, int base) n
             base = 8;
         else if (str[1] == 'b' || str[1] == 'B')
             base = 2;
-        else
-            /* "old" (C-style) octal literal, still valid in
-               2.x, although illegal in 3.x */
-            base = 8;
+        else {
+            /* "old" (C-style) octal literal, now invalid.
+               it might still be zero though */
+            error_if_nonzero = true;
+            base = 10;
+        }
     }
-    /* Whether or not we were deducing the base, skip leading chars
-       as needed */
     if (str[0] == '0'
         && ((base == 16 && (str[1] == 'x' || str[1] == 'X')) || (base == 8 && (str[1] == 'o' || str[1] == 'O'))
-            || (base == 2 && (str[1] == 'b' || str[1] == 'B'))))
+            || (base == 2 && (str[1] == 'b' || str[1] == 'B')))) {
         str += 2;
-
-    llvm::StringRef str_ref = str;
-    llvm::StringRef str_ref_trimmed = str_ref.rtrim(base < 22 ? "Ll \t\n\v\f\r" : " \t\n\v\f\r");
-
-    BoxedLong* rtn = new BoxedLong();
-    int r = 0;
-    if (str_ref_trimmed != str_ref)
-        r = mpz_init_set_str(rtn->n, str_ref_trimmed.str().c_str(), base);
-    else
-        r = mpz_init_set_str(rtn->n, str, base);
-
-    if (pend) {
-        *pend = const_cast<char*>(str) + str_ref.size();
+        /* One underscore allowed here. */
+        if (*str == '_')
+            ++str;
     }
-    if (r != 0) {
-        Py_DECREF(rtn);
-        PyErr_Format(PyExc_ValueError, "invalid literal for long() with base %d: '%s'", base, str);
+
+    std::string digits;
+    bool ok = str[0] != '_'; // May not start with underscores.
+    char prev = 0;
+    while (ok) {
+        char c = *str;
+        int d;
+        if (c >= '0' && c <= '9')
+            d = c - '0';
+        else if (c >= 'a' && c <= 'z')
+            d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z')
+            d = c - 'A' + 10;
+        else if (c == '_') {
+            if (prev == '_') {
+                ok = false; // Only one underscore allowed.
+                break;
+            }
+            prev = c;
+            str++;
+            continue;
+        } else
+            break;
+        if (d >= base)
+            break;
+        digits.push_back(c);
+        prev = c;
+        str++;
+    }
+    if (prev == '_' || digits.empty())
+        ok = false; // Trailing underscore or no digits.
+    if (ok && error_if_nonzero && digits.find_first_not_of('0') != std::string::npos)
+        ok = false;
+    if (ok) {
+        /* Allow only trailing whitespace after the end of the number. */
+        while (*str && Py_ISSPACE(Py_CHARMASK(*str)))
+            str++;
+        ok = *str == '\0';
+    }
+    if (pend)
+        *pend = const_cast<char*>(str);
+    if (!ok) {
+        size_t slen = strlen(orig_str) < 200 ? strlen(orig_str) : 200;
+        PyObject* strobj = PyUnicode_FromStringAndSize(orig_str, slen);
+        if (strobj == NULL)
+            return NULL;
+        PyErr_Format(PyExc_ValueError, "invalid literal for int() with base %d: %.200R", base, strobj);
+        Py_DECREF(strobj);
         return NULL;
     }
 
-    if (sign == -1)
-        mpz_neg(rtn->n, rtn->n);
+    if (_Py_int_max_str_digits > 0 && !isBinaryBase(base) && (Py_ssize_t)digits.size() > _Py_int_max_str_digits) {
+        // A NULL end tells the callers to keep this error.
+        if (pend)
+            *pend = NULL;
+        PyErr_Format(PyExc_ValueError, MAX_STR_DIGITS_ERROR_FMT_TO_INT, _Py_int_max_str_digits,
+                     (Py_ssize_t)digits.size());
+        return NULL;
+    }
 
+    mpz_t v;
+    int r = mpz_init_set_str(v, digits.c_str(), base);
+    RELEASE_ASSERT(r == 0, "");
+    if (sign == -1)
+        mpz_neg(v, v);
+    Box* rtn = boxMPZ(v);
+    mpz_clear(v);
     return rtn;
 }
 
@@ -260,8 +632,8 @@ static uint64_t asUnsignedLong(BoxedLong* self) {
 extern "C" unsigned long PyLong_AsUnsignedLong(PyObject* vv) noexcept {
     assert(vv);
 
-    if (vv->cls == int_cls) {
-        long val = PyInt_AsLong(vv);
+    if (PyInt_Check(vv)) {
+        long val = PyInt_AS_LONG(vv);
         if (val < 0) {
             PyErr_SetString(PyExc_OverflowError, "can't convert negative value "
                                                  "to unsigned long");
@@ -270,7 +642,7 @@ extern "C" unsigned long PyLong_AsUnsignedLong(PyObject* vv) noexcept {
         return val;
     }
 
-    RELEASE_ASSERT(PyLong_Check(vv), "");
+    RELEASE_ASSERT(PyLongObject_Check(vv), "");
     BoxedLong* l = static_cast<BoxedLong*>(vv);
 
     try {
@@ -293,9 +665,14 @@ extern "C" long PyLong_AsLong(PyObject* vv) noexcept {
 }
 
 extern "C" Py_ssize_t PyLong_AsSsize_t(PyObject* vv) noexcept {
-    RELEASE_ASSERT(PyLong_Check(vv), "");
+    if (vv == NULL || !PyLong_Check(vv)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    if (PyInt_Check(vv))
+        return PyInt_AS_LONG(vv);
 
-    if (PyLong_Check(vv)) {
+    if (PyLongObject_Check(vv)) {
         BoxedLong* l = static_cast<BoxedLong*>(vv);
         if (mpz_fits_slong_p(l->n)) {
             return mpz_get_si(l->n);
@@ -318,9 +695,9 @@ extern "C" long PyLong_AsLongAndOverflow(Box* vv, int* overflow) noexcept {
     }
 
     if (PyInt_Check(vv))
-        return PyInt_AsLong(vv);
+        return PyInt_AS_LONG(vv);
 
-    if (!PyLong_Check(vv)) {
+    if (!PyLongObject_Check(vv)) {
         PyNumberMethods* nb;
         nb = vv->cls->tp_as_number;
         if (nb == NULL || nb->nb_int == NULL) {
@@ -332,10 +709,13 @@ extern "C" long PyLong_AsLongAndOverflow(Box* vv, int* overflow) noexcept {
         if (vv == NULL)
             return -1;
 
-        if (PyInt_Check(vv))
-            return PyInt_AsLong(vv);
+        if (PyInt_Check(vv)) {
+            long r = PyInt_AS_LONG(vv);
+            Py_DECREF(vv);
+            return r;
+        }
 
-        if (!PyLong_Check(vv)) {
+        if (!PyLongObject_Check(vv)) {
             PyErr_SetString(PyExc_TypeError, "nb_int should return int object");
             return -1;
         }
@@ -352,7 +732,12 @@ extern "C" long PyLong_AsLongAndOverflow(Box* vv, int* overflow) noexcept {
 }
 
 extern "C" double PyLong_AsDouble(PyObject* vv) noexcept {
-    RELEASE_ASSERT(PyLong_Check(vv), "");
+    if (vv == NULL || !PyLong_Check(vv)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    if (PyInt_Check(vv))
+        return (double)PyInt_AS_LONG(vv);
     BoxedLong* l = static_cast<BoxedLong*>(vv);
     mpfr_t result;
     mpfr_init(result);
@@ -367,22 +752,30 @@ extern "C" double PyLong_AsDouble(PyObject* vv) noexcept {
     return result_f;
 }
 
-/* Convert the long to a string object with given base,
-   appending a base prefix of 0[box] if base is 2, 8 or 16.
-   Add a trailing "L" if addL is non-zero.
-   If newstyle is zero, then use the pre-2.6 behavior of octal having
-   a leading "0", instead of the prefix "0o" */
-extern "C" PyAPI_FUNC(PyObject*) _PyLong_Format(PyObject* aa, int base, int addL, int newstyle) noexcept {
-    BoxedLong* v = (BoxedLong*)aa;
-
-    RELEASE_ASSERT(PyLong_Check(v), "");
+/* Convert an int to a string object with given base,
+   appending a base prefix of 0[box] if base is 2, 8 or 16. */
+extern "C" PyAPI_FUNC(PyObject*) _PyLong_Format(PyObject* aa, int base) noexcept {
+    RELEASE_ASSERT(PyLong_Check(aa), "");
     RELEASE_ASSERT(base >= 2 && base <= 62, "");
 
-    bool is_negative = mpz_sgn(v->n) == -1;
+    MPZView view(aa);
+    mpz_srcptr n = view.get();
+    bool is_negative = mpz_sgn(n) == -1;
 
-    int space_required = mpz_sizeinbase(v->n, base) + 2;
+    int space_required = mpz_sizeinbase(n, base) + 2;
+    // mpz_sizeinbase can be one too big, so check the real length after converting too.
+    int limit = isBinaryBase(base) ? 0 : _Py_int_max_str_digits;
+    if (limit > 0 && space_required - 3 > limit) {
+        PyErr_Format(PyExc_ValueError, MAX_STR_DIGITS_ERROR_FMT_TO_STR, limit);
+        return NULL;
+    }
     char* buf = (char*)malloc(space_required);
-    mpz_get_str(buf, base, v->n);
+    mpz_get_str(buf, base, n);
+    if (limit > 0 && (Py_ssize_t)strlen(buf) - is_negative > limit) {
+        free(buf);
+        PyErr_Format(PyExc_ValueError, MAX_STR_DIGITS_ERROR_FMT_TO_STR, limit);
+        return NULL;
+    }
 
     std::string str;
     llvm::raw_string_ostream os(str);
@@ -391,20 +784,15 @@ extern "C" PyAPI_FUNC(PyObject*) _PyLong_Format(PyObject* aa, int base, int addL
 
     if (base == 2)
         os << "0b";
-    else if (base == 8) {
-        if (!(mpz_sgn(v->n) == 0)) {
-            os << (newstyle ? "0o" : "0");
-        }
-    } else if (base == 16)
+    else if (base == 8)
+        os << "0o";
+    else if (base == 16)
         os << "0x";
 
     if (is_negative)
         os << buf + 1; // +1 to remove sign
     else
         os << buf;
-
-    if (addL)
-        os << "L";
 
     os.flush();
     auto rtn = boxString(str);
@@ -424,13 +812,7 @@ extern "C" PyObject* PyLong_FromDouble(double v) noexcept {
 
     BoxedLong* rtn = new BoxedLong();
     mpz_init_set_d(rtn->n, v);
-    return rtn;
-}
-
-extern "C" PyObject* PyLong_FromLong(long ival) noexcept {
-    BoxedLong* rtn = new BoxedLong();
-    mpz_init_set_si(rtn->n, ival);
-    return rtn;
+    return normalizeLong(rtn);
 }
 
 #ifdef Py_USING_UNICODE
@@ -452,21 +834,11 @@ extern "C" PyObject* PyLong_FromUnicode(Py_UNICODE* u, Py_ssize_t length, int ba
 #endif
 
 extern "C" PyObject* PyLong_FromUnsignedLong(unsigned long ival) noexcept {
+    if (ival <= LONG_MAX)
+        return boxInt(ival);
     BoxedLong* rtn = new BoxedLong();
     mpz_init_set_ui(rtn->n, ival);
-    return rtn;
-}
-
-extern "C" PyObject* PyLong_FromSsize_t(Py_ssize_t ival) noexcept {
-    Py_ssize_t bytes = ival;
-    int one = 1;
-    return _PyLong_FromByteArray((unsigned char*)&bytes, SIZEOF_SIZE_T, IS_LITTLE_ENDIAN, 1);
-}
-
-extern "C" PyObject* PyLong_FromSize_t(size_t ival) noexcept {
-    size_t bytes = ival;
-    int one = 1;
-    return _PyLong_FromByteArray((unsigned char*)&bytes, SIZEOF_SIZE_T, IS_LITTLE_ENDIAN, 0);
+    return normalizeLong(rtn);
 }
 
 #undef IS_LITTLE_ENDIAN
@@ -484,7 +856,7 @@ extern "C" PyObject* PyLong_FromVoidPtr(void* p) noexcept {
 #if SIZEOF_VOID_P <= SIZEOF_LONG
     if ((long)p < 0)
         return PyLong_FromUnsignedLong((unsigned long)p);
-    return PyInt_FromLong((long)p);
+    return PyLong_FromLong((long)p);
 #else
 
 #ifndef HAVE_LONG_LONG
@@ -495,7 +867,7 @@ extern "C" PyObject* PyLong_FromVoidPtr(void* p) noexcept {
 #endif
     /* optimize null pointers */
     if (p == NULL)
-        return PyInt_FromLong(0);
+        return PyLong_FromLong(0);
     return PyLong_FromUnsignedLongLong((unsigned PY_LONG_LONG)p);
 
 #endif /* SIZEOF_VOID_P <= SIZEOF_LONG */
@@ -513,7 +885,7 @@ extern "C" void* PyLong_AsVoidPtr(PyObject* vv) noexcept {
 
     if (PyInt_Check(vv))
         x = PyInt_AS_LONG(vv);
-    else if (PyLong_Check(vv) && _PyLong_Sign(vv) < 0)
+    else if (PyLongObject_Check(vv) && _PyLong_Sign(vv) < 0)
         x = PyLong_AsLong(vv);
     else
         x = PyLong_AsUnsignedLong(vv);
@@ -529,7 +901,7 @@ extern "C" void* PyLong_AsVoidPtr(PyObject* vv) noexcept {
 
     if (PyInt_Check(vv))
         x = PyInt_AS_LONG(vv);
-    else if (PyLong_Check(vv) && _PyLong_Sign(vv) < 0)
+    else if (PyLongObject_Check(vv) && _PyLong_Sign(vv) < 0)
         x = PyLong_AsLongLong(vv);
     else
         x = PyLong_AsUnsignedLongLong(vv);
@@ -543,16 +915,19 @@ extern "C" void* PyLong_AsVoidPtr(PyObject* vv) noexcept {
 
 
 extern "C" size_t _PyLong_NumBits(PyObject* vv) noexcept {
-    RELEASE_ASSERT(PyLong_Check(vv), "");
-    return mpz_sizeinbase(((BoxedLong*)vv)->n, 2);
+    MPZView view(vv);
+    if (mpz_sgn(view.get()) == 0)
+        return 0;
+    return mpz_sizeinbase(view.get(), 2);
 }
 
 extern "C" int _PyLong_AsByteArray(PyLongObject* v, unsigned char* bytes, size_t n, int little_endian,
                                    int is_signed) noexcept {
-    const mpz_t* op = &((BoxedLong*)v)->n;
+    MPZView view((Box*)v);
+    mpz_srcptr op = view.get();
     mpz_t modified;
 
-    int sign = mpz_sgn(*op);
+    int sign = mpz_sgn(op);
     // If the value is zero, then mpz_export won't touch any of the memory, so handle that here:
     if (sign == 0) {
         memset(bytes, 0, n);
@@ -566,7 +941,7 @@ extern "C" int _PyLong_AsByteArray(PyLongObject* v, unsigned char* bytes, size_t
 
     if (sign == -1) {
         if (!is_signed) {
-            PyErr_SetString(PyExc_OverflowError, "can't convert negative long to unsigned");
+            PyErr_SetString(PyExc_OverflowError, "can't convert negative int to unsigned");
             return -1;
         }
 
@@ -576,25 +951,25 @@ extern "C" int _PyLong_AsByteArray(PyLongObject* v, unsigned char* bytes, size_t
         // just extract the value and then do the two's complement conversion ourselves.  But
         // then we would have to worry about endianness, which we don't right now.
         mpz_init(modified);
-        mpz_com(modified, *op);
+        mpz_com(modified, op);
         bits = mpz_sizeinbase(modified, 2);
         for (int i = 0; i < 8 * n; i++) {
             mpz_combit(modified, i);
         }
-        op = &modified;
+        op = modified;
     } else {
-        bits = mpz_sizeinbase(*op, 2);
+        bits = mpz_sizeinbase(op, 2);
     }
 
     if (bits > max_bits) {
         if (sign == -1)
             mpz_clear(modified);
-        PyErr_SetString(PyExc_OverflowError, "long too big to convert");
+        PyErr_SetString(PyExc_OverflowError, "int too big to convert");
         return -1;
     }
 
     size_t count = 0;
-    mpz_export(bytes, &count, 1, n, little_endian ? -1 : 1, 0, *op);
+    mpz_export(bytes, &count, 1, n, little_endian ? -1 : 1, 0, op);
     ASSERT(count == 1, "overflow? (%ld %ld)", count, n);
 
     if (sign == -1)
@@ -608,37 +983,34 @@ extern "C" PyObject* _PyLong_FromByteArray(const unsigned char* bytes, size_t n,
         return PyLong_FromLong(0);
 
     if (!little_endian) {
-        // TODO: check if the behaviour of mpz_import is right when big endian is specified.
-        Py_FatalError("unimplemented");
-        return 0;
+        std::vector<unsigned char> reversed(bytes, bytes + n);
+        std::reverse(reversed.begin(), reversed.end());
+        return _PyLong_FromByteArray(reversed.data(), n, 1, is_signed);
     }
 
-    BoxedLong* rtn = new BoxedLong();
-    mpz_init(rtn->n);
-    mpz_import(rtn->n, 1, 1, n, little_endian ? -1 : 1, 0, &bytes[0]);
+    mpz_t v;
+    mpz_init(v);
+    mpz_import(v, 1, 1, n, -1, 0, &bytes[0]);
 
-
-    RELEASE_ASSERT(little_endian, "");
-    if (is_signed && bytes[n - 1] >= 0x80) { // todo add big endian support
+    if (is_signed && bytes[n - 1] >= 0x80) {
         mpz_t t;
         mpz_init(t);
         mpz_setbit(t, n * 8);
-        mpz_sub(rtn->n, rtn->n, t);
+        mpz_sub(v, v, t);
         mpz_clear(t);
     }
 
+    Box* rtn = boxMPZ(v);
+    mpz_clear(v);
     return rtn;
 }
 
 extern "C" void _PyLong_AsMPZ(PyObject* obj, _PyLongMPZ num) noexcept {
-    RELEASE_ASSERT(obj->cls == long_cls, "needs a long argument");
-    mpz_set((mpz_ptr)num, ((BoxedLong*)obj)->n);
+    mpz_set((mpz_ptr)num, MPZView(obj).get());
 }
 
 extern "C" PyObject* _PyLong_FromMPZ(const _PyLongMPZ num) noexcept {
-    BoxedLong* r = new BoxedLong();
-    mpz_init_set(r->n, (mpz_srcptr)num);
-    return r;
+    return boxMPZ((mpz_srcptr)num);
 }
 
 extern "C" Box* createLong(llvm::StringRef s) {
@@ -646,7 +1018,7 @@ extern "C" Box* createLong(llvm::StringRef s) {
     assert(s.data()[s.size()] == '\0');
     int r = mpz_init_set_str(rtn->n, s.data(), 10);
     RELEASE_ASSERT(r == 0, "%d: '%s'", r, s.data());
-    return rtn;
+    return normalizeLong(rtn);
 }
 
 extern "C" BoxedLong* boxLong(int64_t n) {
@@ -656,15 +1028,16 @@ extern "C" BoxedLong* boxLong(int64_t n) {
 }
 
 extern "C" PyObject* PyLong_FromLongLong(long long ival) noexcept {
-    BoxedLong* rtn = new BoxedLong();
-    mpz_init_set_si(rtn->n, ival);
-    return rtn;
+    static_assert(sizeof(long long) == sizeof(int64_t), "");
+    return boxInt(ival);
 }
 
 extern "C" PyObject* PyLong_FromUnsignedLongLong(unsigned long long ival) noexcept {
+    if (ival <= LLONG_MAX)
+        return boxInt(ival);
     BoxedLong* rtn = new BoxedLong();
     mpz_init_set_ui(rtn->n, ival);
-    return rtn;
+    return normalizeLong(rtn);
 }
 
 template <ExceptionStyle S> Box* _longNew(Box* val, Box* _base) noexcept(S == CAPI) {
@@ -681,7 +1054,7 @@ template <ExceptionStyle S> Box* _longNew(Box* val, Box* _base) noexcept(S == CA
                 return NULL;
             }
 
-            if (!PyString_Check(val) && !PyUnicode_Check(val)) {
+            if (!PyUnicode_Check(val) && !PyUnicode_Check(val)) {
                 PyErr_SetString(PyExc_TypeError, "long() can't convert non-string with explicit base");
                 return NULL;
             }
@@ -692,7 +1065,7 @@ template <ExceptionStyle S> Box* _longNew(Box* val, Box* _base) noexcept(S == CA
             if (val == NULL)
                 raiseExcHelper(TypeError, "long() missing string argument");
 
-            if (!PyString_Check(val) && !PyUnicode_Check(val))
+            if (!PyUnicode_Check(val) && !PyUnicode_Check(val))
                 raiseExcHelper(TypeError, "long() can't convert non-string with explicit base");
         }
         base = static_cast<BoxedInt*>(_base)->n;
@@ -710,18 +1083,18 @@ template <ExceptionStyle S> Box* _longNew(Box* val, Box* _base) noexcept(S == CA
         return r;
     }
 
-    if (PyString_Check(val)) {
+    if (PyUnicode_Check(val)) {
         BoxedString* s = static_cast<BoxedString*>(val);
 
         if (s->size() != strlen(s->data())) {
             Box* srepr = PyObject_Repr(val);
             if (S == CAPI) {
                 PyErr_Format(PyExc_ValueError, "invalid literal for long() with base %d: '%s'", base,
-                             PyString_AS_STRING(autoDecref(srepr)));
+                             PyUnicode_AsUTF8(autoDecref(srepr)));
                 return NULL;
             } else {
                 raiseExcHelper(ValueError, "invalid literal for long() with base %d: '%s'", base,
-                               PyString_AS_STRING(autoDecref(srepr)));
+                               PyUnicode_AsUTF8(autoDecref(srepr)));
             }
         }
         Box* r = PyLong_FromString(s->data(), NULL, base);
@@ -778,7 +1151,7 @@ template <ExceptionStyle S> Box* longNew(Box* _cls, Box* val, Box* base) noexcep
 }
 
 Box* longInt(Box* v) {
-    if (!PyLong_Check(v))
+    if (!PyLongObject_Check(v))
         raiseExcHelper(TypeError, "descriptor '__int__' requires a 'long' object but received a '%s'", getTypeName(v));
 
     int overflow = 0;
@@ -787,7 +1160,7 @@ Box* longInt(Box* v) {
     if (overflow) {
         BoxedLong* rtn = new BoxedLong();
         mpz_init_set(rtn->n, ((BoxedLong*)v)->n);
-        return rtn;
+        return normalizeLong(rtn);
     } else
         return boxInt(n);
 }
@@ -796,15 +1169,15 @@ Box* longToLong(Box* self) noexcept {
     if (self->cls == long_cls) {
         return incref(self);
     } else {
-        assert(PyLong_Check(self));
+        assert(PyLongObject_Check(self));
         BoxedLong* l = new BoxedLong();
         mpz_init_set(l->n, static_cast<BoxedLong*>(self)->n);
-        return l;
+        return normalizeLong(l);
     }
 }
 
 Box* longLong(BoxedLong* self) {
-    if (!PyLong_Check(self))
+    if (!PyLongObject_Check(self))
         raiseExcHelper(TypeError, "descriptor '__long__' requires a 'int' object but received a '%s'",
                        getTypeName(self));
 
@@ -821,7 +1194,7 @@ Box* longToFloat(BoxedLong* v) {
 }
 
 Box* longFloat(BoxedLong* v) {
-    if (!PyLong_Check(v))
+    if (!PyLongObject_Check(v))
         raiseExcHelper(TypeError, "descriptor '__float__' requires a 'long' object but received a '%s'",
                        getTypeName(v));
 
@@ -829,80 +1202,29 @@ Box* longFloat(BoxedLong* v) {
 }
 
 template <ExceptionStyle S> Box* longRepr(Box* v) noexcept(S == CAPI) {
-    if (!PyLong_Check(v))
+    if (!PyLongObject_Check(v))
         return setDescrTypeError<S>(v, "long", "__repr__");
-    return callCAPIFromStyle<S>(_PyLong_Format, v, 10, 1 /* add L */, 0);
+    return callCAPIFromStyle<S>(_PyLong_Format, v, 10);
 }
 
 template <ExceptionStyle S> Box* longStr(Box* v) noexcept(S == CAPI) {
-    if (!PyLong_Check(v))
+    if (!PyLongObject_Check(v))
         return setDescrTypeError<S>(v, "long", "__str__");
-    return callCAPIFromStyle<S>(_PyLong_Format, v, 10, 0 /* no L */, 0);
-}
-
-Box* long__format__(BoxedLong* self, Box* format_spec) noexcept {
-    if (PyBytes_Check(format_spec))
-        return _PyLong_FormatAdvanced(self, PyBytes_AS_STRING(format_spec), PyBytes_GET_SIZE(format_spec));
-    if (PyUnicode_Check(format_spec)) {
-        /* Convert format_spec to a str */
-        PyObject* result;
-        PyObject* str_spec = PyObject_Str(format_spec);
-
-        if (str_spec == NULL)
-            return NULL;
-
-        result = _PyLong_FormatAdvanced(self, PyBytes_AS_STRING(str_spec), PyBytes_GET_SIZE(str_spec));
-
-        Py_DECREF(str_spec);
-        return result;
-    }
-    PyErr_SetString(PyExc_TypeError, "__format__ requires str or unicode");
-    return NULL;
-}
-
-Box* longFormat(BoxedLong* self, Box* format_spec) {
-    if (!PyLong_Check(self))
-        raiseExcHelper(TypeError, "descriptor '__format__' requires a 'long' object but received a '%s'",
-                       getTypeName(self));
-
-    Box* res = long__format__(self, format_spec);
-
-    if (res == NULL)
-        throwCAPIException();
-
-    return res;
-}
-
-Box* longBin(BoxedLong* v) {
-    if (!PyLong_Check(v))
-        raiseExcHelper(TypeError, "descriptor '__bin__' requires a 'long' object but received a '%s'", getTypeName(v));
-    return _PyLong_Format(v, 2, 0 /* no L */, 0);
-}
-
-Box* longHex(BoxedLong* v) {
-    if (!PyLong_Check(v))
-        raiseExcHelper(TypeError, "descriptor '__hex__' requires a 'long' object but received a '%s'", getTypeName(v));
-    return _PyLong_Format(v, 16, 1 /* add L */, 0);
-}
-
-Box* longOct(BoxedLong* v) {
-    if (!PyLong_Check(v))
-        raiseExcHelper(TypeError, "descriptor '__oct__' requires a 'long' object but received a '%s'", getTypeName(v));
-    return _PyLong_Format(v, 8, 1 /* add L */, 0);
+    return callCAPIFromStyle<S>(_PyLong_Format, v, 10);
 }
 
 Box* longNeg(BoxedLong* v1) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__neg__' requires a 'long' object but received a '%s'", getTypeName(v1));
 
     BoxedLong* r = new BoxedLong();
     mpz_init(r->n);
     mpz_neg(r->n, v1->n);
-    return r;
+    return normalizeLong(r);
 }
 
 Box* longPos(BoxedLong* v) {
-    if (!PyLong_Check(v))
+    if (!PyLongObject_Check(v))
         raiseExcHelper(TypeError, "descriptor '__pos__' requires a 'long' object but received a '%s'", getTypeName(v));
 
     if (v->cls == long_cls) {
@@ -910,29 +1232,29 @@ Box* longPos(BoxedLong* v) {
     } else {
         BoxedLong* r = new BoxedLong();
         mpz_init_set(r->n, v->n);
-        return r;
+        return normalizeLong(r);
     }
 }
 
 Box* longAbs(BoxedLong* v1) {
-    assert(PyLong_Check(v1));
+    assert(PyLongObject_Check(v1));
     BoxedLong* r = new BoxedLong();
     mpz_init(r->n);
     mpz_abs(r->n, v1->n);
-    return r;
+    return normalizeLong(r);
 }
 
 Box* longAdd(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__add__' requires a 'long' object but received a '%s'", getTypeName(v1));
 
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_add(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
@@ -942,7 +1264,7 @@ Box* longAdd(BoxedLong* v1, Box* _v2) {
             mpz_add_ui(r->n, v1->n, v2->n);
         else
             mpz_sub_ui(r->n, v1->n, -v2->n);
-        return r;
+        return normalizeLong(r);
     } else {
         return incref(NotImplemented);
     }
@@ -950,14 +1272,14 @@ Box* longAdd(BoxedLong* v1, Box* _v2) {
 
 // TODO: split common code out into a helper function
 extern "C" Box* longAnd(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__and__' requires a 'long' object but received a '%s'", getTypeName(v1));
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_and(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2_int = static_cast<BoxedInt*>(_v2);
         BoxedLong* r = new BoxedLong();
@@ -970,20 +1292,20 @@ extern "C" Box* longAnd(BoxedLong* v1, Box* _v2) {
             mpz_init_set_si(v2_long, v2_int->n);
 
         mpz_and(r->n, v1->n, v2_long);
-        return r;
+        return normalizeLong(r);
     }
     return incref(NotImplemented);
 }
 
 extern "C" Box* longOr(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__or__' requires a 'long' object but received a '%s'", getTypeName(v1));
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_ior(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2_int = static_cast<BoxedInt*>(_v2);
         BoxedLong* r = new BoxedLong();
@@ -996,20 +1318,20 @@ extern "C" Box* longOr(BoxedLong* v1, Box* _v2) {
             mpz_init_set_si(v2_long, v2_int->n);
 
         mpz_ior(r->n, v1->n, v2_long);
-        return r;
+        return normalizeLong(r);
     }
     return incref(NotImplemented);
 }
 
 extern "C" Box* longXor(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__xor__' requires a 'long' object but received a '%s'", getTypeName(v1));
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_xor(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2_int = static_cast<BoxedInt*>(_v2);
         BoxedLong* r = new BoxedLong();
@@ -1022,16 +1344,16 @@ extern "C" Box* longXor(BoxedLong* v1, Box* _v2) {
             mpz_init_set_si(v2_long, v2_int->n);
 
         mpz_xor(r->n, v1->n, v2_long);
-        return r;
+        return normalizeLong(r);
     }
     return incref(NotImplemented);
 }
 
 static PyObject* long_richcompare(Box* _v1, Box* _v2, int op) noexcept {
-    RELEASE_ASSERT(PyLong_Check(_v1), "");
+    RELEASE_ASSERT(PyLongObject_Check(_v1), "");
     BoxedLong* v1 = static_cast<BoxedLong*>(_v1);
 
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         return convert_3way_to_object(op, mpz_cmp(v1->n, v2->n));
@@ -1045,7 +1367,7 @@ static PyObject* long_richcompare(Box* _v1, Box* _v2, int op) noexcept {
 }
 
 Box* convertToLong(Box* val) {
-    if (PyLong_Check(val)) {
+    if (PyLongObject_Check(val)) {
         return incref(val);
     } else if (PyInt_Check(val)) {
         BoxedInt* val_int = static_cast<BoxedInt*>(val);
@@ -1066,7 +1388,7 @@ Box* longLShiftLong(BoxedLong* lhs, Box* _rhs) {
 
     BoxedLong* rhs_long = static_cast<BoxedLong*>(rhs);
 
-    // if (PyLong_Check(_v2)) {
+    // if (PyLongObject_Check(_v2)) {
     //     BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
     if (mpz_sgn(rhs_long->n) < 0)
@@ -1076,11 +1398,11 @@ Box* longLShiftLong(BoxedLong* lhs, Box* _rhs) {
     BoxedLong* r = new BoxedLong();
     mpz_init(r->n);
     mpz_mul_2exp(r->n, lhs->n, n);
-    return r;
+    return normalizeLong(r);
 }
 
 Box* longLShift(BoxedLong* lhs, Box* rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__lshift__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1088,7 +1410,7 @@ Box* longLShift(BoxedLong* lhs, Box* rhs) {
 }
 
 Box* longRLShift(BoxedLong* lhs, Box* _rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rlshift__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1115,15 +1437,19 @@ Box* longRShiftLong(BoxedLong* lhs, Box* _rhs) {
     if (mpz_sgn(rhs_long->n) < 0)
         raiseExcHelper(ValueError, "negative shift count");
 
+    // Shifting right by more bits than fit in a word leaves only the sign.
+    if (!mpz_fits_ulong_p(rhs_long->n))
+        return boxInt(mpz_sgn(lhs->n) < 0 ? -1 : 0);
+
     uint64_t n = asUnsignedLong(rhs_long);
     BoxedLong* r = new BoxedLong();
     mpz_init(r->n);
     mpz_div_2exp(r->n, lhs->n, n);
-    return r;
+    return normalizeLong(r);
 }
 
 Box* longRShift(BoxedLong* lhs, Box* rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rshift__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1131,7 +1457,7 @@ Box* longRShift(BoxedLong* lhs, Box* rhs) {
 }
 
 Box* longRRShift(BoxedLong* lhs, Box* _rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rrshift__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1147,14 +1473,14 @@ Box* longRRShift(BoxedLong* lhs, Box* _rhs) {
 }
 
 Box* longCoerce(BoxedLong* lhs, Box* _rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__coerce__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
     Box* rhs = convertToLong(_rhs);
     AUTO_DECREF(rhs);
 
-    if (!PyLong_Check(rhs))
+    if (!PyLongObject_Check(rhs))
         return incref(NotImplemented);
 
     BoxedLong* rhs_long = static_cast<BoxedLong*>(rhs);
@@ -1162,16 +1488,16 @@ Box* longCoerce(BoxedLong* lhs, Box* _rhs) {
 }
 
 Box* longSub(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__sub__' requires a 'long' object but received a '%s'", getTypeName(v1));
 
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_sub(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
@@ -1181,48 +1507,52 @@ Box* longSub(BoxedLong* v1, Box* _v2) {
             mpz_sub_ui(r->n, v1->n, v2->n);
         else
             mpz_add_ui(r->n, v1->n, -v2->n);
-        return r;
+        return normalizeLong(r);
     } else {
         return incref(NotImplemented);
     }
 }
 
 Box* longRsub(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__rsub__' requires a 'long' object but received a '%s'",
                        getTypeName(v1));
 
-    return longAdd(static_cast<BoxedLong*>(autoDecref(longNeg(v1))), _v2);
+    Box* lhs = convertToLong(_v2);
+    if (lhs == NotImplemented)
+        return lhs;
+    AUTO_DECREF(lhs);
+    return longSub(static_cast<BoxedLong*>(lhs), v1);
 }
 
 Box* longMul(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__mul__' requires a 'long' object but received a '%s'", getTypeName(v1));
 
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_mul(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_mul_si(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else {
         return incref(NotImplemented);
     }
 }
 
 Box* longDiv(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__div__' requires a 'long' object but received a '%s'", getTypeName(v1));
 
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         if (mpz_sgn(v2->n) == 0)
@@ -1231,7 +1561,7 @@ Box* longDiv(BoxedLong* v1, Box* _v2) {
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_fdiv_q(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
@@ -1241,24 +1571,24 @@ Box* longDiv(BoxedLong* v1, Box* _v2) {
         BoxedLong* r = new BoxedLong();
         mpz_init_set_si(r->n, v2->n);
         mpz_fdiv_q(r->n, v1->n, r->n);
-        return r;
+        return normalizeLong(r);
     } else {
         return incref(NotImplemented);
     }
 }
 
 Box* longFloorDiv(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__floordiv__' requires a 'long' object but received a '%s'",
                        getTypeName(v1));
     return longDiv(v1, _v2);
 }
 
 Box* longMod(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__mod__' requires a 'long' object but received a '%s'", getTypeName(v1));
 
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         if (mpz_sgn(v2->n) == 0)
@@ -1267,7 +1597,7 @@ Box* longMod(BoxedLong* v1, Box* _v2) {
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_mmod(r->n, v1->n, v2->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
@@ -1277,20 +1607,20 @@ Box* longMod(BoxedLong* v1, Box* _v2) {
         BoxedLong* r = new BoxedLong();
         mpz_init_set_si(r->n, v2->n);
         mpz_mmod(r->n, v1->n, r->n);
-        return r;
+        return normalizeLong(r);
     } else {
         return incref(NotImplemented);
     }
 }
 
 Box* longRMod(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__rmod__' requires a 'long' object but received a '%s'",
                        getTypeName(v1));
 
     Box* lhs = _v2;
     BoxedLong* rhs = v1;
-    if (PyLong_Check(lhs)) {
+    if (PyLongObject_Check(lhs)) {
         return longMod((BoxedLong*)lhs, rhs);
     } else if (PyInt_Check(lhs)) {
         return longMod(autoDecref(boxLong(((BoxedInt*)lhs)->n)), rhs);
@@ -1300,7 +1630,7 @@ Box* longRMod(BoxedLong* v1, Box* _v2) {
 }
 
 Box* longDivmodLong(BoxedLong* lhs, Box* _rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__div__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1326,7 +1656,7 @@ Box* longDivmodLong(BoxedLong* lhs, Box* _rhs) {
 }
 
 Box* longDivmod(BoxedLong* lhs, Box* rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__div__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1334,7 +1664,7 @@ Box* longDivmod(BoxedLong* lhs, Box* rhs) {
 }
 
 Box* longRDivmod(BoxedLong* lhs, Box* _rhs) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__div__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1350,34 +1680,34 @@ Box* longRDivmod(BoxedLong* lhs, Box* _rhs) {
 }
 
 Box* longRdiv(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__rdiv__' requires a 'long' object but received a '%s'",
                        getTypeName(v1));
 
     if (mpz_sgn(v1->n) == 0)
         raiseExcHelper(ZeroDivisionError, "long division or modulo by zero");
 
-    if (PyLong_Check(_v2)) {
+    if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
         mpz_fdiv_q(r->n, v2->n, v1->n);
-        return r;
+        return normalizeLong(r);
     } else if (PyInt_Check(_v2)) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
         BoxedLong* r = new BoxedLong();
         mpz_init_set_si(r->n, v2->n);
         mpz_fdiv_q(r->n, r->n, v1->n);
-        return r;
+        return normalizeLong(r);
     } else {
         return incref(NotImplemented);
     }
 }
 
 Box* longRfloorDiv(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__rfloordiv__' requires a 'long' object but received a '%s'",
                        getTypeName(v1));
 
@@ -1385,67 +1715,52 @@ Box* longRfloorDiv(BoxedLong* v1, Box* _v2) {
 }
 
 Box* longTrueDiv(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__truediv__' requires a 'long' object but received a '%s'",
                        getTypeName(v1));
-
-    BoxedLong* v2;
-    if (PyInt_Check(_v2) || PyLong_Check(_v2)) {
-        v2 = (BoxedLong*)PyNumber_Long(_v2);
-        if (!v2) {
-            throwCAPIException();
-        }
-    } else {
+    if (!PyLong_Check(_v2))
         return incref(NotImplemented);
-    }
 
-    AUTO_DECREF(v2);
-
-    if (mpz_sgn(v2->n) == 0) {
+    MPZView lhs(v1), rhs(_v2);
+    if (mpz_sgn(rhs.get()) == 0)
         raiseExcHelper(ZeroDivisionError, "division by zero");
-    }
 
+    // TODO: this rounds twice (through mpfr's 53-bit mantissa), CPython rounds once.
     mpfr_t lhs_f, rhs_f, result;
     mpfr_init(result);
-    mpfr_init_set_z(lhs_f, v1->n, MPFR_RNDN);
-    mpfr_init_set_z(rhs_f, v2->n, MPFR_RNDZ);
+    mpfr_init_set_z(lhs_f, lhs.get(), MPFR_RNDN);
+    mpfr_init_set_z(rhs_f, rhs.get(), MPFR_RNDN);
     mpfr_div(result, lhs_f, rhs_f, MPFR_RNDN);
-
     double result_f = mpfr_get_d(result, MPFR_RNDN);
+    mpfr_clears(lhs_f, rhs_f, result, (mpfr_ptr)0);
 
-    if (std::isinf(result_f)) {
+    if (std::isinf(result_f))
         raiseExcHelper(OverflowError, "integer division result too large for a float");
-    }
     return boxFloat(result_f);
 }
 
 Box* longRTrueDiv(BoxedLong* v1, Box* _v2) {
-    if (!PyLong_Check(v1))
+    if (!PyLongObject_Check(v1))
         raiseExcHelper(TypeError, "descriptor '__rtruediv__' requires a 'long' object but received a '%s'",
                        getTypeName(v1));
-
-    BoxedLong* v2;
-    if (PyInt_Check(_v2) || PyLong_Check(_v2)) {
-        v2 = (BoxedLong*)PyNumber_Long(_v2);
-    } else {
+    if (!PyLong_Check(_v2))
         return incref(NotImplemented);
-    }
-    AUTO_DECREF(v2);
 
-    if (mpz_sgn(v1->n) == 0) {
+    MPZView lhs(_v2), rhs(v1);
+    if (mpz_sgn(rhs.get()) == 0)
         raiseExcHelper(ZeroDivisionError, "division by zero");
-    }
 
+    // TODO: this rounds twice (through mpfr's 53-bit mantissa), CPython rounds once.
     mpfr_t lhs_f, rhs_f, result;
     mpfr_init(result);
-    mpfr_init_set_z(lhs_f, v2->n, MPFR_RNDN);
-    mpfr_init_set_z(rhs_f, v1->n, MPFR_RNDZ);
+    mpfr_init_set_z(lhs_f, lhs.get(), MPFR_RNDN);
+    mpfr_init_set_z(rhs_f, rhs.get(), MPFR_RNDN);
     mpfr_div(result, lhs_f, rhs_f, MPFR_RNDN);
+    double result_f = mpfr_get_d(result, MPFR_RNDN);
+    mpfr_clears(lhs_f, rhs_f, result, (mpfr_ptr)0);
 
-    double result_f = mpfr_get_d(result, MPFR_RNDZ);
-    if (std::isinf(result_f)) {
+    if (std::isinf(result_f))
         raiseExcHelper(OverflowError, "integer division result too large for a float");
-    }
     return boxFloat(result_f);
 }
 
@@ -1460,10 +1775,10 @@ static void _addFuncPow(const char* name, ConcreteCompilerType* rtn_type, void* 
 }
 
 extern "C" Box* longPowFloat(BoxedLong* lhs, BoxedFloat* rhs) {
-    assert(PyLong_Check(lhs));
+    assert(PyLongObject_Check(lhs));
     assert(PyFloat_Check(rhs));
     double lhs_float = static_cast<BoxedFloat*>(longFloat(lhs))->d;
-    return boxFloat(pow_float_float(lhs_float, rhs->d));
+    return powFloatFloat(lhs_float, rhs->d);
 }
 
 Box* longPowLong(BoxedLong* lhs, Box* _rhs, Box* _mod) {
@@ -1487,20 +1802,35 @@ Box* longPowLong(BoxedLong* lhs, Box* _rhs, Box* _mod) {
 
     rhs_long = static_cast<BoxedLong*>(rhs);
 
+    // A negative exponent with a modulus uses the modular inverse of the base (new in 3.8).
+    BoxedLong* inverse = NULL;
     if (_mod != Py_None) {
-        if (mpz_sgn(rhs_long->n) < 0)
-            raiseExcHelper(TypeError, "pow() 2nd argument "
-                                      "cannot be negative when 3rd argument specified");
-        else if (mpz_sgn(mod_long->n) == 0)
+        if (mpz_sgn(mod_long->n) == 0)
             raiseExcHelper(ValueError, "pow() 3rd argument cannot be 0");
+        if (mpz_sgn(rhs_long->n) < 0) {
+            inverse = new BoxedLong();
+            mpz_init(inverse->n);
+            if (!mpz_invert(inverse->n, lhs->n, mod_long->n)) {
+                Py_DECREF(inverse);
+                raiseExcHelper(ValueError, "base is not invertible for the given modulus");
+            }
+            BoxedLong* neg = new BoxedLong();
+            mpz_init(neg->n);
+            mpz_neg(neg->n, rhs_long->n);
+            rhs_long = neg;
+            lhs = inverse;
+        }
     }
+    AUTO_XDECREF(inverse);
+    // rhs_long is a new reference when it was negated.
+    DecrefHandle<Box, true> negated_rhs(inverse ? (Box*)rhs_long : NULL);
 
     if (mpz_sgn(rhs_long->n) == -1) {
         BoxedFloat* rhs_float = static_cast<BoxedFloat*>(longToFloat(rhs_long));
         AUTO_DECREF(rhs_float);
         BoxedFloat* lhs_float = static_cast<BoxedFloat*>(longToFloat(lhs));
         AUTO_DECREF(lhs_float);
-        return boxFloat(pow_float_float(lhs_float->d, rhs_float->d));
+        return powFloatFloat(lhs_float->d, rhs_float->d);
     }
 
     BoxedLong* r = new BoxedLong();
@@ -1509,7 +1839,7 @@ Box* longPowLong(BoxedLong* lhs, Box* _rhs, Box* _mod) {
     if (_mod != Py_None) {
         mpz_powm(r->n, lhs->n, rhs_long->n, mod_long->n);
         if (mpz_sgn(r->n) == 0)
-            return r;
+            return normalizeLong(r);
         if (mpz_sgn(mod_long->n) < 0)
             return longAdd(autoDecref(r), mod_long);
     } else {
@@ -1529,10 +1859,10 @@ Box* longPowLong(BoxedLong* lhs, Box* _rhs, Box* _mod) {
             }
         }
     }
-    return r;
+    return normalizeLong(r);
 }
 Box* longPow(BoxedLong* lhs, Box* rhs, Box* mod) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__pow__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1540,7 +1870,7 @@ Box* longPow(BoxedLong* lhs, Box* rhs, Box* mod) {
 }
 
 Box* longRPow(BoxedLong* lhs, Box* _rhs, Box* mod) {
-    if (!PyLong_Check(lhs))
+    if (!PyLongObject_Check(lhs))
         raiseExcHelper(TypeError, "descriptor '__rpow__' requires a 'long' object but received a '%s'",
                        getTypeName(lhs));
 
@@ -1555,18 +1885,18 @@ Box* longRPow(BoxedLong* lhs, Box* _rhs, Box* mod) {
 }
 
 extern "C" Box* longInvert(BoxedLong* v) {
-    if (!PyLong_Check(v))
+    if (!PyLongObject_Check(v))
         raiseExcHelper(TypeError, "descriptor '__invert__' requires a 'long' object but received a '%s'",
                        getTypeName(v));
 
     BoxedLong* r = new BoxedLong();
     mpz_init(r->n);
     mpz_com(r->n, v->n);
-    return r;
+    return normalizeLong(r);
 }
 
 Box* longNonzero(BoxedLong* self) {
-    if (!PyLong_Check(self))
+    if (!PyLongObject_Check(self))
         raiseExcHelper(TypeError, "descriptor '__pow__' requires a 'long' object but received a '%s'",
                        getTypeName(self));
 
@@ -1580,29 +1910,15 @@ bool longNonzeroUnboxed(BoxedLong* self) {
 }
 
 Box* longHash(BoxedLong* self) {
-    if (!PyLong_Check(self))
+    if (!PyLongObject_Check(self))
         raiseExcHelper(TypeError, "descriptor '__hash__' requires a 'long' object but received a '%s'",
                        getTypeName(self));
 
-    // If the long fits into an int we have to return the same hash in order that we can find the value in a dict.
-    if (mpz_fits_slong_p(self->n)) {
-        auto v = mpz_get_si(self->n);
-        if (v == -1)
-            v = -2;
-        return boxInt(v);
-    }
-
-    // CPython use the absolute value of self mod ULONG_MAX.
-    unsigned long remainder = mpz_tdiv_ui(self->n, ULONG_MAX);
-    if (remainder == 0)
-        remainder = -1; // CPython compatibility -- ULONG_MAX mod ULONG_MAX is ULONG_MAX to them.
-
-    remainder *= mpz_sgn(self->n);
-
-    if (remainder == -1)
-        remainder = -2;
-
-    return boxInt(remainder);
+    // Python 3 hashes ints modulo _PyHASH_MODULUS so that equal ints and floats hash the same.
+    int64_t x = (int64_t)mpz_tdiv_ui(self->n, _PyHASH_MODULUS) * mpz_sgn(self->n);
+    if (x == -1)
+        x = -2;
+    return boxInt(x);
 }
 
 long long_hash(PyObject* self) noexcept {
@@ -1614,7 +1930,7 @@ long long_hash(PyObject* self) noexcept {
 }
 
 extern "C" Box* longTrunc(BoxedLong* self) {
-    if (!PyLong_Check(self))
+    if (!PyLongObject_Check(self))
         raiseExcHelper(TypeError, "descriptor '__trunc__' requires a 'long' object but received a '%s'",
                        getTypeName(self));
 
@@ -1622,15 +1938,15 @@ extern "C" Box* longTrunc(BoxedLong* self) {
 }
 
 extern "C" Box* longIndex(BoxedLong* v) noexcept {
-    if (PyLong_CheckExact(v))
+    if (PyLongObject_Check(v))
         return incref(v);
     BoxedLong* rtn = new BoxedLong();
     mpz_init_set(rtn->n, v->n);
-    return rtn;
+    return normalizeLong(rtn);
 }
 
 extern "C" Box* longBitLength(BoxedLong* self) noexcept {
-    if (!PyLong_Check(self))
+    if (!PyLongObject_Check(self))
         raiseExcHelper(TypeError, "descriptor 'bit_length' requires a 'long' object but received a '%s'",
                        getTypeName(self));
 
@@ -1642,7 +1958,7 @@ extern "C" Box* longBitLength(BoxedLong* self) noexcept {
 }
 
 static int convert_binop(PyObject* v, PyObject* w, PyLongObject** a, PyLongObject** b) noexcept {
-    if (PyLong_Check(v)) {
+    if (PyLongObject_Check(v)) {
         *a = (PyLongObject*)v;
         Py_INCREF(v);
     } else if (PyInt_Check(v)) {
@@ -1650,7 +1966,7 @@ static int convert_binop(PyObject* v, PyObject* w, PyLongObject** a, PyLongObjec
     } else {
         return 0;
     }
-    if (PyLong_Check(w)) {
+    if (PyLongObject_Check(w)) {
         *b = (PyLongObject*)w;
         Py_INCREF(w);
     } else if (PyInt_Check(w)) {
@@ -1699,7 +2015,147 @@ static PyObject* long_getnewargs(PyLongObject* v) noexcept {
     return Py_BuildValue("(N)", _PyLong_Copy(v));
 }
 
+static int parseByteorder(PyObject* byteorder, int* little_endian) noexcept {
+    if (_PyUnicode_EqualToASCIIString(byteorder, "little"))
+        *little_endian = 1;
+    else if (_PyUnicode_EqualToASCIIString(byteorder, "big"))
+        *little_endian = 0;
+    else {
+        PyErr_SetString(PyExc_ValueError, "byteorder must be either 'little' or 'big'");
+        return -1;
+    }
+    return 0;
+}
+
+static PyObject* int_to_bytes(PyObject* self, PyObject* args, PyObject* kwds) noexcept {
+    static char* kwlist[] = { const_cast<char*>("length"), const_cast<char*>("byteorder"), const_cast<char*>("signed"), NULL };
+    Py_ssize_t length;
+    PyObject* byteorder;
+    int is_signed = 0, little_endian;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "nU|$p:to_bytes", kwlist, &length, &byteorder, &is_signed))
+        return NULL;
+    if (parseByteorder(byteorder, &little_endian) < 0)
+        return NULL;
+    if (length < 0) {
+        PyErr_SetString(PyExc_ValueError, "length argument must be non-negative");
+        return NULL;
+    }
+    PyObject* bytes = PyBytes_FromStringAndSize(NULL, length);
+    if (bytes == NULL)
+        return NULL;
+    if (_PyLong_AsByteArray((PyLongObject*)self, (unsigned char*)PyBytes_AS_STRING(bytes), length, little_endian,
+                            is_signed) < 0) {
+        Py_DECREF(bytes);
+        return NULL;
+    }
+    return bytes;
+}
+
+static PyObject* int_from_bytes(PyObject* type, PyObject* args, PyObject* kwds) noexcept {
+    static char* kwlist[] = { const_cast<char*>("bytes"), const_cast<char*>("byteorder"), const_cast<char*>("signed"), NULL };
+    PyObject* obj, *byteorder;
+    int is_signed = 0, little_endian;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OU|$p:from_bytes", kwlist, &obj, &byteorder, &is_signed))
+        return NULL;
+    if (parseByteorder(byteorder, &little_endian) < 0)
+        return NULL;
+    PyObject* bytes = PyObject_Bytes(obj);
+    if (bytes == NULL)
+        return NULL;
+    PyObject* long_obj = _PyLong_FromByteArray((unsigned char*)PyBytes_AS_STRING(bytes), Py_SIZE(bytes), little_endian,
+                                               is_signed);
+    Py_DECREF(bytes);
+    if (long_obj != NULL && type != (PyObject*)int_cls && type != (PyObject*)long_cls)
+        Py_SETREF(long_obj, PyObject_CallFunctionObjArgs(type, long_obj, NULL));
+    return long_obj;
+}
+
+static PyObject* int_exact(PyObject* self, PyObject*) noexcept {
+    // int(self), which also turns bools into plain ints
+    return PyNumber_Long(self);
+}
+
+static PyObject* int_as_integer_ratio(PyObject* self, PyObject*) noexcept {
+    PyObject* numerator = PyNumber_Long(self);
+    if (numerator == NULL)
+        return NULL;
+    PyObject* ratio = PyTuple_Pack(2, numerator, _PyLong_One);
+    Py_DECREF(numerator);
+    return ratio;
+}
+
+static PyObject* int_round(PyObject* self, PyObject* args) noexcept {
+    PyObject* o_ndigits = NULL;
+    if (!PyArg_ParseTuple(args, "|O:__round__", &o_ndigits))
+        return NULL;
+    if (o_ndigits == NULL || o_ndigits == Py_None)
+        return PyNumber_Long(self);
+    PyObject* ndigits = PyNumber_Index(o_ndigits);
+    if (ndigits == NULL)
+        return NULL;
+    AUTO_DECREF(ndigits);
+    int cmp = PyObject_RichCompareBool(ndigits, _PyLong_Zero, Py_GE);
+    if (cmp < 0)
+        return NULL;
+    if (cmp)
+        return PyNumber_Long(self);
+
+    // Round half to even at 10**-ndigits.
+    PyObject* neg = PyNumber_Negative(ndigits);
+    if (neg == NULL)
+        return NULL;
+    AUTO_DECREF(neg);
+    PyObject* ten = PyLong_FromLong(10);
+    AUTO_DECREF(ten);
+    PyObject* pow = PyNumber_Power(ten, neg, Py_None);
+    if (pow == NULL)
+        return NULL;
+    AUTO_DECREF(pow);
+    PyObject* qr = PyNumber_Divmod(self, pow);
+    if (qr == NULL)
+        return NULL;
+    AUTO_DECREF(qr);
+    PyObject* q = PyTuple_GET_ITEM(qr, 0);
+    PyObject* r = PyTuple_GET_ITEM(qr, 1);
+    PyObject* twice_r = PyNumber_Add(r, r);
+    if (twice_r == NULL)
+        return NULL;
+    AUTO_DECREF(twice_r);
+    int gt = PyObject_RichCompareBool(twice_r, pow, Py_GT);
+    int eq = PyObject_RichCompareBool(twice_r, pow, Py_EQ);
+    if (gt < 0 || eq < 0)
+        return NULL;
+    PyObject* q_final;
+    if (gt || (eq && PyObject_IsTrue(autoDecref(PyNumber_And(q, _PyLong_One)))))
+        q_final = PyNumber_Add(q, _PyLong_One);
+    else
+        q_final = incref(q);
+    if (q_final == NULL)
+        return NULL;
+    AUTO_DECREF(q_final);
+    return PyNumber_Multiply(q_final, pow);
+}
+
+static PyMethodDef int_methods[] = {
+    { "to_bytes", (PyCFunction)int_to_bytes, METH_VARARGS | METH_KEYWORDS, NULL },
+    { "from_bytes", (PyCFunction)int_from_bytes, METH_VARARGS | METH_KEYWORDS | METH_CLASS, NULL },
+    { "as_integer_ratio", int_as_integer_ratio, METH_NOARGS, NULL },
+    { "__ceil__", int_exact, METH_NOARGS, NULL },
+    { "__floor__", int_exact, METH_NOARGS, NULL },
+    { "__round__", int_round, METH_VARARGS, NULL },
+    { NULL, NULL, 0, NULL },
+};
+
+extern "C" {
+PyTypeObject* _PyLong_BigType = NULL;
+}
+
 void setupLong() {
+    _PyLong_Zero = boxInt(0);
+    PyGC_RegisterStaticConstant(_PyLong_Zero);
+    _PyLong_One = boxInt(1);
+    PyGC_RegisterStaticConstant(_PyLong_One);
+
     static PyNumberMethods long_as_number;
     long_cls->tp_as_number = &long_as_number;
 
@@ -1715,8 +2171,6 @@ void setupLong() {
     long_cls->giveAttr("__mul__", new BoxedFunction(BoxedCode::create((void*)longMul, UNKNOWN, 2, "long.__mul__")));
     long_cls->giveAttr("__rmul__", incref(long_cls->getattr(autoDecref(internStringMortal("__mul__")))));
 
-    long_cls->giveAttr("__div__", new BoxedFunction(BoxedCode::create((void*)longDiv, UNKNOWN, 2, "long.__div__")));
-    long_cls->giveAttr("__rdiv__", new BoxedFunction(BoxedCode::create((void*)longRdiv, UNKNOWN, 2, "long.__rdiv__")));
     long_cls->giveAttr("__floordiv__",
                        new BoxedFunction(BoxedCode::create((void*)longFloorDiv, UNKNOWN, 2, "long.__floordiv__")));
     long_cls->giveAttr("__rfloordiv__",
@@ -1756,31 +2210,23 @@ void setupLong() {
                        new BoxedFunction(BoxedCode::create((void*)longRShift, UNKNOWN, 2, "long.__rshift__")));
     long_cls->giveAttr("__rrshift__",
                        new BoxedFunction(BoxedCode::create((void*)longRRShift, UNKNOWN, 2, "long.__rrshift__")));
-    long_cls->giveAttr("__coerce__",
-                       new BoxedFunction(BoxedCode::create((void*)longCoerce, UNKNOWN, 2, "long.__coerce__")));
 
     long_cls->giveAttr("__int__", new BoxedFunction(BoxedCode::create((void*)longInt, UNKNOWN, 1, "long.__int__")));
     long_cls->giveAttr("__float__",
                        new BoxedFunction(BoxedCode::create((void*)longFloat, UNKNOWN, 1, "long.__float__")));
     long_cls->giveAttr("__repr__", new BoxedFunction(BoxedCode::create((void*)longRepr<CXX>, STR, 1, "long.__repr__")));
     long_cls->giveAttr("__str__", new BoxedFunction(BoxedCode::create((void*)longStr<CXX>, STR, 1, "long.__str__")));
-    long_cls->giveAttr("__format__",
-                       new BoxedFunction(BoxedCode::create((void*)longFormat, STR, 2, "long.__format__")));
-    long_cls->giveAttr("__bin__", new BoxedFunction(BoxedCode::create((void*)longBin, STR, 1, "long.__bin__")));
-    long_cls->giveAttr("__hex__", new BoxedFunction(BoxedCode::create((void*)longHex, STR, 1, "long.__hex__")));
-    long_cls->giveAttr("__oct__", new BoxedFunction(BoxedCode::create((void*)longOct, STR, 1, "long.__oct__")));
 
     long_cls->giveAttr("__abs__", new BoxedFunction(BoxedCode::create((void*)longAbs, UNKNOWN, 1, "long.__abs__")));
     long_cls->giveAttr("__invert__",
                        new BoxedFunction(BoxedCode::create((void*)longInvert, UNKNOWN, 1, "long.__invert__")));
     long_cls->giveAttr("__neg__", new BoxedFunction(BoxedCode::create((void*)longNeg, UNKNOWN, 1, "long.__neg__")));
     long_cls->giveAttr("__pos__", new BoxedFunction(BoxedCode::create((void*)longPos, UNKNOWN, 1, "long.__pos__")));
-    long_cls->giveAttr("__nonzero__",
-                       new BoxedFunction(BoxedCode::create((void*)longNonzero, BOXED_BOOL, 1, "long.__nonzero__")));
+    long_cls->giveAttr("__bool__",
+                       new BoxedFunction(BoxedCode::create((void*)longNonzero, BOXED_BOOL, 1, "int.__bool__")));
     long_cls->giveAttr("__hash__",
                        new BoxedFunction(BoxedCode::create((void*)longHash, BOXED_INT, 1, "long.__hash__")));
 
-    long_cls->giveAttr("__long__", new BoxedFunction(BoxedCode::create((void*)longLong, UNKNOWN, 1, "long.__long__")));
     long_cls->giveAttr("__trunc__",
                        new BoxedFunction(BoxedCode::create((void*)longTrunc, UNKNOWN, 1, "long.__trunc__")));
     long_cls->giveAttr("__index__", new BoxedFunction(BoxedCode::create((void*)longIndex, LONG, 1, "long.__index__")));
@@ -1808,6 +2254,9 @@ void setupLong() {
                                             "6"));
 
     add_operators(long_cls);
+    // These are shared by both of our int representations.
+    add_methods(int_cls, int_methods);
+
     long_cls->freeze();
 
     long_cls->tp_as_number->nb_power = long_pow;

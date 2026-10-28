@@ -1242,6 +1242,11 @@ Value ASTInterpreter::visit_makeClass(BST_MakeClass* node) {
     assert(bases_tuple->cls == tuple_cls);
     AUTO_DECREF(bases_tuple);
 
+    Box* kwargs = NULL;
+    if (node->vreg_kwargs != VREG_UNDEFINED)
+        kwargs = getVReg(node->vreg_kwargs).o;
+    AUTO_XDECREF(kwargs);
+
     std::vector<Box*> decorators;
     decorators.reserve(node->num_decorator);
     for (int i = 0; i < node->num_decorator; ++i) {
@@ -1266,12 +1271,11 @@ Value ASTInterpreter::visit_makeClass(BST_MakeClass* node) {
     Box* passed_globals = NULL;
     if (!getCode()->source->scoping.areGlobalsFromModule())
         passed_globals = frame_info.globals;
-    Box* attrDict = runtimeCall(autoDecref(createFunctionFromMetadata(code, closure, passed_globals, {})),
-                                ArgPassSpec(0), 0, 0, 0, 0, 0);
-    AUTO_DECREF(attrDict);
+    Box* body_func = createFunctionFromMetadata(code, closure, passed_globals, {});
+    AUTO_DECREF(body_func);
 
     InternedString name = getCodeConstants().getInternedString(node->index_name);
-    Box* classobj = createUserClass(name.getBox(), bases_tuple, attrDict);
+    Box* classobj = createUserClass(name.getBox(), bases_tuple, body_func, kwargs);
 
     for (int i = decorators.size() - 1; i >= 0; i--) {
         classobj = runtimeCall(autoDecref(decorators[i]), ArgPassSpec(1), autoDecref(classobj), 0, 0, 0, 0);
@@ -1361,8 +1365,23 @@ void ASTInterpreter::visit_deletename(BST_DeleteName* target) {
         if (jit)
             jit->emitDelName(id);
         ASTInterpreterJitInterface::delNameHelper(this, id);
+    } else if (vst == ScopeInfo::VarScopeType::DEREF) {
+        // The baseline JIT doesn't support deleting closure variables.
+        abortJITing();
+        DerefInfo deref_info = target->deref_info;
+        BoxedClosure* closure;
+        if (deref_info.num_parents_from_passed_closure == DerefInfo::FROM_CREATED_CLOSURE) {
+            closure = created_closure;
+        } else {
+            closure = getPassedClosure();
+            for (int i = 0; i < deref_info.num_parents_from_passed_closure; i++)
+                closure = closure->parent;
+        }
+        delClosureVar(closure, deref_info.offset, id.c_str(), true);
     } else {
-        assert(vst == ScopeInfo::VarScopeType::FAST);
+        assert(vst == ScopeInfo::VarScopeType::FAST || vst == ScopeInfo::VarScopeType::CLOSURE);
+        if (vst == ScopeInfo::VarScopeType::CLOSURE)
+            abortJITing();
 
         assert(getVRegInfo().getVReg(id) == target->vreg);
 
@@ -1381,6 +1400,9 @@ void ASTInterpreter::visit_deletename(BST_DeleteName* target) {
         frame_info.num_vregs = std::max(frame_info.num_vregs, target->vreg + 1);
         Py_DECREF(vregs[target->vreg]);
         vregs[target->vreg] = NULL;
+
+        if (vst == ScopeInfo::VarScopeType::CLOSURE)
+            delClosureVar(created_closure, target->closure_offset, id.c_str(), false);
     }
 }
 
@@ -1702,6 +1724,17 @@ void ASTInterpreter::visit_storename(BST_StoreName* node) {
         // TODO should probably pre-box the names when it's a scope that usesNameLookup
         AUTO_DECREF(value.o);
         setitem(frame_info.boxedLocals, name.getBox(), value.o);
+    } else if (vst == ScopeInfo::VarScopeType::DEREF) {
+        // A `nonlocal` variable.
+        // TODO: let the baseline JIT handle this
+        abortJITing();
+        BoxedClosure* closure = getPassedClosure();
+        assert(closure);
+        for (int i = 0; i < node->deref_info.num_parents_from_passed_closure; i++)
+            closure = closure->parent;
+        Box* prev = closure->elts[node->deref_info.offset];
+        closure->elts[node->deref_info.offset] = value.o;
+        Py_XDECREF(prev);
     } else {
         bool closure = vst == ScopeInfo::VarScopeType::CLOSURE;
         if (jit) {
@@ -1857,21 +1890,28 @@ void ASTInterpreterJitInterface::delNameHelper(void* _interpreter, InternedStrin
     } else if (boxed_locals->cls == attrwrapper_cls) {
         attrwrapperDel(boxed_locals, name);
     } else {
-        RELEASE_ASSERT(0, "%s", boxed_locals->cls->tp_name);
+        boxedLocalsDel(boxed_locals, name.getBox());
     }
 }
 
 Box* ASTInterpreterJitInterface::derefHelper(void* _interpreter, BST_LoadName* node) {
     ASTInterpreter* interpreter = (ASTInterpreter*)_interpreter;
     DerefInfo deref_info = interpreter->scope_info.getDerefInfo(node);
-    assert(interpreter->getPassedClosure());
-    BoxedClosure* closure = interpreter->getPassedClosure();
-    for (int i = 0; i < deref_info.num_parents_from_passed_closure; i++) {
-        closure = closure->parent;
+    BoxedClosure* closure;
+    if (deref_info.num_parents_from_passed_closure == DerefInfo::FROM_CREATED_CLOSURE) {
+        closure = interpreter->created_closure;
+    } else {
+        assert(interpreter->getPassedClosure());
+        closure = interpreter->getPassedClosure();
+        for (int i = 0; i < deref_info.num_parents_from_passed_closure; i++) {
+            closure = closure->parent;
+        }
     }
     Box* val = closure->elts[deref_info.offset];
     if (val == NULL) {
         InternedString id = interpreter->getCodeConstants().getInternedString(node->index_id);
+        if (deref_info.num_parents_from_passed_closure == DerefInfo::FROM_CREATED_CLOSURE)
+            raiseExcHelper(NameError, "local variable '%s' referenced before assignment", id.c_str());
         raiseExcHelper(NameError, "free variable '%s' referenced before assignment in enclosing scope", id.c_str());
     }
     Py_INCREF(val);
@@ -2025,7 +2065,10 @@ Box* astInterpretFunction(BoxedCode* code, Box* closure, Box* generator, Box* gl
     const ScopingResults& scope_info = code->source->scoping;
 
     if (unlikely(scope_info.usesNameLookup())) {
-        interpreter.setBoxedLocals(new BoxedDict());
+        if (source_info->ast_type == AST_TYPE::ClassDef)
+            interpreter.setBoxedLocals(createClassNamespace());
+        else
+            interpreter.setBoxedLocals(new BoxedDict());
     }
 
     assert((!globals) == code->source->scoping.areGlobalsFromModule());
@@ -2164,6 +2207,11 @@ extern "C" void printExprHelper(Box* obj) {
     if (!displayhook)
         raiseExcHelper(RuntimeError, "lost sys.displayhook");
     autoDecref(runtimeCall(displayhook, ArgPassSpec(1), obj, 0, 0, 0, 0));
+}
+
+// TODO: the print statement is gone in Python 3, but the BST still has a Print node.
+extern "C" void printHelper(Box* dest, Box* var, bool nl) {
+    RELEASE_ASSERT(0, "the print statement doesn't exist in Python 3");
 }
 
 static ASTInterpreter* getInterpreterFromFramePtr(void* frame_ptr) {

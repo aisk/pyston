@@ -40,7 +40,7 @@
 # don't want to bake the instrumentation into the resulting bitcode anyway.
 REMOVE_PROFILE_FLAGS()
 
-set(BC_INLINE_SRCS boxing.cpp dict.cpp link_forcer.cpp list.cpp tuple.cpp xrange.cpp)
+set(BC_INLINE_SRCS boxing.cpp dict.cpp link_forcer.cpp list.cpp tuple.cpp)
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
 

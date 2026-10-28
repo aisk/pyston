@@ -27,19 +27,11 @@
 #include "runtime/types.h"
 #include "runtime/util.h"
 
-extern "C" int float_coerce(PyObject** v, PyObject** w) noexcept;
-extern "C" int float_pow_unboxed(double iv, double iw, double* res) noexcept;
-extern "C" PyObject* float_as_integer_ratio(PyObject* v, PyObject* unused) noexcept;
+extern "C" int _PyFloat_Init(void) noexcept;
+extern "C" PyMethodDef* _PystonFloat_GetMethods(void) noexcept;
 extern "C" PyObject* float_divmod(PyObject* v, PyObject* w) noexcept;
-extern "C" PyObject* float__format__(PyObject* v) noexcept;
-extern "C" PyObject* float_fromhex(PyObject* cls, PyObject* arg) noexcept;
-extern "C" PyObject* float_getformat(PyTypeObject* v, PyObject* arg) noexcept;
-extern "C" PyObject* float_getnewargs(PyFloatObject* v) noexcept;
-extern "C" PyObject* float_hex(PyObject* v) noexcept;
-extern "C" PyObject* float_is_integer(PyObject* v) noexcept;
 extern "C" PyObject* float_pow(PyObject* v, PyObject* w, PyObject* z) noexcept;
 extern "C" PyObject* float_richcompare(PyObject* v, PyObject* w, int op) noexcept;
-extern "C" PyObject* float_setformat(PyTypeObject* v, PyObject* args) noexcept;
 extern "C" PyObject* float_str(PyObject* v) noexcept;
 
 namespace pyston {
@@ -70,8 +62,8 @@ PyFloatObject* BoxedFloat::fill_free_list(void) noexcept {
     p = &((PyFloatBlock*)p)->objects[0];
     q = p + N_FLOATOBJECTS;
     while (--q > p)
-        q->ob_type = (struct _typeobject*)(q - 1);
-    q->ob_type = NULL;
+        Py_TYPE(q) = (PyTypeObject*)(q - 1);
+    Py_TYPE(q) = NULL;
     return p + N_FLOATOBJECTS - 1;
 }
 
@@ -81,7 +73,7 @@ void BoxedFloat::tp_dealloc(Box* b) noexcept {
 #else
     if (likely(PyFloat_CheckExact(b))) {
         PyFloatObject* v = (PyFloatObject*)(b);
-        v->ob_type = (struct _typeobject*)free_list;
+        Py_TYPE(v) = (PyTypeObject*)free_list;
         free_list = v;
     } else {
         b->cls->tp_free(b);
@@ -111,7 +103,7 @@ extern "C" int PyFloat_ClearFreeList() noexcept {
             block_list = list;
             for (i = 0, p = &list->objects[0]; i < N_FLOATOBJECTS; i++, p++) {
                 if (!PyFloat_CheckExact((BoxedFloat*)p) || Py_REFCNT(p) == 0) {
-                    p->ob_type = (struct _typeobject*)BoxedFloat::free_list;
+                    Py_TYPE(p) = (PyTypeObject*)BoxedFloat::free_list;
                     BoxedFloat::free_list = p;
                 }
             }
@@ -576,14 +568,11 @@ Box* floatRPow(BoxedFloat* lhs, Box* rhs) {
     return res;
 }
 
-extern "C" double pow_float_float(double lhs, double rhs) {
-    double res;
-    int err = float_pow_unboxed(lhs, rhs, &res);
-    if (err) {
+Box* powFloatFloat(double lhs, double rhs) {
+    Box* r = float_pow(autoDecref(boxFloat(lhs)), autoDecref(boxFloat(rhs)), Py_None);
+    if (!r)
         throwCAPIException();
-    } else {
-        return res;
-    }
+    return r;
 }
 
 extern "C" Box* floatMulFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
@@ -702,8 +691,8 @@ Box* floatNonzero(BoxedFloat* self) {
 
 template <ExceptionStyle S> static BoxedFloat* _floatNew(Box* x) noexcept(S == CAPI) {
     Box* rtn;
-    if (PyString_CheckExact(x))
-        rtn = PyFloat_FromString(x, NULL);
+    if (PyUnicode_CheckExact(x))
+        rtn = PyFloat_FromString(x);
     else
         rtn = PyNumber_Float(x);
     if (!rtn && S == CXX)
@@ -765,7 +754,7 @@ PyObject* float_str_or_repr(double v, int precision, char format_code) {
     char* buf = PyOS_double_to_string(v, format_code, precision, Py_DTSF_ADD_DOT_0, NULL);
     if (!buf)
         return PyErr_NoMemory();
-    result = PyString_FromString(buf);
+    result = PyUnicode_FromString(buf);
     PyMem_Free(buf);
     return result;
 }
@@ -783,7 +772,7 @@ extern "C" Box* floatFloat(BoxedFloat* self) {
 template <ExceptionStyle S> Box* floatStr(BoxedFloat* self) noexcept(S == CAPI) {
     if (!PyFloat_Check(self))
         return setDescrTypeError<S>(self, "float", "__str__");
-    return callCAPIFromStyle<S>(float_str_or_repr, self->d, PyFloat_STR_PRECISION, 'g');
+    return callCAPIFromStyle<S>(float_str_or_repr, self->d, 0, 'r');
 }
 
 template <ExceptionStyle S> Box* floatRepr(BoxedFloat* self) noexcept(S == CAPI) {
@@ -813,7 +802,7 @@ Box* float_to_int(BoxedFloat* self) noexcept {
      */
     if ((double)LONG_MIN <= wholepart && wholepart < -(double)LONG_MIN) {
         const long aslong = (long)wholepart;
-        return PyInt_FromLong(aslong);
+        return PyLong_FromLong(aslong);
     }
     return PyLong_FromDouble(wholepart);
 }
@@ -833,31 +822,6 @@ Box* floatInt(BoxedFloat* self) {
     return float_to_int(self);
 }
 
-Box* floatLong(BoxedFloat* self) {
-    if (!PyFloat_Check(self))
-        raiseExcHelper(TypeError, "descriptor '__long__' requires a 'float' object but received a '%s'",
-                       getTypeName(self));
-
-    double x = PyFloat_AsDouble(self);
-    return PyLong_FromDouble(x);
-}
-
-Box* floatCoerce(BoxedFloat* _self, Box* other) {
-    if (!PyFloat_Check(_self))
-        raiseExcHelper(TypeError, "descriptor '__coerce__' requires a 'float' object but received a '%s'",
-                       getTypeName(_self));
-
-    Box* self = static_cast<Box*>(_self);
-    int result = float_coerce(&self, &other);
-    if (result == 0) {
-        AUTO_DECREF(self);
-        AUTO_DECREF(other);
-        return BoxedTuple::create({ self, other });
-    } else if (result == 1)
-        return incref(NotImplemented);
-    else
-        throwCAPIException();
-}
 
 Box* floatHash(BoxedFloat* self) {
     if (!PyFloat_Check(self))
@@ -914,50 +878,13 @@ static Box* float0(Box*, void*) noexcept {
     return boxFloat(0.0);
 }
 
-PyDoc_STRVAR(float_getformat_doc, "float.__getformat__(typestr) -> string\n"
-                                  "\n"
-                                  "You probably don't want to use this function.  It exists mainly to be\n"
-                                  "used in Python's test suite.\n"
-                                  "\n"
-                                  "typestr must be 'double' or 'float'.  This function returns whichever of\n"
-                                  "'unknown', 'IEEE, big-endian' or 'IEEE, little-endian' best describes the\n"
-                                  "format of floating point numbers used by the C type named by typestr.");
-
-PyDoc_STRVAR(float_setformat_doc, "float.__setformat__(typestr, fmt) -> None\n"
-                                  "\n"
-                                  "You probably don't want to use this function.  It exists mainly to be\n"
-                                  "used in Python's test suite.\n"
-                                  "\n"
-                                  "typestr must be 'double' or 'float'.  fmt must be one of 'unknown',\n"
-                                  "'IEEE, big-endian' or 'IEEE, little-endian', and in addition can only be\n"
-                                  "one of the latter two if it appears to match the underlying C reality.\n"
-                                  "\n"
-                                  "Override the automatic determination of C-level floating point type.\n"
-                                  "This affects how floats are converted to and from binary strings.");
-
-static PyMethodDef float_methods[]
-    = { { "hex", (PyCFunction)float_hex, METH_NOARGS, NULL },
-        { "fromhex", (PyCFunction)float_fromhex, METH_O | METH_CLASS, NULL },
-        { "as_integer_ratio", (PyCFunction)float_as_integer_ratio, METH_NOARGS, NULL },
-        { "__getformat__", (PyCFunction)float_getformat, METH_O | METH_CLASS, float_getformat_doc },
-        { "__setformat__", (PyCFunction)float_setformat, METH_VARARGS | METH_CLASS, float_setformat_doc },
-        { "is_integer", (PyCFunction)float_is_integer, METH_NOARGS, NULL },
-        { "__format__", (PyCFunction)float__format__, METH_VARARGS, NULL },
-        { NULL, NULL, 0, NULL } };
-
 void setupFloat() {
     static PyNumberMethods float_as_number;
     float_cls->tp_as_number = &float_as_number;
 
-    float_cls->giveAttr("__getnewargs__",
-                        new BoxedFunction(BoxedCode::create((void*)float_getnewargs, UNKNOWN, 1, "float.__getnewargs__",
-                                                            "", ParamNames::empty(), CAPI)));
-
     _addFunc("__add__", BOXED_FLOAT, (void*)floatAddFloat, (void*)floatAddInt, (void*)floatAdd);
     float_cls->giveAttrBorrowed("__radd__", float_cls->getattr(autoDecref(internStringMortal("__add__"))));
 
-    _addFunc("__div__", BOXED_FLOAT, (void*)floatDivFloat, (void*)floatDivInt, (void*)floatDiv);
-    _addFunc("__rdiv__", BOXED_FLOAT, (void*)floatRDivFloat, (void*)floatRDivInt, (void*)floatRDiv);
     _addFunc("__floordiv__", BOXED_FLOAT, (void*)floatFloorDivFloat, (void*)floatFloorDivInt, (void*)floatFloorDiv);
     float_cls->giveAttr("__rfloordiv__",
                         new BoxedFunction(BoxedCode::create((void*)floatRFloorDiv, UNKNOWN, 2, "float.__rfloordiv__")));
@@ -998,25 +925,19 @@ void setupFloat() {
     float_cls->giveAttr("__abs__",
                         new BoxedFunction(BoxedCode::create((void*)floatAbs, BOXED_FLOAT, 1, "float.__abs__")));
 
-    BoxedCode* nonzero = BoxedCode::create((void*)floatNonzeroUnboxed, BOOL, 1, "float.__nonzero__");
+    BoxedCode* nonzero = BoxedCode::create((void*)floatNonzeroUnboxed, BOOL, 1, "float.__bool__");
     nonzero->addVersion((void*)floatNonzero, UNKNOWN);
-    float_cls->giveAttr("__nonzero__", new BoxedFunction(nonzero));
+    float_cls->giveAttr("__bool__", new BoxedFunction(nonzero));
 
-    // float_cls->giveAttr("__nonzero__", new BoxedFunction(BoxedCode::create((void*)floatNonzero, NULL, 1,
-    // "float.__nonzero__")));
     float_cls->giveAttr("__float__",
                         new BoxedFunction(BoxedCode::create((void*)floatFloat, BOXED_FLOAT, 1, "float.__float__")));
     float_cls->giveAttr("__str__", new BoxedFunction(BoxedCode::create((void*)floatStr<CXX>, STR, 1, "float.__str__")));
     float_cls->giveAttr("__repr__",
                         new BoxedFunction(BoxedCode::create((void*)floatRepr<CXX>, STR, 1, "float.__repr__")));
-    float_cls->giveAttr("__coerce__",
-                        new BoxedFunction(BoxedCode::create((void*)floatCoerce, UNKNOWN, 2, "float.__coerce__")));
 
     float_cls->giveAttr("__trunc__",
                         new BoxedFunction(BoxedCode::create((void*)floatTrunc, UNKNOWN, 1, "float.__trunc__")));
     float_cls->giveAttr("__int__", new BoxedFunction(BoxedCode::create((void*)floatInt, UNKNOWN, 1, "float.__int__")));
-    float_cls->giveAttr("__long__",
-                        new BoxedFunction(BoxedCode::create((void*)floatLong, UNKNOWN, 1, "float.__long__")));
     float_cls->giveAttr("__hash__",
                         new BoxedFunction(BoxedCode::create((void*)floatHash, BOXED_INT, 1, "float.__hash__")));
 
@@ -1030,7 +951,8 @@ void setupFloat() {
                                              "\n"
                                              "Convert a string or number to a floating point number, if possible."));
 
-    add_methods(float_cls, float_methods);
+    // The rest of float's methods come from Objects/floatobject.c.
+    add_methods(float_cls, _PystonFloat_GetMethods());
 
     add_operators(float_cls);
     float_cls->freeze();

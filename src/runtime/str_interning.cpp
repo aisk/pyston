@@ -56,11 +56,8 @@ namespace pyston {
 static llvm::DenseSet<BoxedString*> interned_strings;
 
 static StatCounter num_interned_strings("num_interned_string");
-extern "C" PyObject* PyString_InternFromString(const char* s) noexcept {
-    RELEASE_ASSERT(s, "");
-    return internStringImmortal(s);
-}
 
+// Pyston's interning table replaces the one in unicodeobject.c.  Interned strings are immortal.
 BoxedString* internStringImmortal(llvm::StringRef s) noexcept {
     auto it = interned_strings.find_as(s);
     if (it != interned_strings.end())
@@ -69,23 +66,23 @@ BoxedString* internStringImmortal(llvm::StringRef s) noexcept {
     num_interned_strings.log();
     BoxedString* entry = boxString(s);
     // CPython returns mortal but in our current implementation they are inmortal
-    entry->interned_state = SSTATE_INTERNED_IMMORTAL;
+    entry->state.interned = SSTATE_INTERNED_IMMORTAL;
     interned_strings.insert((BoxedString*)entry);
 
     Py_INCREF(entry);
     return entry;
 }
 
-extern "C" void PyString_InternInPlace(PyObject** p) noexcept {
+extern "C" void PyUnicode_InternInPlace(PyObject** p) noexcept {
     BoxedString* s = (BoxedString*)*p;
-    if (s == NULL || !PyString_Check(s))
-        Py_FatalError("PyString_InternInPlace: strings only please!");
+    if (s == NULL || !PyUnicode_Check(s))
+        Py_FatalError("PyUnicode_InternInPlace: strings only please!");
     /* If it's a string subclass, we don't really know what putting
        it in the interned dict might do. */
-    if (!PyString_CheckExact(s))
+    if (!PyUnicode_CheckExact(s))
         return;
 
-    if (PyString_CHECK_INTERNED(s))
+    if (PyUnicode_CHECK_INTERNED(s))
         return;
 
     auto it = interned_strings.find(s);
@@ -102,8 +99,17 @@ extern "C" void PyString_InternInPlace(PyObject** p) noexcept {
         Py_INCREF(s);
 
         // CPython returns mortal but in our current implementation they are inmortal
-        s->interned_state = SSTATE_INTERNED_IMMORTAL;
+        s->state.interned = SSTATE_INTERNED_IMMORTAL;
     }
+}
+
+extern "C" void PyUnicode_InternImmortal(PyObject** p) noexcept {
+    PyUnicode_InternInPlace(p);
+}
+
+extern "C" PyObject* PyUnicode_InternFromString(const char* s) noexcept {
+    RELEASE_ASSERT(s, "");
+    return internStringImmortal(s);
 }
 
 extern "C" void _Py_ReleaseInternedStrings() noexcept {

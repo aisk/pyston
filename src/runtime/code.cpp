@@ -22,7 +22,6 @@
 namespace pyston {
 
 extern "C" {
-BoxedClass* code_cls;
 }
 
 #if 0
@@ -66,7 +65,18 @@ Box* BoxedCode::co_firstlineno(Box* b, void*) noexcept {
 
 Box* BoxedCode::argcount(Box* b, void*) noexcept {
     RELEASE_ASSERT(b->cls == code_cls, "");
-    return boxInt(static_cast<BoxedCode*>(b)->num_args);
+    BoxedCode* code = static_cast<BoxedCode*>(b);
+    return boxInt(code->num_args - code->num_kwonly);
+}
+
+static Box* posonlyargcount(Box* b, void*) noexcept {
+    RELEASE_ASSERT(b->cls == code_cls, "");
+    return boxInt(static_cast<BoxedCode*>(b)->param_names.num_posonly);
+}
+
+static Box* kwonlyargcount(Box* b, void*) noexcept {
+    RELEASE_ASSERT(b->cls == code_cls, "");
+    return boxInt(static_cast<BoxedCode*>(b)->num_kwonly);
 }
 
 Box* BoxedCode::varnames(Box* b, void*) noexcept {
@@ -106,6 +116,7 @@ void BoxedCode::dealloc(Box* b) noexcept {
 
     Py_XDECREF(o->filename);
     Py_XDECREF(o->name);
+    Py_XDECREF(o->qualname);
     Py_XDECREF(o->_doc);
 
     o->tryDeallocatingTheBJitCode();
@@ -169,13 +180,13 @@ BoxedCode::BoxedCode(BoxedString* filename, BoxedString* name, int firstline)
     Py_XINCREF(name);
 }
 
-extern "C" PyCodeObject* PyCode_New(int argcount, int nlocals, int stacksize, int flags, PyObject* code,
+extern "C" PyCodeObject* PyCode_New(int argcount, int kwonlyargcount, int nlocals, int stacksize, int flags, PyObject* code,
                                     PyObject* consts, PyObject* names, PyObject* varnames, PyObject* freevars,
                                     PyObject* cellvars, PyObject* filename, PyObject* name, int firstlineno,
                                     PyObject* lnotab) noexcept {
     // Check if this is a dummy code object like PyCode_NewEmpty generates.
     // Because we currently support dummy ones only.
-    bool is_dummy = argcount == 0 && nlocals == 0 && stacksize == 0 && flags == 0;
+    bool is_dummy = argcount == 0 && kwonlyargcount == 0 && nlocals == 0 && stacksize == 0 && flags == 0;
     is_dummy = is_dummy && code == EmptyString && lnotab == EmptyString;
     for (auto&& var : { consts, names, varnames, freevars, cellvars })
         is_dummy = is_dummy && var == EmptyTuple;
@@ -184,8 +195,8 @@ extern "C" PyCodeObject* PyCode_New(int argcount, int nlocals, int stacksize, in
     auto temp_allowed = argcount || argcount || flags || varnames != EmptyTuple;
     RELEASE_ASSERT(is_dummy || temp_allowed, "not implemented");
 
-    RELEASE_ASSERT(PyString_Check(filename), "");
-    RELEASE_ASSERT(PyString_Check(name), "");
+    RELEASE_ASSERT(PyUnicode_Check(filename), "");
+    RELEASE_ASSERT(PyUnicode_Check(name), "");
 
     return (PyCodeObject*)new BoxedCode(static_cast<BoxedString*>(filename), static_cast<BoxedString*>(name),
                                         firstlineno);
@@ -198,7 +209,7 @@ extern "C" PyCodeObject* PyCode_NewEmpty(const char* filename, const char* funcn
     PyObject* funcname_ob = NULL;
     PyCodeObject* result = NULL;
     if (emptystring == NULL) {
-        emptystring = PyGC_RegisterStaticConstant(PyString_FromString(""));
+        emptystring = PyGC_RegisterStaticConstant(PyUnicode_FromString(""));
         if (emptystring == NULL)
             goto failed;
     }
@@ -207,14 +218,15 @@ extern "C" PyCodeObject* PyCode_NewEmpty(const char* filename, const char* funcn
         if (nulltuple == NULL)
             goto failed;
     }
-    funcname_ob = PyString_FromString(funcname);
+    funcname_ob = PyUnicode_FromString(funcname);
     if (funcname_ob == NULL)
         goto failed;
-    filename_ob = PyString_FromString(filename);
+    filename_ob = PyUnicode_FromString(filename);
     if (filename_ob == NULL)
         goto failed;
 
     result = PyCode_New(0,           /* argcount */
+                        0,           /* kwonlyargcount */
                         0,           /* nlocals */
                         0,           /* stacksize */
                         0,           /* flags */
@@ -263,6 +275,8 @@ void setupCode() {
     code_cls->giveAttrDescriptor("co_filename", BoxedCode::co_filename, NULL);
     code_cls->giveAttrDescriptor("co_firstlineno", BoxedCode::co_firstlineno, NULL);
     code_cls->giveAttrDescriptor("co_argcount", BoxedCode::argcount, NULL);
+    code_cls->giveAttrDescriptor("co_posonlyargcount", posonlyargcount, NULL);
+    code_cls->giveAttrDescriptor("co_kwonlyargcount", kwonlyargcount, NULL);
     code_cls->giveAttrDescriptor("co_varnames", BoxedCode::varnames, NULL);
     code_cls->giveAttrDescriptor("co_flags", BoxedCode::flags, NULL);
 

@@ -27,8 +27,6 @@
 #include "runtime/types.h"
 #include "runtime/util.h"
 
-extern "C" PyObject* calliter_next(calliterobject* it);
-
 namespace pyston {
 
 BoxedClass* seqiter_cls;
@@ -51,12 +49,7 @@ static llvm_compat_bool seqiterHasnextUnboxed(Box* s) {
         if (self->idx >= self->len)
             return false;
         assert(!self->next);
-        if (self->b->cls == str_cls)
-            self->next = incref(characters[static_cast<BoxedString*>(self->b)->s()[self->idx] & UCHAR_MAX]);
-        else if (self->b->cls == unicode_cls)
-            self->next = PyUnicode_FromUnicode(&reinterpret_cast<PyUnicodeObject*>(self->b)->str[self->idx], 1);
-        else
-            self->next = PySequence_GetItem(self->b, self->idx);
+        self->next = PySequence_GetItem(self->b, self->idx);
         assert(self->next);
         self->idx++;
         return true;
@@ -193,24 +186,12 @@ extern "C" PyObject* PySeqIter_New(PyObject* seq) noexcept {
     }
 }
 
-llvm_compat_bool calliterHasnextUnboxed(Box* b) {
-    calliterobject* it = (calliterobject*)b;
-    if (!it->it_nextvalue) {
-        it->it_nextvalue = calliter_next(it);
-        if (PyErr_Occurred()) {
-            throwCAPIException();
-        }
-    }
-    return it->it_nextvalue != NULL;
-}
-
-
 void setupIter() {
     seqiter_cls = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(BoxedSeqIter), false, "iterator", false,
                                      (destructor)BoxedSeqIter::dealloc, NULL, true,
                                      (traverseproc)BoxedSeqIter::traverse, NOCLEAR);
 
-    seqiter_cls->giveAttr("next", new BoxedFunction(BoxedCode::create((void*)seqiterNext, UNKNOWN, 1, "seqiter.next")));
+    seqiter_cls->giveAttr("__next__", new BoxedFunction(BoxedCode::create((void*)seqiterNext, UNKNOWN, 1, "seqiter.next")));
     BoxedCode* hasnext = BoxedCode::create((void*)seqiterHasnextUnboxed, BOOL, 1, "seqiter.__hasnext__");
     hasnext->addVersion((void*)seqiterHasnext, BOXED_BOOL);
     seqiter_cls->giveAttr("__hasnext__", new BoxedFunction(hasnext));
@@ -226,7 +207,7 @@ void setupIter() {
                                         (destructor)BoxedSeqIter::dealloc, NULL, true,
                                         (traverseproc)BoxedSeqIter::traverse, NOCLEAR);
 
-    seqreviter_cls->giveAttr("next",
+    seqreviter_cls->giveAttr("__next__",
                              new BoxedFunction(BoxedCode::create((void*)seqiterNext, UNKNOWN, 1, "seqreviter.next")));
     seqreviter_cls->giveAttr("__hasnext__", new BoxedFunction(BoxedCode::create((void*)seqreviterHasnext, BOXED_BOOL, 1,
                                                                                 "seqreviter.__hasnext__")));
@@ -242,7 +223,7 @@ void setupIter() {
                                          (traverseproc)BoxedIterWrapper::traverse, NOCLEAR);
 
     iterwrapper_cls->giveAttr(
-        "next", new BoxedFunction(BoxedCode::create((void*)iterwrapperNext, UNKNOWN, 1, "iterwrapper.next")));
+        "__next__", new BoxedFunction(BoxedCode::create((void*)iterwrapperNext, UNKNOWN, 1, "iterwrapper.next")));
     iterwrapper_cls->giveAttr("__hasnext__", new BoxedFunction(BoxedCode::create((void*)iterwrapperHasnext, BOXED_BOOL,
                                                                                  1, "iterwrapper.__hasnext__")));
 

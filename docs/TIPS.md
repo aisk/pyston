@@ -175,7 +175,7 @@ Pyston's JIT and unwinder make assumptions about the code the C++ compiler gener
 - Generated code passed the result of a `setcc` to a C++ function taking `bool` without zero-extending it, but clang assumes `bool` arguments are extended to 32 bits.
 - The custom unwinder doesn't support `DW_CFA_GNU_args_size`; see [unwinding](UNWINDING.md).
 
-Running with `-I` (interpreter only) or `-n` (always use the LLVM tier) helps narrow down whether the JIT is involved. Also note that debug builds against a recent libstdc++ enable `_GLIBCXX_ASSERTIONS`, which catches out-of-bounds container accesses that release builds silently get away with.
+Running with `-Y` (interpreter only) or `-n` (always use the LLVM tier) helps narrow down whether the JIT is involved. Also note that debug builds against a recent libstdc++ enable `_GLIBCXX_ASSERTIONS`, which catches out-of-bounds container accesses that release builds silently get away with.
 
 ##### Problem: JIT'd code crashes with a corrupted local
 

@@ -44,7 +44,8 @@ void raiseSyntaxError(const char* msg, int lineno, int col_offset, llvm::StringR
         }
         AUTO_DECREF(loc);
 
-        auto args = BoxedTuple::create({ autoDecref(boxString(file)), autoDecref(boxInt(lineno)), Py_None, loc });
+        auto args = BoxedTuple::create(
+            { autoDecref(boxString(file)), autoDecref(boxInt(lineno)), autoDecref(boxInt(col_offset + 1)), loc });
         AUTO_DECREF(args);
         Box* exc = runtimeCall(SyntaxError, ArgPassSpec(2), autoDecref(boxString(msg)), args, NULL, NULL, NULL);
         assert(!PyErr_Occurred());
@@ -99,8 +100,7 @@ ExcInfo excInfoForRaise(STOLEN(Box*) type, STOLEN(Box*) value, STOLEN(Box*) tb) 
     // TODO switch this to PyErr_Normalize
 
     if (tb == Py_None) {
-        Py_DECREF(tb);
-        tb = NULL;
+        Py_CLEAR(tb);
     } else if (tb != NULL && !PyTraceBack_Check(tb)) {
         Py_DECREF(type);
         Py_DECREF(value);
@@ -108,14 +108,6 @@ ExcInfo excInfoForRaise(STOLEN(Box*) type, STOLEN(Box*) value, STOLEN(Box*) tb) 
         raiseExcHelper(TypeError, "raise: arg 3 must be a traceback or None");
     }
 
-
-    /* Next, repeatedly, replace a tuple exception with its first item */
-    while (PyTuple_Check(type) && PyTuple_Size(type) > 0) {
-        PyObject* tmp = type;
-        type = PyTuple_GET_ITEM(type, 0);
-        Py_INCREF(type);
-        Py_DECREF(tmp);
-    }
 
     if (PyExceptionClass_Check(type)) {
         PyErr_NormalizeException(&type, &value, &tb);
@@ -148,14 +140,140 @@ ExcInfo excInfoForRaise(STOLEN(Box*) type, STOLEN(Box*) value, STOLEN(Box*) tb) 
         Py_XDECREF(tb);
         /* Not something you can raise.  You get an exception
            anyway, just not what you specified :-) */
-        raiseExcHelper(TypeError, "exceptions must be old-style classes or "
-                                  "derived from BaseException, not %s",
-                       type->cls->tp_name);
+        raiseExcHelper(TypeError, "exceptions must derive from BaseException");
     }
 
     assert(PyExceptionClass_Check(type));
 
     return ExcInfo(type, value, tb);
+}
+
+// Sets value.__context__ to the exception currently being handled, like CPython's _PyErr_SetObject.
+void chainExceptionContext(Box* value) {
+    if (!cur_thread_state.frame_info || !value || !PyExceptionInstance_Check(value))
+        return;
+    Box* handled = getFrameExcInfo()->value;
+    if (!handled || handled == Py_None || handled == value || !PyExceptionInstance_Check(handled))
+        return;
+
+    // Avoid creating a cycle in the context chain.
+    Box* o = handled;
+    Box* context;
+    while ((context = PyException_GetContext(o))) {
+        Py_DECREF(context);
+        if (context == value) {
+            PyException_SetContext(o, NULL);
+            break;
+        }
+        o = context;
+    }
+    Py_INCREF(handled);
+    PyException_SetContext(value, handled);
+}
+
+// Implements 'raise exc from cause': returns the exception instance with its __cause__ set.
+static Box* raiseFrom(Box* exc, Box* cause) {
+    Box* value;
+    if (PyExceptionClass_Check(exc)) {
+        value = runtimeCall(exc, ArgPassSpec(0), NULL, NULL, NULL, NULL, NULL);
+        if (!PyExceptionInstance_Check(value)) {
+            AUTO_DECREF(value);
+            raiseExcHelper(TypeError, "calling %s should have returned an instance of BaseException, not %s",
+                           ((PyTypeObject*)exc)->tp_name, Py_TYPE(value)->tp_name);
+        }
+    } else if (PyExceptionInstance_Check(exc)) {
+        value = incref(exc);
+    } else {
+        raiseExcHelper(TypeError, "exceptions must derive from BaseException");
+    }
+    AUTO_DECREF(value);
+
+    Box* fixed_cause;
+    if (PyExceptionClass_Check(cause)) {
+        fixed_cause = runtimeCall(cause, ArgPassSpec(0), NULL, NULL, NULL, NULL, NULL);
+        if (!PyExceptionInstance_Check(fixed_cause)) {
+            AUTO_DECREF(fixed_cause);
+            raiseExcHelper(TypeError, "calling %s should have returned an instance of BaseException, not %s",
+                           ((PyTypeObject*)cause)->tp_name, Py_TYPE(fixed_cause)->tp_name);
+        }
+    } else if (PyExceptionInstance_Check(cause)) {
+        fixed_cause = incref(cause);
+    } else if (cause == Py_None) {
+        fixed_cause = NULL;
+    } else {
+        raiseExcHelper(TypeError, "exception causes must derive from BaseException");
+    }
+    // PyException_SetCause steals the cause and sets __suppress_context__.
+    PyException_SetCause(value, fixed_cause);
+    return incref(value);
+}
+
+// The CFG saves the exception being handled with this before a try statement and puts it back with
+// restoreExcInfo when a handler is done. NotImplemented, which is never an exception value, means the
+// frame had no state of its own and inherits it from its caller.
+static Box* getExcValue() {
+    FrameInfo* frame_info = (FrameInfo*)cur_thread_state.frame_info;
+    if (!frame_info->exc.type)
+        return incref(Py_NotImplemented);
+    return incref(frame_info->exc.value);
+}
+
+static Box* restoreExcInfo(Box* value) {
+    FrameInfo* frame_info = (FrameInfo*)cur_thread_state.frame_info;
+    if (value == Py_NotImplemented)
+        setFrameExcInfo(frame_info, NULL, NULL, NULL);
+    else if (value == Py_None)
+        setFrameExcInfo(frame_info, incref(Py_None), incref(Py_None), NULL);
+    else
+        setFrameExcInfo(frame_info, incref(Py_TYPE(value)), incref(value), PyException_GetTraceback(value));
+    Py_RETURN_NONE;
+}
+
+// CPython's SETUP_ANNOTATIONS: a module or class body with annotations gets an __annotations__ dict,
+// unless its namespace already has one.
+static Box* setupAnnotations() {
+    static BoxedString* annotations_str = getStaticString("__annotations__");
+    FrameInfo* frame_info = (FrameInfo*)cur_thread_state.frame_info;
+    Box* ns = frame_info->boxedLocals;
+    if (!ns) {
+        ns = frame_info->globals;
+        if (PyModule_Check(ns))
+            ns = ns->getAttrWrapper();
+    }
+    if (PyDict_CheckExact(ns)) {
+        if (PyDict_GetItem(ns, annotations_str))
+            Py_RETURN_NONE;
+    } else {
+        Box* v = PyObject_GetItem(ns, annotations_str);
+        if (v) {
+            Py_DECREF(v);
+            Py_RETURN_NONE;
+        }
+        if (!PyErr_ExceptionMatches(PyExc_KeyError))
+            throwCAPIException();
+        PyErr_Clear();
+    }
+    Box* d = PyDict_New();
+    AUTO_DECREF(d);
+    if (PyObject_SetItem(ns, annotations_str, d) < 0)
+        throwCAPIException();
+    Py_RETURN_NONE;
+}
+
+Box* raise_from_func, *get_exc_value_func, *restore_exc_info_func, *setup_annotations_func;
+
+void setupRaiseFrom() {
+    raise_from_func = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)raiseFrom, UNKNOWN, 2, "raise_from"));
+    PyGC_RegisterStaticConstant(raise_from_func);
+    get_exc_value_func
+        = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)getExcValue, UNKNOWN, 0, "get_exc_value"));
+    PyGC_RegisterStaticConstant(get_exc_value_func);
+    restore_exc_info_func
+        = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)restoreExcInfo, NONE, 1, "restore_exc_info"));
+    PyGC_RegisterStaticConstant(restore_exc_info_func);
+    setup_annotations_func
+        = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)setupAnnotations, NONE, 0, "setup_annotations"));
+    PyGC_RegisterStaticConstant(setup_annotations_func);
 }
 
 extern "C" void raise0(ExcInfo* frame_exc_info) {
@@ -164,7 +282,7 @@ extern "C" void raise0(ExcInfo* frame_exc_info) {
 
     // TODO need to clean up when we call normalize, do_raise, etc
     if (frame_exc_info->type == Py_None)
-        raiseExcHelper(TypeError, "exceptions must be old-style classes or derived from BaseException, not NoneType");
+        raiseExcHelper(RuntimeError, "No active exception to reraise");
 
     startReraise();
     assert(!PyErr_Occurred());
@@ -181,7 +299,7 @@ extern "C" void raise0_capi(ExcInfo* frame_exc_info) noexcept {
 
     // TODO need to clean up when we call normalize, do_raise, etc
     if (frame_exc_info->type == Py_None) {
-        PyErr_SetString(TypeError, "exceptions must be old-style classes or derived from BaseException, not NoneType");
+        PyErr_SetString(RuntimeError, "No active exception to reraise");
         return;
     }
 
@@ -199,8 +317,14 @@ extern "C" void raise3(STOLEN(Box*) arg0, STOLEN(Box*) arg1, STOLEN(Box*) arg2) 
     bool reraise = arg2 != NULL && arg2 != Py_None;
     auto exc_info = excInfoForRaise(arg0, arg1, arg2);
 
-    if (reraise)
+    if (reraise) {
         startReraise();
+    } else {
+        chainExceptionContext(exc_info.value);
+        // Raising an instance continues the traceback it already has.
+        if (!exc_info.traceback)
+            exc_info.traceback = PyException_GetTraceback(exc_info.value);
+    }
 
     if (PyErr_Occurred())
         PyErr_Clear();
@@ -215,10 +339,16 @@ extern "C" void raise3_capi(STOLEN(Box*) arg0, STOLEN(Box*) arg1, STOLEN(Box*) a
         exc_info = excInfoForRaise(arg0, arg1, arg2);
     } catch (ExcInfo e) {
         exc_info = e;
+        reraise = false;
     }
 
-    if (reraise)
+    if (reraise) {
         startReraise();
+    } else {
+        chainExceptionContext(exc_info.value);
+        if (!exc_info.traceback)
+            exc_info.traceback = PyException_GetTraceback(exc_info.value);
+    }
 
     PyErr_Restore(exc_info.type, exc_info.value, exc_info.traceback);
 }
@@ -274,6 +404,17 @@ void logException(ExcInfo* exc_info) {
 
 extern "C" void caughtCapiException() {
     PyThreadState* tstate = PyThreadState_GET();
+    // An exception raised by C code reaches its first Python frame without a traceback.
+    if (tstate->curexc_type && !tstate->curexc_traceback && !getIsReraiseFlag() && cur_thread_state.frame_info) {
+        Box* handled = getFrameExcInfo()->value;
+        if (handled && handled != Py_None) {
+            Box* type, *value, *tb;
+            PyErr_Fetch(&type, &value, &tb);
+            PyErr_NormalizeException(&type, &value, &tb);
+            chainExceptionContext(value);
+            PyErr_Restore(type, value, tb);
+        }
+    }
     exceptionAtLine(&tstate->curexc_traceback);
 }
 
@@ -296,6 +437,8 @@ void caughtCxxException(ExcInfo* exc_info) {
     static StatCounter frames_unwound("num_frames_unwound_python");
     frames_unwound.log();
 
+    if (!exc_info->traceback && !getIsReraiseFlag())
+        chainExceptionContext(exc_info->value);
     exceptionAtLine(&exc_info->traceback);
 }
 

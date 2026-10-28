@@ -52,8 +52,6 @@ Box* longPow(BoxedLong* lhs, Box* rhs, Box* mod = Py_None);
 Box* longLShiftLong(BoxedLong* lhs, Box* _rhs);
 Box* longRShiftLong(BoxedLong* lhs, Box* _rhs);
 
-Box* longHex(BoxedLong* v);
-Box* longOct(BoxedLong* v);
 Box* longStr(BoxedLong* v);
 Box* longInt(Box* v);
 

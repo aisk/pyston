@@ -40,6 +40,9 @@ void commonClassSetup(BoxedClass* cls);
 // We could probably unify things more but that's for later.
 PyTypeObject* best_base(PyObject* bases) noexcept;
 PyObject* mro_external(PyObject* self) noexcept;
+// Like CPython's _PyObject_LookupSpecial, but takes the name as a C string and caches the
+// interned name object in *attrobj.
+PyObject* _PyObject_LookupSpecial(PyObject* self, const char* attrstr, PyObject** attrobj) noexcept;
 int type_set_bases(PyTypeObject* type, PyObject* value, void* context) noexcept;
 
 PyObject* slot_tp_richcompare(PyObject* self, PyObject* other, int op) noexcept;

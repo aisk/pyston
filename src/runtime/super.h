@@ -20,7 +20,6 @@ namespace pyston {
 void setupSuper();
 
 class BoxedClass;
-extern BoxedClass* super_cls;
 }
 
 #endif

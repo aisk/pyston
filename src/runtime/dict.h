@@ -25,6 +25,8 @@ public:
     BoxedDict* d;
     BoxedDict::DictMap::iterator it;
     const BoxedDict::DictMap::iterator itEnd;
+    // The dict's size when iteration started, or -1 once a size change has been reported.
+    Py_ssize_t size;
 
     BoxedDictIterator(BoxedDict* d);
 

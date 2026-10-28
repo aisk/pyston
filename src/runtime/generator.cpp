@@ -105,9 +105,22 @@ void generatorEntry(BoxedGenerator* g) noexcept {
             auto r = callCLFunc<ExceptionStyle::CAPI, NOT_REWRITABLE>(func->code, nullptr,
                                                                       func->code->numReceivedArgs(), func->closure, g,
                                                                       func->globals, g->arg1, g->arg2, g->arg3, args);
-            if (r)
+            if (r && r != Py_None) {
+                // `return value` in a generator raises StopIteration(value)
+                PyObject* exc = PyObject_CallFunctionObjArgs(StopIteration, r, NULL);
                 Py_DECREF(r);
-            else {
+                if (exc)
+                    g->exception = ExcInfo(incref(StopIteration), exc, NULL);
+                else
+                    r = NULL;
+            } else if (r) {
+                Py_DECREF(r);
+            }
+
+            if (!r) {
+                // PEP 479: a StopIteration escaping the body becomes a RuntimeError
+                if (PyErr_ExceptionMatches(StopIteration))
+                    _PyErr_FormatFromCause(RuntimeError, "generator raised StopIteration");
                 // unhandled exception: propagate the exception to the caller
                 PyErr_Fetch(&g->exception.type, &g->exception.value, &g->exception.traceback);
                 PyErr_Clear();
@@ -331,9 +344,10 @@ template <ExceptionStyle S> static Box* generatorNext(Box* s) noexcept(S == CAPI
     if (self->iterated_from__hasnext__) {
         self->iterated_from__hasnext__ = false;
         Box* rtn = self->returnValue;
-        assert(rtn);
         self->returnValue = NULL;
-        return rtn;
+        // No value means __hasnext__ found the generator exhausted, and sending to it raises StopIteration.
+        if (rtn)
+            return rtn;
     }
 
     return generatorSend<S>(s, Py_None);
@@ -628,7 +642,7 @@ static void generator_del(PyObject* self) noexcept {
         _Py_NewReference(self);
         self->ob_refcnt = refcnt;
     }
-    assert(PyType_IS_GC(self->cls) && _Py_AS_GC(self)->gc.gc_refs != _PyGC_REFS_UNTRACKED);
+    assert(PyType_IS_GC(self->cls) && _PyObject_GC_IS_TRACKED(self));
 
     /* If Py_REF_DEBUG, _Py_NewReference bumped _Py_RefTotal, so
      * we need to undo that. */
@@ -729,8 +743,58 @@ static int generator_traverse(BoxedGenerator* self, visitproc visit, void* arg) 
     return 0;
 }
 
+// Helpers for `yield from`, which the CFG lowers into a loop around yieldFromStep.
+static Box* yieldFromIter(Box* o) {
+    Box* r = PyObject_GetIter(o);
+    if (!r)
+        throwCAPIException();
+    return r;
+}
+
+// Advances the subiterator, sending it `sent` unless that's None.  Returns (False, yielded value)
+// or, once the subiterator is exhausted, (True, its return value).
+// TODO: exceptions thrown into the outer generator, and closing it, are not passed on to the
+// subiterator yet.
+static Box* yieldFromStep(Box* it, Box* sent) {
+    Box* r;
+    if (sent == Py_None) {
+        if (!PyIter_Check(it))
+            raiseExcHelper(TypeError, "'%s' object is not an iterator", getTypeName(it));
+        r = Py_TYPE(it)->tp_iternext(it);
+    } else {
+        r = PyObject_CallMethod(it, "send", "O", sent);
+    }
+    if (r) {
+        Box* rtn = BoxedTuple::create({ Py_False, r });
+        Py_DECREF(r);
+        return rtn;
+    }
+
+    if (PyErr_Occurred() && !PyErr_ExceptionMatches(StopIteration))
+        throwCAPIException();
+
+    Box* value = Py_None;
+    Box* type, *val, *tb;
+    PyErr_Fetch(&type, &val, &tb);
+    AUTO_XDECREF(type);
+    AUTO_XDECREF(tb);
+    if (val) {
+        AUTO_DECREF(val);
+        if (PyObject_TypeCheck(val, (PyTypeObject*)StopIteration))
+            value = ((PyStopIterationObject*)val)->value;
+        else if (PyTuple_Check(val) && PyTuple_GET_SIZE(val))
+            value = PyTuple_GET_ITEM(val, 0);
+        else if (!PyTuple_Check(val))
+            value = val;
+        return BoxedTuple::create({ Py_True, value });
+    }
+    return BoxedTuple::create({ Py_True, value });
+}
+
+Box* yield_from_iter_func, *yield_from_step_func;
+
 void setupGenerator() {
-    generator_cls = BoxedClass::create(type_cls, object_cls, 0, offsetof(BoxedGenerator, weakreflist),
+    BoxedClass::createStatic(generator_cls, type_cls, object_cls, 0, offsetof(BoxedGenerator, weakreflist),
                                        sizeof(BoxedGenerator), false, "generator", false, (destructor)generator_dealloc,
                                        NULL, true, (traverseproc)generator_traverse, NOCLEAR);
     generator_cls->giveAttr("__iter__",
@@ -744,7 +808,7 @@ void setupGenerator() {
     auto generator_next
         = BoxedCode::create((void*)generatorNext<CXX>, UNKNOWN, 1, "generatro.next", "", ParamNames::empty(), CXX);
     generator_next->addVersion((void*)generatorNext<CAPI>, UNKNOWN, CAPI);
-    generator_cls->giveAttr("next", new BoxedFunction(generator_next));
+    generator_cls->giveAttr("__next__", new BoxedFunction(generator_next));
 
     BoxedCode* hasnext = BoxedCode::create((void*)generatorHasnextUnboxed, BOOL, 1, "generator.__hasnext__");
     hasnext->addVersion((void*)generatorHasnext, BOXED_BOOL);
@@ -765,5 +829,12 @@ void setupGenerator() {
     generator_cls->tp_del = generator_del; // don't do giveAttr("__del__") because it should not be visible from python
     generator_cls->tpp_hasnext = generatorHasnextUnboxed;
     generator_cls->tp_iternext = generatorNext<CAPI>;
+
+    yield_from_iter_func = new BoxedBuiltinFunctionOrMethod(
+        BoxedCode::create((void*)yieldFromIter, UNKNOWN, 1, "yield_from_iter"));
+    PyGC_RegisterStaticConstant(yield_from_iter_func);
+    yield_from_step_func = new BoxedBuiltinFunctionOrMethod(
+        BoxedCode::create((void*)yieldFromStep, UNKNOWN, 2, "yield_from_step"));
+    PyGC_RegisterStaticConstant(yield_from_step_func);
 }
 }

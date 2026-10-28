@@ -56,7 +56,7 @@ int HiddenClass::attributeArraySize() {
 }
 
 void HiddenClassSingleton::appendAttribute(BoxedString* attr) {
-    assert(attr->interned_state != SSTATE_NOT_INTERNED);
+    assert(attr->state.interned != SSTATE_NOT_INTERNED);
     assert(type == SINGLETON);
     dependent_getattrs.invalidateAll();
     assert(attr_offsets.count(attr) == 0);
@@ -72,7 +72,7 @@ void HiddenClassSingleton::appendAttrwrapper() {
 }
 
 void HiddenClassSingleton::delAttribute(BoxedString* attr) {
-    assert(attr->interned_state != SSTATE_NOT_INTERNED);
+    assert(attr->state.interned != SSTATE_NOT_INTERNED);
     assert(type == SINGLETON);
     dependent_getattrs.invalidateAll();
     assert(attr_offsets.count(attr));
@@ -97,7 +97,7 @@ void HiddenClassSingleton::addDependence(Rewriter* rewriter) {
 HiddenClassNormal* HiddenClassNormal::getOrMakeChild(BoxedString* attr) {
     STAT_TIMER(t0, "us_timer_hiddenclass_getOrMakeChild", 0);
 
-    assert(attr->interned_state != SSTATE_NOT_INTERNED);
+    assert(attr->state.interned != SSTATE_NOT_INTERNED);
     assert(type == NORMAL);
 
     auto it = children.find(attr);
@@ -135,7 +135,7 @@ HiddenClassNormal* HiddenClassNormal::getAttrwrapperChild() {
 HiddenClassNormal* HiddenClassNormal::delAttrToMakeHC(BoxedString* attr) {
     STAT_TIMER(t0, "us_timer_hiddenclass_delAttrToMakeHC", 0);
 
-    assert(attr->interned_state != SSTATE_NOT_INTERNED);
+    assert(attr->state.interned != SSTATE_NOT_INTERNED);
     assert(type == NORMAL);
     int idx = getOffset(attr);
     assert(idx >= 0);

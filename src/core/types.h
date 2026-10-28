@@ -30,6 +30,10 @@
 #include "llvm/ADT/TinyPtrVector.h"
 #include "Python.h"
 
+// In CPython 3.8 these macros are internal (pycore_object.h); use the function versions.
+#define _PyObject_GC_TRACK(o) PyObject_GC_Track((PyObject*)(o))
+#define _PyObject_GC_UNTRACK(o) PyObject_GC_UnTrack((PyObject*)(o))
+
 #include "core/common.h"
 #include "core/stats.h"
 #include "core/stringpool.h"
@@ -233,13 +237,15 @@ struct ParamNames {
     const unsigned char takes_param_names : 1;
     unsigned char has_vararg_name : 1;
     unsigned char has_kwarg_name : 1;
+    // The first num_posonly arguments can't be passed by keyword.
+    int num_posonly = 0;
 
     ParamNames(ParamNames&) = delete;
     ParamNames(ParamNames&&) = default;
     ~ParamNames();
 
     explicit ParamNames(AST_arguments* ast, InternedStringPool& pool);
-    ParamNames(const std::vector<const char*>& args, const char* vararg, const char* kwarg);
+    ParamNames(const std::vector<const char*>& args, const char* vararg, const char* kwarg, int num_posonly = 0);
 
     static ParamNames empty() { return ParamNames(); }
 
@@ -287,26 +293,37 @@ struct ParamReceiveSpec {
     bool takes_varargs : 1;
     bool takes_kwargs : 1;
     unsigned int num_defaults : 14;
+    // Includes the keyword-only arguments, which are the last num_kwonly of the num_args slots.
+    // num_defaults only covers the positional ones; keyword-only defaults live in __kwdefaults__.
     unsigned int num_args : 16;
+    unsigned int num_kwonly : 16;
 
     static const int MAX_ARGS = (1 << 16) - 1;
     static const int MAX_DEFAULTS = (1 << 14) - 1;
 
     explicit ParamReceiveSpec(int num_args)
-        : takes_varargs(false), takes_kwargs(false), num_defaults(0), num_args(num_args) {
+        : takes_varargs(false), takes_kwargs(false), num_defaults(0), num_args(num_args), num_kwonly(0) {
         assert(num_args <= MAX_ARGS);
         assert(num_defaults <= MAX_DEFAULTS);
     }
-    explicit ParamReceiveSpec(int num_args, int num_defaults, bool takes_varargs, bool takes_kwargs)
-        : takes_varargs(takes_varargs), takes_kwargs(takes_kwargs), num_defaults(num_defaults), num_args(num_args) {
+    explicit ParamReceiveSpec(int num_args, int num_defaults, bool takes_varargs, bool takes_kwargs,
+                              int num_kwonly = 0)
+        : takes_varargs(takes_varargs),
+          takes_kwargs(takes_kwargs),
+          num_defaults(num_defaults),
+          num_args(num_args),
+          num_kwonly(num_kwonly) {
         assert(num_args <= MAX_ARGS);
+        assert(num_kwonly <= num_args);
         assert(num_defaults <= MAX_DEFAULTS);
     }
 
     bool operator==(ParamReceiveSpec rhs) const {
         return takes_varargs == rhs.takes_varargs && takes_kwargs == rhs.takes_kwargs
-               && num_defaults == rhs.num_defaults && num_args == rhs.num_args;
+               && num_defaults == rhs.num_defaults && num_args == rhs.num_args && num_kwonly == rhs.num_kwonly;
     }
+
+    int numPositional() const { return num_args - num_kwonly; }
 
     bool operator!=(ParamReceiveSpec rhs) const { return !(*this == rhs); }
 
@@ -444,8 +461,12 @@ class LivenessAnalysis;
 // (ii) what offset into the array to find the variable. This struct stores that
 // information. You can query the ScopeInfo with a name to get this info.
 struct DerefInfo {
+    // FROM_CREATED_CLOSURE means the variable is in the closure that the current function creates
+    // (see ScopeInfo::isModifiedFromNested).
     size_t num_parents_from_passed_closure;
     size_t offset;
+
+    static constexpr size_t FROM_CREATED_CLOSURE = (size_t)-1;
 };
 
 class ScopeInfo;
@@ -666,7 +687,7 @@ struct GetattrRewriteArgs;
 struct DelattrRewriteArgs;
 struct UnaryopRewriteArgs;
 
-// Helper function around PyString_InternFromString:
+// Returns the interned (and immortal) str object for s, which is UTF-8 encoded.
 BoxedString* internStringImmortal(llvm::StringRef s) noexcept;
 
 // Callers should use this function if they can accept mortal string objects.
@@ -683,7 +704,14 @@ inline BoxedString* internStringMortal(llvm::StringRef s) noexcept {
 // internStringMortalInplace(s);
 // AUTO_DECREF(s);
 inline void internStringMortalInplace(BoxedString*& s) noexcept {
-    PyString_InternInPlace((PyObject**)&s);
+    // PyUnicode_InternInPlace leaves str subclasses alone, but attribute names have to be interned.
+    if (unlikely(!PyUnicode_CheckExact(s))) {
+        BoxedString* copy = (BoxedString*)_PyUnicode_Copy((PyObject*)s);
+        RELEASE_ASSERT(copy, "");
+        Py_DECREF(s);
+        s = copy;
+    }
+    PyUnicode_InternInPlace((PyObject**)&s);
 }
 
 // The data structure definition for hidden-class-based attributes.  Consists of a
@@ -985,8 +1013,10 @@ Box* moduleInit(BoxedModule* self, Box* name, Box* doc = NULL);
 
 // TODO where to put this
 void appendToSysPath(llvm::StringRef path);
+void setupStdio();
 void prependToSysPath(llvm::StringRef path);
 void addToSysArgv(const char* str);
+std::vector<std::string> getModuleSearchPath();
 
 // Raise a SyntaxError that occurs at a specific location.
 // The traceback given to the user will include this,

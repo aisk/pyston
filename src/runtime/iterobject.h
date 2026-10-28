@@ -42,9 +42,7 @@ public:
         Py_INCREF(b);
 
         if (b->cls == str_cls) {
-            len = static_cast<BoxedString*>(b)->size();
-        } else if (b->cls == unicode_cls) {
-            len = reinterpret_cast<PyUnicodeObject*>(b)->length;
+            len = PyUnicode_GET_LENGTH(b);
         } else {
             len = -1;
         }
@@ -92,7 +90,6 @@ public:
     }
 };
 
-llvm_compat_bool calliterHasnextUnboxed(Box* b);
 
 void setupIter();
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "capi/typeobject.h"
 #include "Python.h"
 
 #include "frameobject.h"
@@ -24,7 +25,6 @@
 namespace pyston {
 
 extern "C" {
-BoxedClass* frame_cls;
 }
 
 // Issues:
@@ -336,6 +336,9 @@ extern "C" void setFrameExcInfo(FrameInfo* frame_info, STOLEN(Box*) type, STOLEN
     Box* old_value = frame_info->exc.value;
     Box* old_traceback = frame_info->exc.traceback;
 
+    if (tb && value && PyExceptionInstance_Check(value))
+        PyException_SetTraceback(value, tb);
+
     frame_info->exc.type = type;
     frame_info->exc.value = value;
     frame_info->exc.traceback = tb;
@@ -369,6 +372,11 @@ extern "C" PyFrameObject* PyFrame_New(PyThreadState* tstate, PyCodeObject* code,
     return (PyFrameObject*)BoxedFrame::createFrame(getFrame(0), (BoxedCode*)code, globals, locals);
 }
 
+extern "C" BORROWED(PyFrameObject*) PyFrame_GetBack(PyFrameObject* f) noexcept {
+    Box* back = BoxedFrame::back((Box*)f, NULL);
+    return back == Py_None ? NULL : (PyFrameObject*)back;
+}
+
 extern "C" BORROWED(PyObject*) PyFrame_GetGlobals(PyFrameObject* f) noexcept {
     return BoxedFrame::globals((Box*)f, NULL);
 }
@@ -381,8 +389,19 @@ extern "C" PyFrameObject* PyFrame_ForStackLevel(int stack_level) noexcept {
     return (PyFrameObject*)getFrame(stack_level);
 }
 
+// Pyston frames don't own the locals of a function that has returned, so there is nothing
+// to clear. traceback.clear_frames() and unittest call this.
+static PyObject* frame_clear(PyObject* self, PyObject* args) noexcept {
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef frame_methods[] = {
+    { "clear", (PyCFunction)frame_clear, METH_NOARGS, NULL },
+    { NULL, NULL, 0, NULL },
+};
+
 void setupFrame() {
-    frame_cls = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(BoxedFrame), false, "frame", false,
+    BoxedClass::createStatic(frame_cls, type_cls, object_cls, 0, 0, sizeof(BoxedFrame), false, "frame", false,
                                    (destructor)BoxedFrame::dealloc, NULL, true, (traverseproc)BoxedFrame::traverse,
                                    (inquiry)BoxedFrame::clear);
 
@@ -392,6 +411,7 @@ void setupFrame() {
 
     frame_cls->giveAttrDescriptor("f_globals", BoxedFrame::f_globals, NULL);
     frame_cls->giveAttrDescriptor("f_back", BoxedFrame::f_back, NULL);
+    add_methods(frame_cls, frame_methods);
 
     frame_cls->freeze();
 }

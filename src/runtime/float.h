@@ -17,10 +17,12 @@
 
 namespace pyston {
 
+// lhs ** rhs with Python's float semantics.  The result is complex for a negative lhs and a
+// fractional rhs.
+Box* powFloatFloat(double lhs, double rhs);
 extern "C" double mod_float_float(double lhs, double rhs);
 extern "C" double div_float_float(double lhs, double rhs);
 extern "C" double floordiv_float_float(double lhs, double rhs);
-extern "C" double pow_float_float(double lhs, double rhs);
 
 class BoxedFloat;
 bool floatNonzeroUnboxed(BoxedFloat* self);

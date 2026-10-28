@@ -27,8 +27,6 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		asm_writing/mc_writer.cpp
 		asm_writing/rewriter.cpp
 		capi/abstract.cpp
-		capi/codecs.cpp
-		capi/errors.cpp
 		capi/modsupport.cpp
 		capi/object.cpp
 		capi/typeobject.cpp
@@ -53,7 +51,6 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		codegen/profiling/dumprof.cpp
 		codegen/profiling/profiling.cpp
 		codegen/runtime_hooks.cpp
-		codegen/serialize_ast.cpp
 		codegen/stackmaps.cpp
 		codegen/type_recording.cpp
 		codegen/unwinding.cpp
@@ -72,7 +69,6 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		runtime/builtin_modules/sys.cpp
 		runtime/builtin_modules/thread.cpp
 		runtime/capi.cpp
-		runtime/classobj.cpp
 		runtime/code.cpp
 		runtime/complex.cpp
 		runtime/ctxswitching.S

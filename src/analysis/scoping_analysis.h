@@ -91,6 +91,10 @@ public:
 
     virtual bool areLocalsFromModule() = 0;
 
+    // Whether a CLOSURE variable of this scope gets assigned to by a nested scope through
+    // `nonlocal`.  Reads of it then have to go to the closure rather than the cached vreg.
+    virtual bool isModifiedFromNested(InternedString name) { return false; }
+
     // For a variable with DEREF lookup, return the DerefInfo used to lookup
     // the variable in a passed closure.
     virtual DerefInfo getDerefInfo(InternedString name) = 0;

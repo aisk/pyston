@@ -20,7 +20,7 @@
 #include "llvm/Support/FileSystem.h"
 
 #include "Python.h"
-#include "Python-ast.h"
+#include "codegen/cpython_ast.h"
 
 #include "capi/typeobject.h"
 #include "capi/types.h"
@@ -29,11 +29,9 @@
 #include "codegen/parser.h"
 #include "codegen/unwinding.h"
 #include "core/types.h"
-#include "runtime/classobj.h"
 #include "runtime/ics.h"
 #include "runtime/import.h"
 #include "runtime/inline/list.h"
-#include "runtime/inline/xrange.h"
 #include "runtime/iterobject.h"
 #include "runtime/list.h"
 #include "runtime/long.h"
@@ -47,16 +45,23 @@
 namespace pyston {
 
 extern "C" {
-Box* Ellipsis = 0;
-
-// Copied from CPython:
-#if defined(MS_WINDOWS) && defined(HAVE_USABLE_WCHAR_T)
-const char* Py_FileSystemDefaultEncoding = "mbcs";
-#elif defined(__APPLE__)
+// From CPython's Python/preconfig.c and Python/initconfig.c.  Pyston always uses UTF-8 for file
+// names, like CPython 3.8 does on Linux in the C.UTF-8 locale.
 const char* Py_FileSystemDefaultEncoding = "utf-8";
-#else
-const char* Py_FileSystemDefaultEncoding = "UTF-8"; // Pyston change: modified to UTF-8
-#endif
+int Py_HasFileSystemDefaultEncoding = 1;
+const char* Py_FileSystemDefaultEncodeErrors = "surrogateescape";
+int _Py_HasFileSystemDefaultEncodeErrors = 1;
+int Py_UTF8Mode = 0;
+
+PyMethodDef* _PystonBuiltin_GetMethods(void);
+void _PystonInterp_SetBuiltins(PyObject* builtins);
+}
+
+extern "C" PyObject* _PyEval_GetBuiltinId(_Py_Identifier* name) noexcept {
+    PyObject* attr = _PyObject_GetAttrId(builtins_module, name);
+    if (attr == NULL && !PyErr_Occurred())
+        PyErr_SetObject(PyExc_AttributeError, _PyUnicode_FromId(name));
+    return attr;
 }
 
 extern "C" Box* trap() {
@@ -98,44 +103,6 @@ extern "C" Box* abs_(Box* x) {
     return rtn;
 }
 
-static PyObject* builtin_bin(PyObject* self, PyObject* v) noexcept {
-    return PyNumber_ToBase(v, 2);
-}
-
-static PyObject* builtin_hex(PyObject* self, PyObject* v) noexcept {
-    PyNumberMethods* nb;
-    PyObject* res;
-
-    if ((nb = v->cls->tp_as_number) == NULL || nb->nb_hex == NULL) {
-        PyErr_SetString(PyExc_TypeError, "hex() argument can't be converted to hex");
-        return NULL;
-    }
-    res = (*nb->nb_hex)(v);
-    if (res && !PyString_Check(res)) {
-        PyErr_Format(PyExc_TypeError, "__hex__ returned non-string (type %.200s)", res->cls->tp_name);
-        Py_DECREF(res);
-        return NULL;
-    }
-    return res;
-}
-
-static PyObject* builtin_oct(PyObject* self, PyObject* v) noexcept {
-    PyNumberMethods* nb;
-    PyObject* res;
-
-    if (v == NULL || (nb = v->cls->tp_as_number) == NULL || nb->nb_oct == NULL) {
-        PyErr_SetString(PyExc_TypeError, "oct() argument can't be converted to oct");
-        return NULL;
-    }
-    res = (*nb->nb_oct)(v);
-    if (res && !PyString_Check(res)) {
-        PyErr_Format(PyExc_TypeError, "__oct__ returned non-string (type %.200s)", res->cls->tp_name);
-        Py_DECREF(res);
-        return NULL;
-    }
-    return res;
-}
-
 extern "C" Box* all(Box* container) {
     for (Box* e : container->pyElements()) {
         AUTO_DECREF(e);
@@ -154,117 +121,6 @@ extern "C" Box* any(Box* container) {
         }
     }
     return boxBool(false);
-}
-
-Box* min_max(Box* arg0, BoxedTuple* args, BoxedDict* kwargs, int opid) {
-    assert(args->cls == tuple_cls);
-    if (kwargs)
-        assert(kwargs->cls == dict_cls);
-
-    Box* key_func = nullptr;
-    Box* extremElement;
-    Box* container;
-    Box* extremVal;
-
-    if (kwargs && kwargs->d.size()) {
-        static BoxedString* key_str = static_cast<BoxedString*>(getStaticString("key"));
-        auto it = kwargs->d.find(key_str);
-        if (it != kwargs->d.end() && kwargs->d.size() == 1) {
-            key_func = it->second;
-        } else {
-            if (opid == Py_LT)
-                raiseExcHelper(TypeError, "min() got an unexpected keyword argument");
-            else
-                raiseExcHelper(TypeError, "max() got an unexpected keyword argument");
-        }
-    }
-
-    XKEEP_ALIVE(key_func); // probably not necessary
-
-    if (args->size() == 0) {
-        extremElement = nullptr;
-        extremVal = nullptr;
-        container = arg0;
-    } else {
-        if (key_func != NULL) {
-            extremVal = runtimeCall(key_func, ArgPassSpec(1), arg0, NULL, NULL, NULL, NULL);
-        } else {
-            extremVal = incref(arg0);
-        }
-        extremElement = incref(arg0);
-        container = args;
-    }
-
-    Box* curVal = nullptr;
-    for (Box* e : container->pyElements()) {
-        if (key_func != NULL) {
-            if (!extremElement) {
-                extremVal = runtimeCall(key_func, ArgPassSpec(1), e, NULL, NULL, NULL, NULL);
-                extremElement = e;
-                continue;
-            }
-            try {
-                curVal = runtimeCall(key_func, ArgPassSpec(1), e, NULL, NULL, NULL, NULL);
-            } catch (ExcInfo ex) {
-                Py_DECREF(e);
-                Py_DECREF(extremVal);
-                Py_DECREF(extremElement);
-                throw ex;
-            }
-        } else {
-            if (!extremElement) {
-                extremVal = incref(e);
-                extremElement = e;
-                continue;
-            }
-            curVal = incref(e);
-        }
-        int r = PyObject_RichCompareBool(curVal, extremVal, opid);
-        if (r == -1) {
-            Py_DECREF(e);
-            Py_DECREF(extremVal);
-            Py_DECREF(extremElement);
-            Py_DECREF(curVal);
-            throwCAPIException();
-        }
-        if (r) {
-            Py_DECREF(extremElement);
-            Py_DECREF(extremVal);
-            extremElement = e;
-            extremVal = curVal;
-        } else {
-            Py_DECREF(curVal);
-            Py_DECREF(e);
-        }
-    }
-    Py_XDECREF(extremVal);
-    return extremElement;
-}
-
-extern "C" Box* min(Box* arg0, BoxedTuple* args, BoxedDict* kwargs) {
-    if (arg0 == Py_None && args->size() == 0) {
-        raiseExcHelper(TypeError, "min expected 1 arguments, got 0");
-    }
-
-    Box* minElement = min_max(arg0, args, kwargs, Py_LT);
-
-    if (!minElement) {
-        raiseExcHelper(ValueError, "min() arg is an empty sequence");
-    }
-    return minElement;
-}
-
-extern "C" Box* max(Box* arg0, BoxedTuple* args, BoxedDict* kwargs) {
-    if (arg0 == Py_None && args->size() == 0) {
-        raiseExcHelper(TypeError, "max expected 1 arguments, got 0");
-    }
-
-    Box* maxElement = min_max(arg0, args, kwargs, Py_GT);
-
-    if (!maxElement) {
-        raiseExcHelper(ValueError, "max() arg is an empty sequence");
-    }
-    return maxElement;
 }
 
 extern "C" Box* next(Box* iterator, Box* _default) noexcept {
@@ -299,198 +155,13 @@ extern "C" Box* next(Box* iterator, Box* _default) noexcept {
     }
 }
 
-extern "C" Box* sum(Box* container, Box* initial) {
-    if (initial->cls == str_cls)
-        raiseExcHelper(TypeError, "sum() can't sum strings [use ''.join(seq) instead]");
-
-    static RuntimeICCache<BinopIC, 3> runtime_ic_cache;
-    std::shared_ptr<BinopIC> pp = runtime_ic_cache.getIC(__builtin_return_address(0));
-
-    Py_INCREF(initial);
-    auto cur = autoDecref(initial);
-    for (Box* e : container->pyElements()) {
-        AUTO_DECREF(e);
-        cur = pp->call(cur, e, AST_TYPE::Add);
-    }
-    return incref(cur.get());
-}
-
 extern "C" Box* id(Box* arg) {
     i64 addr = (i64)(arg) ^ 0xdeadbeef00000003;
     return boxInt(addr);
 }
 
 
-Box* open(Box* arg1, Box* arg2, Box* arg3) {
-    assert(arg2);
-    assert(arg3);
-    // This could be optimized quite a bit if it ends up being important:
-    return runtimeCall(&PyFile_Type, ArgPassSpec(3), arg1, arg2, arg3, NULL, NULL);
-}
-
-extern "C" Box* chr(Box* arg) {
-    i64 n = PyInt_AsLong(arg);
-    if (n == -1 && PyErr_Occurred())
-        throwCAPIException();
-
-    if (n < 0 || n >= 256) {
-        raiseExcHelper(ValueError, "chr() arg not in range(256)");
-    }
-
-    char c = (char)n;
-    return boxString(llvm::StringRef(&c, 1));
-}
-
-extern "C" Box* unichr(Box* arg) {
-    int n = -1;
-    if (!PyArg_ParseSingle(arg, 0, "unichr", "i", &n))
-        throwCAPIException();
-
-    Box* rtn = PyUnicode_FromOrdinal(n);
-    if (!rtn)
-        throwCAPIException();
-    return rtn;
-}
-
-Box* coerceFunc(Box* vv, Box* ww) {
-    Box* res;
-
-    if (PyErr_WarnPy3k("coerce() not supported in 3.x", 1) < 0)
-        throwCAPIException();
-
-    if (PyNumber_Coerce(&vv, &ww) < 0)
-        throwCAPIException();
-    res = PyTuple_Pack(2, vv, ww);
-    Py_DECREF(vv);
-    Py_DECREF(ww);
-    return res;
-}
-
-extern "C" Box* ord(Box* obj) {
-    long ord;
-    Py_ssize_t size;
-
-    if (PyString_Check(obj)) {
-        size = PyString_GET_SIZE(obj);
-        if (size == 1) {
-            ord = (long)((unsigned char)*PyString_AS_STRING(obj));
-            return boxInt(ord);
-        }
-    } else if (PyByteArray_Check(obj)) {
-        size = PyByteArray_GET_SIZE(obj);
-        if (size == 1) {
-            ord = (long)((unsigned char)*PyByteArray_AS_STRING(obj));
-            return boxInt(ord);
-        }
-
-#ifdef Py_USING_UNICODE
-    } else if (PyUnicode_Check(obj)) {
-        size = PyUnicode_GET_SIZE(obj);
-        if (size == 1) {
-            ord = (long)*PyUnicode_AS_UNICODE(obj);
-            return boxInt(ord);
-        }
-#endif
-    } else {
-        raiseExcHelper(TypeError, "ord() expected string of length 1, but "
-                                  "%.200s found",
-                       obj->cls->tp_name);
-    }
-
-    raiseExcHelper(TypeError, "ord() expected a character, "
-                              "but string of length %zd found",
-                   size);
-}
-
-Box* range(Box* start, Box* stop, Box* step) {
-    i64 istart, istop, istep;
-    if (stop == NULL) {
-        istart = 0;
-        istop = PyLong_AsLong(start);
-        if ((istop == -1) && PyErr_Occurred())
-            throwCAPIException();
-        istep = 1;
-    } else if (step == NULL) {
-        istart = PyLong_AsLong(start);
-        if ((istart == -1) && PyErr_Occurred())
-            throwCAPIException();
-        istop = PyLong_AsLong(stop);
-        if ((istop == -1) && PyErr_Occurred())
-            throwCAPIException();
-        istep = 1;
-    } else {
-        istart = PyLong_AsLong(start);
-        if ((istart == -1) && PyErr_Occurred())
-            throwCAPIException();
-        istop = PyLong_AsLong(stop);
-        if ((istop == -1) && PyErr_Occurred())
-            throwCAPIException();
-        istep = PyLong_AsLong(step);
-        if ((istep == -1) && PyErr_Occurred())
-            throwCAPIException();
-    }
-
-    BoxedList* rtn = new BoxedList();
-    rtn->ensure(std::max(0l, 1 + (istop - istart) / istep));
-    if (istep > 0) {
-        for (i64 i = istart; i < istop; i += istep) {
-            Box* bi = boxInt(i);
-            listAppendInternalStolen(rtn, bi);
-        }
-    } else {
-        for (i64 i = istart; i > istop; i += istep) {
-            Box* bi = boxInt(i);
-            listAppendInternalStolen(rtn, bi);
-        }
-    }
-    return rtn;
-}
-
-Box* notimplementedRepr(Box* self) {
-    assert(self == NotImplemented);
-    return boxString("NotImplemented");
-}
-
 // Copied from CPython with some minor modifications
-static PyObject* builtin_sorted(PyObject* self, PyObject* args, PyObject* kwds) {
-    PyObject* newlist, *v, *seq, * compare = NULL, * keyfunc = NULL, *newargs;
-    PyObject* callable;
-    static const char* kwlist[] = { "iterable", "cmp", "key", "reverse", 0 };
-    int reverse;
-
-    /* args 1-4 should match listsort in Objects/listobject.c */
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|OOi:sorted", const_cast<char**>(kwlist), &seq, &compare, &keyfunc,
-                                     &reverse))
-        return NULL;
-
-    newlist = PySequence_List(seq);
-    if (newlist == NULL)
-        return NULL;
-
-    callable = PyObject_GetAttrString(newlist, "sort");
-    if (callable == NULL) {
-        Py_DECREF(newlist);
-        return NULL;
-    }
-
-    newargs = PyTuple_GetSlice(args, 1, 4);
-    if (newargs == NULL) {
-        Py_DECREF(newlist);
-        Py_DECREF(callable);
-        return NULL;
-    }
-
-    v = PyObject_Call(callable, newargs, kwds);
-    Py_DECREF(newargs);
-    Py_DECREF(callable);
-    if (v == NULL) {
-        Py_DECREF(newlist);
-        return NULL;
-    }
-    Py_DECREF(v);
-    return newlist;
-}
-
 Box* isinstance_func(Box* obj, Box* cls) {
     int rtn = PyObject_IsInstance(obj, cls);
     if (rtn < 0)
@@ -503,14 +174,6 @@ Box* issubclass_func(Box* child, Box* parent) {
     if (rtn < 0)
         throwCAPIException();
     return boxBool(rtn);
-}
-
-Box* intern_func(Box* str) {
-    if (!PyString_CheckExact(str)) // have to use exact check!
-        raiseExcHelper(TypeError, "can't intern subclass of string");
-    Py_INCREF(str);
-    PyString_InternInPlace(&str);
-    return str;
 }
 
 Box* bltinImport(Box* name, Box* globals, Box* locals, Box** args) {
@@ -555,7 +218,7 @@ Box* delattrFunc(Box* obj, Box* _str) {
 }
 
 static Box* getattrFuncHelper(STOLEN(Box*) return_val, Box* obj, BoxedString* str, Box* default_val) noexcept {
-    assert(PyString_Check(str));
+    assert(PyUnicode_Check(str));
 
     if (return_val)
         return return_val;
@@ -590,10 +253,10 @@ Box* getattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
             // that we end up looking up (because we need to encode it or intern it),
             // guarding on that object means (for strings and unicode) that the string
             // value is fixed.
-            if (!PyString_CheckExact(_str) && !PyUnicode_CheckExact(_str))
+            if (!PyUnicode_CheckExact(_str) && !PyUnicode_CheckExact(_str))
                 rewrite_args = NULL;
             else {
-                if (PyString_CheckExact(_str) && PyString_CHECK_INTERNED(_str) == SSTATE_INTERNED_IMMORTAL) {
+                if (PyUnicode_CheckExact(_str) && PyUnicode_CHECK_INTERNED(_str) == SSTATE_INTERNED_IMMORTAL) {
                     // can avoid keeping the extra gc reference
                 } else {
                     rewrite_args->rewriter->addGCReference(_str);
@@ -608,7 +271,7 @@ Box* getattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
         if (S == CAPI && !_str)
             return (Box*)NULL;
 
-        if (!PyString_Check(_str)) {
+        if (!PyUnicode_Check(_str)) {
             Py_DECREF(_str);
             if (S == CAPI) {
                 PyErr_SetString(TypeError, "getattr(): attribute name must be string");
@@ -618,7 +281,7 @@ Box* getattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
         }
 
         BoxedString* str = static_cast<BoxedString*>(_str);
-        if (!PyString_CHECK_INTERNED(str))
+        if (!PyUnicode_CHECK_INTERNED(str))
             internStringMortalInplace(str);
         AUTO_DECREF(str);
 
@@ -652,7 +315,7 @@ Box* getattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
         }
 
         if (rewrite_args) {
-            assert(PyString_CHECK_INTERNED(str) == SSTATE_INTERNED_IMMORTAL);
+            assert(PyUnicode_CHECK_INTERNED(str) == SSTATE_INTERNED_IMMORTAL);
             RewriterVar* r_str = rewrite_args->rewriter->loadConst((intptr_t)str, Location::forArg(2));
             RewriterVar* final_rtn
                 = rewrite_args->rewriter->call(false, (void*)getattrFuncHelper, r_rtn, rewrite_args->arg1, r_str,
@@ -722,10 +385,10 @@ Box* hasattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
             // that we end up looking up (because we need to encode it or intern it),
             // guarding on that object means (for strings and unicode) that the string
             // value is fixed.
-            if (!PyString_CheckExact(_str) && !PyUnicode_CheckExact(_str))
+            if (!PyUnicode_CheckExact(_str) && !PyUnicode_CheckExact(_str))
                 rewrite_args = NULL;
             else {
-                if (PyString_CheckExact(_str) && PyString_CHECK_INTERNED(_str) == SSTATE_INTERNED_IMMORTAL) {
+                if (PyUnicode_CheckExact(_str) && PyUnicode_CHECK_INTERNED(_str) == SSTATE_INTERNED_IMMORTAL) {
                     // can avoid keeping the extra gc reference
                 } else {
                     rewrite_args->rewriter->addGCReference(_str);
@@ -740,7 +403,7 @@ Box* hasattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
         if (S == CAPI && !_str)
             return (Box*)NULL;
 
-        if (!PyString_Check(_str)) {
+        if (!PyUnicode_Check(_str)) {
             Py_DECREF(_str);
             if (S == CAPI) {
                 PyErr_SetString(TypeError, "hasattr(): attribute name must be string");
@@ -751,7 +414,7 @@ Box* hasattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
 
         BoxedString* str = static_cast<BoxedString*>(_str);
 
-        if (!PyString_CHECK_INTERNED(str))
+        if (!PyUnicode_CHECK_INTERNED(str))
             internStringMortalInplace(str);
         AUTO_DECREF(str);
 
@@ -804,488 +467,17 @@ Box* hasattrFuncInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args,
     });
 }
 
-Box* map2(Box* f, Box* container) {
-    Box* rtn = new BoxedList();
-    AUTO_DECREF(rtn);
-    bool use_identity_func = f == Py_None;
-    for (Box* e : container->pyElements()) {
-        Box* val;
-        if (use_identity_func)
-            val = e;
-        else {
-            AUTO_DECREF(e);
-            val = runtimeCall(f, ArgPassSpec(1), e, NULL, NULL, NULL, NULL);
-        }
-        listAppendInternalStolen(rtn, val);
-    }
-    return incref(rtn);
-}
-
-Box* map(Box* f, BoxedTuple* args) {
-    assert(args->cls == tuple_cls);
-    auto num_iterable = args->size();
-    if (num_iterable < 1)
-        raiseExcHelper(TypeError, "map() requires at least two args");
-
-    // performance optimization for the case where we only have one iterable
-    if (num_iterable == 1)
-        return map2(f, args->elts[0]);
-
-    std::vector<BoxIteratorRange> ranges;
-    std::vector<BoxIterator> args_it;
-    std::vector<BoxIterator> args_end;
-
-    ranges.reserve(args->size());
-    args_it.reserve(args->size());
-    args_end.reserve(args->size());
-
-    for (auto e : *args) {
-        auto range = e->pyElements();
-        ranges.push_back(std::move(range));
-        args_it.emplace_back(ranges.back().begin());
-        args_end.emplace_back(ranges.back().end());
-    }
-    assert(args_it.size() == num_iterable);
-    assert(args_end.size() == num_iterable);
-
-    bool use_identity_func = f == Py_None;
-    Box* rtn = new BoxedList();
-    AUTO_DECREF(rtn);
-    std::vector<Box*> current_val(num_iterable);
-    while (true) {
-        int num_done = 0;
-        for (int i = 0; i < num_iterable; ++i) {
-            if (args_it[i] == args_end[i]) {
-                ++num_done;
-                current_val[i] = incref(Py_None);
-            } else {
-                current_val[i] = *args_it[i];
-            }
-        }
-
-        AUTO_DECREF_ARRAY(&current_val[0], num_iterable);
-
-        if (num_done == num_iterable)
-            break;
-
-        Box* entry;
-        if (!use_identity_func) {
-            auto v = getTupleFromArgsArray(&current_val[0], num_iterable);
-            entry = runtimeCall(f, ArgPassSpec(num_iterable), std::get<0>(v), std::get<1>(v), std::get<2>(v),
-                                std::get<3>(v), NULL);
-        } else
-            entry = BoxedTuple::create(num_iterable, &current_val[0]);
-        listAppendInternalStolen(rtn, entry);
-
-        for (int i = 0; i < num_iterable; ++i) {
-            if (args_it[i] != args_end[i])
-                ++args_it[i];
-        }
-    }
-    return incref(rtn);
-}
-
-Box* reduce(Box* f, Box* container, Box* initial) {
-    Box* current = xincref(initial);
-
-    for (Box* e : container->pyElements()) {
-        assert(e);
-        if (current == NULL) {
-            current = e;
-        } else {
-            AUTO_DECREF(current);
-            AUTO_DECREF(e);
-            current = runtimeCall(f, ArgPassSpec(2), current, e, NULL, NULL, NULL);
-        }
-    }
-
-    if (current == NULL) {
-        raiseExcHelper(TypeError, "reduce() of empty sequence with no initial value");
-    }
-
-    return current;
-}
-
 // from cpython, bltinmodule.c
-PyObject* filterstring(PyObject* func, BoxedString* strobj) {
-    PyObject* result;
-    Py_ssize_t i, j;
-    Py_ssize_t len = PyString_Size(strobj);
-    Py_ssize_t outlen = len;
-
-    if (func == Py_None) {
-        /* If it's a real string we can return the original,
-         * as no character is ever false and __getitem__
-         * does return this character. If it's a subclass
-         * we must go through the __getitem__ loop */
-        if (PyString_CheckExact(strobj)) {
-            Py_INCREF(strobj);
-            return strobj;
-        }
-    }
-    if ((result = PyString_FromStringAndSize(NULL, len)) == NULL)
-        return NULL;
-
-    for (i = j = 0; i < len; ++i) {
-        PyObject* item;
-        int ok;
-
-        item = (*strobj->cls->tp_as_sequence->sq_item)(strobj, i);
-        if (item == NULL)
-            goto Fail_1;
-        if (func == Py_None) {
-            ok = 1;
-        } else {
-            PyObject* arg, *good;
-            arg = PyTuple_Pack(1, item);
-            if (arg == NULL) {
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-            good = PyEval_CallObject(func, arg);
-            Py_DECREF(arg);
-            if (good == NULL) {
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-            ok = PyObject_IsTrue(good);
-            Py_DECREF(good);
-        }
-        if (ok > 0) {
-            Py_ssize_t reslen;
-            if (!PyString_Check(item)) {
-                PyErr_SetString(PyExc_TypeError, "can't filter str to str:"
-                                                 " __getitem__ returned different type");
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-            reslen = PyString_GET_SIZE(item);
-            if (reslen == 1) {
-                PyString_AS_STRING(result)[j++] = PyString_AS_STRING(item)[0];
-            } else {
-                /* do we need more space? */
-                Py_ssize_t need = j;
-
-                /* calculate space requirements while checking for overflow */
-                if (need > PY_SSIZE_T_MAX - reslen) {
-                    Py_DECREF(item);
-                    goto Fail_1;
-                }
-
-                need += reslen;
-
-                if (need > PY_SSIZE_T_MAX - len) {
-                    Py_DECREF(item);
-                    goto Fail_1;
-                }
-
-                need += len;
-
-                if (need <= i) {
-                    Py_DECREF(item);
-                    goto Fail_1;
-                }
-
-                need = need - i - 1;
-
-                assert(need >= 0);
-                assert(outlen >= 0);
-
-                if (need > outlen) {
-                    /* overallocate, to avoid reallocations */
-                    if (outlen > PY_SSIZE_T_MAX / 2) {
-                        Py_DECREF(item);
-                        return NULL;
-                    }
-
-                    if (need < 2 * outlen) {
-                        need = 2 * outlen;
-                    }
-                    if (_PyString_Resize(&result, need)) {
-                        Py_DECREF(item);
-                        return NULL;
-                    }
-                    outlen = need;
-                }
-                memcpy(PyString_AS_STRING(result) + j, PyString_AS_STRING(item), reslen);
-                j += reslen;
-            }
-        }
-        Py_DECREF(item);
-        if (ok < 0)
-            goto Fail_1;
-    }
-
-    if (j < outlen)
-        _PyString_Resize(&result, j);
-
-    return result;
-
-Fail_1:
-    Py_DECREF(result);
-    return NULL;
-}
-
-static PyObject* filterunicode(PyObject* func, PyObject* strobj) {
-    PyObject* result;
-    Py_ssize_t i, j;
-    Py_ssize_t len = PyUnicode_GetSize(strobj);
-    Py_ssize_t outlen = len;
-
-    if (func == Py_None) {
-        /* If it's a real string we can return the original,
-         * as no character is ever false and __getitem__
-         * does return this character. If it's a subclass
-         * we must go through the __getitem__ loop */
-        if (PyUnicode_CheckExact(strobj)) {
-            Py_INCREF(strobj);
-            return strobj;
-        }
-    }
-    if ((result = PyUnicode_FromUnicode(NULL, len)) == NULL)
-        return NULL;
-
-    for (i = j = 0; i < len; ++i) {
-        PyObject* item, *arg, *good;
-        int ok;
-
-        item = (*strobj->cls->tp_as_sequence->sq_item)(strobj, i);
-        if (item == NULL)
-            goto Fail_1;
-        if (func == Py_None) {
-            ok = 1;
-        } else {
-            arg = PyTuple_Pack(1, item);
-            if (arg == NULL) {
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-            good = PyEval_CallObject(func, arg);
-            Py_DECREF(arg);
-            if (good == NULL) {
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-            ok = PyObject_IsTrue(good);
-            Py_DECREF(good);
-        }
-        if (ok > 0) {
-            Py_ssize_t reslen;
-            if (!PyUnicode_Check(item)) {
-                PyErr_SetString(PyExc_TypeError, "can't filter unicode to unicode:"
-                                                 " __getitem__ returned different type");
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-            reslen = PyUnicode_GET_SIZE(item);
-            if (reslen == 1)
-                PyUnicode_AS_UNICODE(result)[j++] = PyUnicode_AS_UNICODE(item)[0];
-            else {
-                /* do we need more space? */
-                Py_ssize_t need = j + reslen + len - i - 1;
-
-                /* check that didnt overflow */
-                if ((j > PY_SSIZE_T_MAX - reslen) || ((j + reslen) > PY_SSIZE_T_MAX - len) || ((j + reslen + len) < i)
-                    || ((j + reslen + len - i) <= 0)) {
-                    Py_DECREF(item);
-                    return NULL;
-                }
-
-                assert(need >= 0);
-                assert(outlen >= 0);
-
-                if (need > outlen) {
-                    /* overallocate,
-                       to avoid reallocations */
-                    if (need < 2 * outlen) {
-                        if (outlen > PY_SSIZE_T_MAX / 2) {
-                            Py_DECREF(item);
-                            return NULL;
-                        } else {
-                            need = 2 * outlen;
-                        }
-                    }
-
-                    if (PyUnicode_Resize(&result, need) < 0) {
-                        Py_DECREF(item);
-                        goto Fail_1;
-                    }
-                    outlen = need;
-                }
-                memcpy(PyUnicode_AS_UNICODE(result) + j, PyUnicode_AS_UNICODE(item), reslen * sizeof(Py_UNICODE));
-                j += reslen;
-            }
-        }
-        Py_DECREF(item);
-        if (ok < 0)
-            goto Fail_1;
-    }
-
-    if (j < outlen)
-        PyUnicode_Resize(&result, j);
-
-    return result;
-
-Fail_1:
-    Py_DECREF(result);
-    return NULL;
-}
-
-static PyObject* filtertuple(PyObject* func, PyObject* tuple) {
-    PyObject* result;
-    Py_ssize_t i, j;
-    Py_ssize_t len = PyTuple_Size(tuple);
-
-    if (len == 0) {
-        if (PyTuple_CheckExact(tuple))
-            Py_INCREF(tuple);
-        else
-            tuple = PyTuple_New(0);
-        return tuple;
-    }
-
-    if ((result = PyTuple_New(len)) == NULL)
-        return NULL;
-
-    for (i = j = 0; i < len; ++i) {
-        PyObject* item, *good;
-        int ok;
-
-        if (tuple->cls->tp_as_sequence && tuple->cls->tp_as_sequence->sq_item) {
-            item = tuple->cls->tp_as_sequence->sq_item(tuple, i);
-            if (item == NULL)
-                goto Fail_1;
-        } else {
-            PyErr_SetString(PyExc_TypeError, "filter(): unsubscriptable tuple");
-            goto Fail_1;
-        }
-        if (func == Py_None) {
-            Py_INCREF(item);
-            good = item;
-        } else {
-            PyObject* arg = PyTuple_Pack(1, item);
-            if (arg == NULL) {
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-            good = PyEval_CallObject(func, arg);
-            Py_DECREF(arg);
-            if (good == NULL) {
-                Py_DECREF(item);
-                goto Fail_1;
-            }
-        }
-        ok = PyObject_IsTrue(good);
-        Py_DECREF(good);
-        if (ok > 0) {
-            if (PyTuple_SetItem(result, j++, item) < 0)
-                goto Fail_1;
-        } else {
-            Py_DECREF(item);
-            if (ok < 0)
-                goto Fail_1;
-        }
-    }
-
-    if (_PyTuple_Resize(&result, j) < 0)
-        return NULL;
-
-    return result;
-
-Fail_1:
-    Py_DECREF(result);
-    return NULL;
-}
-
-Box* filter2(Box* f, Box* container) {
-    // If the filter-function argument is None, filter() works by only returning
-    // the elements that are truthy.  This is equivalent to using the bool() constructor.
-    // - actually since we call nonzero() afterwards, we could use an ident() function
-    //   but we don't have one.
-    // If this is a common case we could speed it up with special handling.
-    if (f == Py_None)
-        f = bool_cls;
-
-    // Special cases depending on the type of container influences the return type
-    if (PyTuple_Check(container)) {
-        Box* rtn = filtertuple(f, static_cast<BoxedTuple*>(container));
-        if (!rtn) {
-            throwCAPIException();
-        }
-        return rtn;
-    }
-
-    if (PyString_Check(container)) {
-        Box* rtn = filterstring(f, static_cast<BoxedString*>(container));
-        if (!rtn) {
-            throwCAPIException();
-        }
-        return rtn;
-    }
-
-    if (PyUnicode_Check(container)) {
-        Box* rtn = filterunicode(f, container);
-        if (!rtn) {
-            throwCAPIException();
-        }
-        return rtn;
-    }
-
-    Box* rtn = new BoxedList();
-    AUTO_DECREF(rtn);
-    for (Box* e : container->pyElements()) {
-        AUTO_DECREF(e);
-        Box* r = runtimeCall(f, ArgPassSpec(1), e, NULL, NULL, NULL, NULL);
-        AUTO_DECREF(r);
-        bool b = nonzero(r);
-        if (b)
-            listAppendInternal(rtn, e);
-    }
-    return incref(rtn);
-}
-
-Box* zip(BoxedTuple* containers) {
-    assert(containers->cls == tuple_cls);
-
-    BoxedList* rtn = new BoxedList();
-    AUTO_DECREF(rtn);
-    if (containers->size() == 0)
-        return incref(rtn);
-
-    std::vector<BoxIteratorRange> ranges;
-    ranges.reserve(containers->size());
-    for (auto container : *containers) {
-        ranges.push_back(container->pyElements());
-    }
-
-    std::vector<BoxIterator> iterators;
-    iterators.reserve(containers->size());
-    for (auto&& range : ranges) {
-        iterators.push_back(range.begin());
-    }
-
-    while (true) {
-        for (int i = 0; i < iterators.size(); i++) {
-            if (iterators[i] == ranges[i].end())
-                return incref(rtn);
-        }
-
-        auto el = BoxedTuple::create(iterators.size());
-        AUTO_DECREF(el);
-        for (int i = 0; i < iterators.size(); i++) {
-            el->elts[i] = *iterators[i];
-            ++(iterators[i]);
-        }
-        listAppendInternal(rtn, el);
-    }
-}
-
 static Box* callable(Box* obj) {
     return PyBool_FromLong((long)PyCallable_Check(obj));
 }
 
-BoxedClass* notimplemented_cls;
 BoxedModule* builtins_module;
+
+static Box* notimplementedRepr(Box* self) {
+    assert(self == NotImplemented);
+    return boxString("NotImplemented");
+}
 
 class BoxedException : public Box {
 public:
@@ -1299,7 +491,6 @@ public:
     }
 };
 
-BoxedClass* enumerate_cls;
 class BoxedEnumerate : public Box {
 private:
     BoxIteratorRange range;
@@ -1320,9 +511,13 @@ public:
     DEFAULT_CLASS_SIMPLE(enumerate_cls, true);
 
     static Box* new_(Box* cls, Box* obj, Box* start) {
-        RELEASE_ASSERT(cls == enumerate_cls, "");
-        RELEASE_ASSERT(PyInt_Check(start) || PyLong_Check(start), "");
-        int64_t idx = PyInt_AsSsize_t(start);
+        if (!PyType_Check(cls) || !isSubclass(static_cast<BoxedClass*>(cls), enumerate_cls))
+            raiseExcHelper(TypeError, "enumerate.__new__(X): X is not a subtype of enumerate");
+        start = PyNumber_Index(start);
+        if (!start)
+            throwCAPIException();
+        AUTO_DECREF(start);
+        int64_t idx = PyLong_AsSsize_t(start);
         BoxedLong* idx_long = NULL;
         if (idx == -1 && PyErr_Occurred()) {
             PyErr_Clear();
@@ -1330,18 +525,20 @@ public:
             idx_long = (BoxedLong*)start;
         }
         auto&& range = obj->pyElements();
-        return new BoxedEnumerate(std::move(range), idx, idx_long);
+        return new (static_cast<BoxedClass*>(cls)) BoxedEnumerate(std::move(range), idx, idx_long);
     }
 
     static Box* iter(Box* _self) noexcept {
-        assert(_self->cls == enumerate_cls);
+        assert(PyObject_TypeCheck(_self, enumerate_cls));
         BoxedEnumerate* self = static_cast<BoxedEnumerate*>(_self);
         return incref(self);
     }
 
     static Box* next(Box* _self) {
-        assert(_self->cls == enumerate_cls);
+        assert(PyObject_TypeCheck(_self, enumerate_cls));
         BoxedEnumerate* self = static_cast<BoxedEnumerate*>(_self);
+        if (self->iterator == self->iterator_end)
+            raiseExcHelper(StopIteration, (const char*)NULL);
         Box* val = *self->iterator;
         AUTO_DECREF(val);
         ++self->iterator;
@@ -1365,13 +562,13 @@ public:
     }
 
     static Box* hasnext(Box* _self) {
-        assert(_self->cls == enumerate_cls);
+        assert(PyObject_TypeCheck(_self, enumerate_cls));
         BoxedEnumerate* self = static_cast<BoxedEnumerate*>(_self);
         return boxBool(self->iterator != self->iterator_end);
     }
 
     static void dealloc(Box* b) noexcept {
-        assert(b->cls == enumerate_cls);
+        assert(PyObject_TypeCheck(b, enumerate_cls));
         BoxedEnumerate* self = static_cast<BoxedEnumerate*>(b);
 
         PyObject_GC_UnTrack(self);
@@ -1385,7 +582,7 @@ public:
     }
 
     static int traverse(Box* b, visitproc visit, void* arg) noexcept {
-        assert(b->cls == enumerate_cls);
+        assert(PyObject_TypeCheck(b, enumerate_cls));
         BoxedEnumerate* self = static_cast<BoxedEnumerate*>(b);
 
         Py_VISIT(self->idx_long);
@@ -1425,10 +622,6 @@ extern "C" BORROWED(PyObject*) PyEval_GetBuiltins(void) noexcept {
     return builtins_module->getAttrWrapper();
 }
 
-Box* ellipsisRepr(Box* self) {
-    return boxString("Ellipsis");
-}
-
 Box* divmod(Box* lhs, Box* rhs) {
     return binopInternal<NOT_REWRITABLE, false>(lhs, rhs, AST_TYPE::DivMod, NULL);
 }
@@ -1438,125 +631,6 @@ Box* powFunc(Box* x, Box* y, Box* z) {
     if (!rtn)
         throwCAPIException();
     return rtn;
-}
-
-static PyObject* builtin_print(PyObject* self, PyObject* args, PyObject* kwds) noexcept {
-    static const char* kwlist[] = { "sep", "end", "file", 0 };
-    static PyObject* dummy_args = NULL;
-    static PyObject* unicode_newline = NULL, * unicode_space = NULL;
-    static PyObject* str_newline = NULL, * str_space = NULL;
-    PyObject* newline, *space;
-    PyObject* sep = NULL, * end = NULL, * file = NULL;
-    int i, err, use_unicode = 0;
-
-    if (dummy_args == NULL) {
-        if (!(dummy_args = PyTuple_New(0)))
-            return NULL;
-        constants.push_back(dummy_args);
-    }
-    if (str_newline == NULL) {
-        str_newline = PyString_FromString("\n");
-        if (str_newline == NULL)
-            return NULL;
-        constants.push_back(str_newline);
-        str_space = PyString_FromString(" ");
-        if (str_space == NULL) {
-            Py_CLEAR(str_newline);
-            return NULL;
-        }
-        constants.push_back(str_space);
-#ifdef Py_USING_UNICODE
-        unicode_newline = PyUnicode_FromString("\n");
-        if (unicode_newline == NULL) {
-            Py_CLEAR(str_newline);
-            Py_CLEAR(str_space);
-            return NULL;
-        }
-        constants.push_back(unicode_newline);
-        unicode_space = PyUnicode_FromString(" ");
-        if (unicode_space == NULL) {
-            Py_CLEAR(str_newline);
-            Py_CLEAR(str_space);
-            Py_CLEAR(unicode_space);
-            return NULL;
-        }
-        constants.push_back(unicode_space);
-#endif
-    }
-    if (!PyArg_ParseTupleAndKeywords(dummy_args, kwds, "|OOO:print", const_cast<char**>(kwlist), &sep, &end, &file))
-        return NULL;
-    if (file == NULL || file == Py_None) {
-        file = PySys_GetObject("stdout");
-        /* sys.stdout may be None when FILE* stdout isn't connected */
-        if (file == Py_None)
-            Py_RETURN_NONE;
-    }
-    if (sep == Py_None) {
-        sep = NULL;
-    } else if (sep) {
-        if (PyUnicode_Check(sep)) {
-            use_unicode = 1;
-        } else if (!PyString_Check(sep)) {
-            PyErr_Format(PyExc_TypeError, "sep must be None, str or unicode, not %.200s", sep->cls->tp_name);
-            return NULL;
-        }
-    }
-    if (end == Py_None)
-        end = NULL;
-    else if (end) {
-        if (PyUnicode_Check(end)) {
-            use_unicode = 1;
-        } else if (!PyString_Check(end)) {
-            PyErr_Format(PyExc_TypeError, "end must be None, str or unicode, not %.200s", end->cls->tp_name);
-            return NULL;
-        }
-    }
-
-    if (!use_unicode) {
-        for (i = 0; i < PyTuple_Size(args); i++) {
-            if (PyUnicode_Check(PyTuple_GET_ITEM(args, i))) {
-                use_unicode = 1;
-                break;
-            }
-        }
-    }
-    if (use_unicode) {
-        newline = unicode_newline;
-        space = unicode_space;
-    } else {
-        newline = str_newline;
-        space = str_space;
-    }
-
-    for (i = 0; i < PyTuple_Size(args); i++) {
-        if (i > 0) {
-            if (sep == NULL)
-                err = PyFile_WriteObject(space, file, Py_PRINT_RAW);
-            else
-                err = PyFile_WriteObject(sep, file, Py_PRINT_RAW);
-            if (err)
-                return NULL;
-        }
-        err = PyFile_WriteObject(PyTuple_GetItem(args, i), file, Py_PRINT_RAW);
-        if (err)
-            return NULL;
-    }
-
-    if (end == NULL)
-        err = PyFile_WriteObject(newline, file, Py_PRINT_RAW);
-    else
-        err = PyFile_WriteObject(end, file, Py_PRINT_RAW);
-    if (err)
-        return NULL;
-
-    Py_RETURN_NONE;
-}
-
-static PyObject* builtin_reload(PyObject* self, PyObject* v) noexcept {
-    if (PyErr_WarnPy3k("In 3.x, reload() is renamed to imp.reload()", 1) < 0)
-        return NULL;
-
-    return PyImport_ReloadModule(v);
 }
 
 Box* getreversed(Box* o) {
@@ -1611,270 +685,11 @@ Box* builtinIter(Box* obj, Box* sentinel) {
 
 // Copied from builtin_raw_input, but without the argument handling
 // 'v' is the prompt, and can be NULL corresponding to the arg not getting passed.
-static PyObject* raw_input(PyObject* v) noexcept {
-    PyObject* fin = PySys_GetObject("stdin");
-    PyObject* fout = PySys_GetObject("stdout");
-
-    if (fin == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "[raw_]input: lost sys.stdin");
-        return NULL;
-    }
-    if (fout == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "[raw_]input: lost sys.stdout");
-        return NULL;
-    }
-    if (PyFile_SoftSpace(fout, 0)) {
-        if (PyFile_WriteString(" ", fout) != 0)
-            return NULL;
-    }
-    if (PyFile_AsFile(fin) && PyFile_AsFile(fout) && isatty(fileno(PyFile_AsFile(fin)))
-        && isatty(fileno(PyFile_AsFile(fout)))) {
-        PyObject* po;
-        const char* prompt;
-        char* s;
-        PyObject* result;
-        if (v != NULL) {
-            po = PyObject_Str(v);
-            if (po == NULL)
-                return NULL;
-            prompt = PyString_AsString(po);
-            if (prompt == NULL)
-                return NULL;
-        } else {
-            po = NULL;
-            prompt = "";
-        }
-        s = PyOS_Readline(PyFile_AsFile(fin), PyFile_AsFile(fout), prompt);
-        Py_XDECREF(po);
-        if (s == NULL) {
-            if (!PyErr_Occurred())
-                PyErr_SetNone(PyExc_KeyboardInterrupt);
-            return NULL;
-        }
-        if (*s == '\0') {
-            PyErr_SetNone(PyExc_EOFError);
-            result = NULL;
-        } else { /* strip trailing '\n' */
-            size_t len = strlen(s);
-            if (len > PY_SSIZE_T_MAX) {
-                PyErr_SetString(PyExc_OverflowError, "[raw_]input: input too long");
-                result = NULL;
-            } else {
-                result = PyString_FromStringAndSize(s, len - 1);
-            }
-        }
-        PyMem_FREE(s);
-        return result;
-    }
-    if (v != NULL) {
-        if (PyFile_WriteObject(v, fout, Py_PRINT_RAW) != 0)
-            return NULL;
-    }
-    return PyFile_GetLine(fin, -1);
-}
-
-Box* rawInput(Box* prompt) {
-    Box* r = raw_input(prompt);
-    if (!r)
-        throwCAPIException();
-    return r;
-}
-
-Box* input(Box* prompt) {
-    PyObject* line = rawInput(prompt);
-    AUTO_DECREF(line);
-
-    char* str = NULL;
-    if (!PyArg_Parse(line, "s;embedded '\\0' in input line", &str))
-        throwCAPIException();
-
-    while (*str == ' ' || *str == '\t')
-        str++;
-
-    Box* gbls = PyEval_GetGlobals();
-    Box* lcls = PyEval_GetLocals();
-
-    // CPython has these safety checks that the builtin functions exist
-    // in the current global scope.
-    // e.g. eval('input()', {})
-    if (PyDict_GetItemString(gbls, "__builtins__") == NULL) {
-        if (PyDict_SetItemString(gbls, "__builtins__", PyEval_GetBuiltins()) != 0)
-            throwCAPIException();
-    }
-
-    PyCompilerFlags cf;
-    cf.cf_flags = 0;
-    PyEval_MergeCompilerFlags(&cf);
-    Box* res = PyRun_StringFlags(str, Py_eval_input, gbls, lcls, &cf);
-    if (!res)
-        throwCAPIException();
-    return res;
-}
-
-Box* builtinRound(Box* _number, Box* _ndigits) {
-    double x = PyFloat_AsDouble(_number);
-    if (PyErr_Occurred())
-        throwCAPIException();
-
-    /* interpret 2nd argument as a Py_ssize_t; clip on overflow */
-    Py_ssize_t ndigits = PyNumber_AsSsize_t(_ndigits, NULL);
-    if (ndigits == -1 && PyErr_Occurred())
-        throwCAPIException();
-
-    /* nans, infinities and zeros round to themselves */
-    if (!std::isfinite(x) || x == 0.0)
-        return boxFloat(x);
-
-/* Deal with extreme values for ndigits. For ndigits > NDIGITS_MAX, x
-   always rounds to itself.  For ndigits < NDIGITS_MIN, x always
-   rounds to +-0.0.  Here 0.30103 is an upper bound for log10(2). */
-#define NDIGITS_MAX ((int)((DBL_MANT_DIG - DBL_MIN_EXP) * 0.30103))
-#define NDIGITS_MIN (-(int)((DBL_MAX_EXP + 1) * 0.30103))
-    if (ndigits > NDIGITS_MAX)
-        /* return x */
-        return boxFloat(x);
-    else if (ndigits < NDIGITS_MIN)
-        /* return 0.0, but with sign of x */
-        return boxFloat(0.0 * x);
-    else {
-        /* finite x, and ndigits is not unreasonably large */
-        /* _Py_double_round is defined in floatobject.c */
-        Box* rtn = _Py_double_round(x, (int)ndigits);
-        if (!rtn)
-            throwCAPIException();
-        return rtn;
-    }
-#undef NDIGITS_MAX
-#undef NDIGITS_MIN
-}
-
-Box* builtinCmp(Box* a, Box* b) {
-    int c;
-    if (PyObject_Cmp(a, b, &c) < 0)
-        throwCAPIException();
-    return PyInt_FromLong((long)c);
-}
-
-Box* builtinApply(Box* func, Box* _args, Box* keywords) {
-    Box* args;
-    if (!PyTuple_Check(_args)) {
-        if (!PySequence_Check(_args))
-            raiseExcHelper(TypeError, "apply() arg 2 expected sequence, found %s", getTypeName(_args));
-        args = PySequence_Tuple(_args);
-        if (!args)
-            throwCAPIException();
-    } else {
-        args = incref(_args);
-    }
-
-    AUTO_DECREF(args);
-
-    if (keywords && !PyDict_Check(keywords))
-        raiseExcHelper(TypeError, "apply() arg 3 expected dictionary, found %s", getTypeName(keywords));
-    return runtimeCall(func, ArgPassSpec(0, 0, true, keywords != NULL), args, keywords, NULL, NULL, NULL);
-}
-
-Box* builtinFormat(Box* value, Box* format_spec) {
-    Box* res = PyObject_Format(value, format_spec);
-    if (!res) {
-        throwCAPIException();
-    }
-    return res;
-}
-
-static PyObject* builtin_compile(PyObject* self, PyObject* args, PyObject* kwds) noexcept {
-    const char* str;
-    char* filename;
-    char* startstr;
-    int mode = -1;
-    int dont_inherit = 0;
-    int supplied_flags = 0;
-    int is_ast;
-    PyCompilerFlags cf;
-    PyObject* result = NULL, *cmd, * tmp = NULL;
-    Py_ssize_t length;
-    static const char* kwlist[] = { "source", "filename", "mode", "flags", "dont_inherit", NULL };
-    int start[] = { Py_file_input, Py_eval_input, Py_single_input };
-
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oss|ii:compile", const_cast<char**>(kwlist), &cmd, &filename,
-                                     &startstr, &supplied_flags, &dont_inherit))
-        return NULL;
-
-    cf.cf_flags = supplied_flags;
-
-    if (supplied_flags & ~(PyCF_MASK | PyCF_MASK_OBSOLETE | PyCF_DONT_IMPLY_DEDENT | PyCF_ONLY_AST)) {
-        PyErr_SetString(PyExc_ValueError, "compile(): unrecognised flags");
-        return NULL;
-    }
-    /* XXX Warn if (supplied_flags & PyCF_MASK_OBSOLETE) != 0? */
-
-    if (!dont_inherit) {
-        PyEval_MergeCompilerFlags(&cf);
-    }
-
-    if (strcmp(startstr, "exec") == 0)
-        mode = 0;
-    else if (strcmp(startstr, "eval") == 0)
-        mode = 1;
-    else if (strcmp(startstr, "single") == 0)
-        mode = 2;
-    else {
-        PyErr_SetString(PyExc_ValueError, "compile() arg 3 must be 'exec', 'eval' or 'single'");
-        return NULL;
-    }
-
-    is_ast = PyAST_Check(cmd);
-    if (is_ast == -1)
-        return NULL;
-    if (is_ast) {
-        if (supplied_flags & PyCF_ONLY_AST) {
-            Py_INCREF(cmd);
-            result = cmd;
-        } else {
-            PyArena* arena;
-            mod_ty mod;
-
-            arena = PyArena_New();
-            if (arena == NULL)
-                return NULL;
-            mod = PyAST_obj2mod(cmd, arena, mode);
-            if (mod == NULL) {
-                PyArena_Free(arena);
-                return NULL;
-            }
-            result = (PyObject*)PyAST_Compile(mod, filename, &cf, arena);
-            PyArena_Free(arena);
-        }
-        return result;
-    }
-
-#ifdef Py_USING_UNICODE
-    if (PyUnicode_Check(cmd)) {
-        tmp = PyUnicode_AsUTF8String(cmd);
-        if (tmp == NULL)
-            return NULL;
-        cmd = tmp;
-        cf.cf_flags |= PyCF_SOURCE_IS_UTF8;
-    }
-#endif
-
-    if (PyObject_AsReadBuffer(cmd, (const void**)&str, &length))
-        goto cleanup;
-    if ((size_t)length != strlen(str)) {
-        PyErr_SetString(PyExc_TypeError, "compile() expected string without null bytes");
-        goto cleanup;
-    }
-    result = Py_CompileStringFlags(str, filename, start[mode], &cf);
-cleanup:
-    Py_XDECREF(tmp);
-    return result;
-}
-
 static PyObject* builtin_eval(PyObject* self, PyObject* args) noexcept {
     PyObject* cmd, *result, * tmp = NULL;
     PyObject* globals = Py_None, * locals = Py_None;
-    char* str;
-    PyCompilerFlags cf;
+    const char* str;
+    PyCompilerFlags cf = _PyCompilerFlags_INIT;
 
     if (!PyArg_UnpackTuple(args, "eval", 1, 3, &cmd, &globals, &locals))
         return NULL;
@@ -1917,28 +732,14 @@ static PyObject* builtin_eval(PyObject* self, PyObject* args) noexcept {
             return NULL;
         }
 #endif
-        return PyEval_EvalCode((PyCodeObject*)cmd, globals, locals);
+        return PyEval_EvalCode(cmd, globals, locals);
     }
 
-    if (!PyString_Check(cmd) && !PyUnicode_Check(cmd)) {
-        PyErr_SetString(PyExc_TypeError, "eval() arg 1 must be a string or code object");
+    cf.cf_flags = PyCF_SOURCE_IS_UTF8;
+    str = _Py_SourceAsString(cmd, "eval", "string, bytes or code", &cf, &tmp);
+    if (str == NULL)
         return NULL;
-    }
-    cf.cf_flags = 0;
 
-#ifdef Py_USING_UNICODE
-    if (PyUnicode_Check(cmd)) {
-        tmp = PyUnicode_AsUTF8String(cmd);
-        if (tmp == NULL)
-            return NULL;
-        cmd = tmp;
-        cf.cf_flags |= PyCF_SOURCE_IS_UTF8;
-    }
-#endif
-    if (PyString_AsStringAndSize(cmd, &str, NULL)) {
-        Py_XDECREF(tmp);
-        return NULL;
-    }
     while (*str == ' ' || *str == '\t')
         str++;
 
@@ -1948,102 +749,24 @@ static PyObject* builtin_eval(PyObject* self, PyObject* args) noexcept {
     return result;
 }
 
-static PyObject* builtin_execfile(PyObject* self, PyObject* args) noexcept {
-    char* filename;
-    PyObject* globals = Py_None, * locals = Py_None;
-    PyObject* res;
-    FILE* fp = NULL;
-    PyCompilerFlags cf;
-    int exists;
-
-    if (PyErr_WarnPy3k("execfile() not supported in 3.x; use exec()", 1) < 0)
+static PyObject* builtin_exec(PyObject* self, PyObject* args, PyObject* kwds) noexcept {
+    static const char* kwlist[] = { "source", "globals", "locals", NULL };
+    PyObject* source, * globals = Py_None, * locals = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|OO:exec", const_cast<char**>(kwlist), &source, &globals, &locals))
         return NULL;
-
-    // Pyston change: allow attrwrappers here
-    if (!PyArg_ParseTuple(args, "s|OO:execfile", &filename, &globals, &locals))
-        return NULL;
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        PyErr_SetString(PyExc_TypeError, "locals must be a mapping");
+    try {
+        FutureFlags caller_future_flags = 0;
+        BoxedCode* caller = getTopPythonFunction();
+        if (caller)
+            caller_future_flags = caller->source->future_flags;
+        exec(source, globals, locals, caller_future_flags);
+    } catch (ExcInfo e) {
+        setCAPIException(e);
         return NULL;
     }
-    if (globals == Py_None) {
-        globals = PyEval_GetGlobals();
-        if (locals == Py_None)
-            locals = PyEval_GetLocals();
-    } else if (locals == Py_None)
-        locals = globals;
-
-    if (!PyDict_CheckExact(globals) && globals->cls != attrwrapper_cls) {
-        PyErr_Format(TypeError, "execfile() globals must be dict, not %s", globals->cls->tp_name);
-        return NULL;
-    }
-
-    if (PyDict_GetItemString(globals, "__builtins__") == NULL) {
-        if (PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins()) != 0)
-            return NULL;
-    }
-
-    exists = 0;
-/* Test for existence or directory. */
-#if defined(PLAN9)
-    {
-        Dir* d;
-
-        if ((d = dirstat(filename)) != nil) {
-            if (d->mode & DMDIR)
-                werrstr("is a directory");
-            else
-                exists = 1;
-            free(d);
-        }
-    }
-#elif defined(RISCOS)
-    if (object_exists(filename)) {
-        if (isdir(filename))
-            errno = EISDIR;
-        else
-            exists = 1;
-    }
-#else /* standard Posix */
-    {
-        struct stat s;
-        if (stat(filename, &s) == 0) {
-            if (S_ISDIR(s.st_mode))
-#if defined(PYOS_OS2) && defined(PYCC_VACPP)
-                errno = EOS2ERR;
-#else
-                errno = EISDIR;
-#endif
-            else
-                exists = 1;
-        }
-    }
-#endif
-
-    if (exists) {
-        Py_BEGIN_ALLOW_THREADS fp = fopen(filename, "r" PY_STDIOTEXTMODE);
-        Py_END_ALLOW_THREADS
-
-            if (fp == NULL) {
-            exists = 0;
-        }
-    }
-
-    if (!exists) {
-        PyErr_SetFromErrnoWithFilename(PyExc_IOError, filename);
-        return NULL;
-    }
-    cf.cf_flags = 0;
-    if (PyEval_MergeCompilerFlags(&cf))
-        res = PyRun_FileExFlags(fp, filename, Py_file_input, globals, locals, 1, &cf);
-    else
-        res = PyRun_FileEx(fp, filename, Py_file_input, globals, locals, 1);
-    return res;
+    Py_RETURN_NONE;
 }
 
-extern "C" {
-BoxedClass* ellipsis_cls;
-}
 
 PyDoc_STRVAR(print_doc, "print(value, ..., sep=' ', end='\\n', file=sys.stdout)\n\
 \n\
@@ -2246,11 +969,15 @@ The globals must be a dictionary and locals can be any mapping,\n\
 defaulting to the current globals and locals.\n\
 If only globals is given, locals defaults to it.\n");
 
-PyDoc_STRVAR(execfile_doc, "execfile(filename[, globals[, locals]])\n\
+PyDoc_STRVAR(exec_doc, "exec(source, globals=None, locals=None, /)\n\
 \n\
-Read and execute a Python script from a file.\n\
-The globals and locals are dictionaries, defaulting to the current\n\
-globals and locals.  If only globals is given, locals defaults to it.");
+Execute the given source in the context of globals and locals.\n\
+\n\
+The source may be a string representing one or more Python statements\n\
+or a code object as returned by compile().\n\
+The globals must be a dictionary and locals can be any mapping,\n\
+defaulting to the current globals and locals.\n\
+If only globals is given, locals defaults to it.");
 
 PyDoc_STRVAR(getattr_doc, "getattr(object, name[, default]) -> value\n\
 \n\
@@ -2373,29 +1100,21 @@ static Box* lenCallInternalCapi(BoxedFunctionBase* func, CallRewriteArgs* rewrit
 }
 
 void setupBuiltins() {
-    builtins_module = createModule(autoDecref(boxString("__builtin__")), NULL,
+    builtins_module = createModule(autoDecref(boxString("builtins")), NULL,
                                    "Built-in functions, exceptions, and other objects.\n\nNoteworthy: None is "
                                    "the `nil' object; Ellipsis represents `...' in slices.");
-    PyThreadState_GET()->interp->builtins = incref(builtins_module->getAttrWrapper());
+    _PystonInterp_SetBuiltins(builtins_module->getAttrWrapper());
 
-    ellipsis_cls
-        = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(Box), false, "ellipsis", false, NULL, NULL, false);
-    ellipsis_cls->giveAttr("__repr__",
-                           new BoxedFunction(BoxedCode::create((void*)ellipsisRepr, STR, 1, "ellipsis.__repr__")));
-    ellipsis_cls->freeze();
-    Ellipsis = new (ellipsis_cls) Box();
-    assert(Ellipsis->cls);
-
-    constants.push_back(Ellipsis);
+    PyType_Ready(&PyEllipsis_Type);
     builtins_module->giveAttrBorrowed("Ellipsis", Ellipsis);
     builtins_module->giveAttrBorrowed("None", Py_None);
 
     builtins_module->giveAttrBorrowed("__debug__", Py_True);
 
-    notimplemented_cls = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(Box), false, "NotImplementedType", false,
+    BoxedClass::createStatic(notimplemented_cls, type_cls, object_cls, 0, 0, sizeof(Box), false, "NotImplementedType", false,
                                             NULL, NULL, false);
     notimplemented_cls->giveAttr(
-        "__repr__", new BoxedFunction(BoxedCode::create((void*)notimplementedRepr, STR, 1, "notimplemented.__repr__")));
+        "__repr__", new BoxedFunction(BoxedCode::create((void*)notimplementedRepr, STR, 1, "NotImplementedType.__repr__")));
     notimplemented_cls->freeze();
     notimplemented_cls->instances_are_nonzero = true;
     NotImplemented = new (notimplemented_cls) Box();
@@ -2408,10 +1127,6 @@ void setupBuiltins() {
     builtins_module->giveAttr(
         "any", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)any, BOXED_BOOL, 1, "any", any_doc)));
 
-    builtins_module->giveAttr(
-        "apply",
-        new BoxedBuiltinFunctionOrMethod(
-            BoxedCode::create((void*)builtinApply, UNKNOWN, 3, false, false, "apply", apply_doc), { NULL }, NULL));
 
     repr_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)repr, UNKNOWN, 1, "repr", repr_doc));
     builtins_module->giveAttr("repr", repr_obj);
@@ -2427,31 +1142,15 @@ void setupBuiltins() {
     abs_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)abs_, UNKNOWN, 1, "abs", abs_doc));
     builtins_module->giveAttr("abs", abs_obj);
 
-    min_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)min, UNKNOWN, 1, true, true, "min", min_doc),
-                                               { Py_None }, NULL);
-    builtins_module->giveAttr("min", min_obj);
-
-    max_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)max, UNKNOWN, 1, true, true, "max", max_doc),
-                                               { Py_None }, NULL);
-    builtins_module->giveAttr("max", max_obj);
 
     builtins_module->giveAttr(
         "next", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)next, UNKNOWN, 2, false, false, "next",
                                                                    next_doc, ParamNames::empty(), CAPI),
                                                  { NULL }, NULL));
 
-    builtins_module->giveAttr(
-        "sum", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)sum, UNKNOWN, 2, false, false, "sum", sum_doc),
-                                                { autoDecref(boxInt(0)) }, NULL));
 
     id_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)id, BOXED_INT, 1, "id", id_doc));
     builtins_module->giveAttr("id", id_obj);
-    chr_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)chr, STR, 1, "chr", chr_doc));
-    builtins_module->giveAttr("chr", chr_obj);
-    builtins_module->giveAttr(
-        "unichr", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)unichr, UNKNOWN, 1, "unichr", unichr_doc)));
-    ord_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)ord, BOXED_INT, 1, "ord", ord_doc));
-    builtins_module->giveAttr("ord", ord_obj);
     trap_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)trap, UNKNOWN, 0, "trap"));
     builtins_module->giveAttr("trap", trap_obj);
     builtins_module->giveAttr("dump",
@@ -2488,27 +1187,24 @@ void setupBuiltins() {
         BoxedCode::create((void*)issubclass_func, BOXED_BOOL, 2, "issubclass", issubclass_doc));
     builtins_module->giveAttr("issubclass", issubclass_obj);
 
-    Box* intern_obj
-        = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)intern_func, UNKNOWN, 1, "intern", intern_doc));
-    builtins_module->giveAttr("intern", intern_obj);
 
     BoxedCode* import_func
         = BoxedCode::create((void*)bltinImport, UNKNOWN, 5, false, false, "__import__", import_doc,
                             ParamNames({ "name", "globals", "locals", "fromlist", "level" }, "", ""));
     builtins_module->giveAttr("__import__", new BoxedBuiltinFunctionOrMethod(
-                                                import_func, { NULL, NULL, NULL, autoDecref(boxInt(-1)) }, NULL));
+                                                import_func, { NULL, NULL, NULL, autoDecref(boxInt(0)) }, NULL));
 
-    enumerate_cls = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(BoxedEnumerate), false, "enumerate", true,
+    BoxedClass::createStatic(enumerate_cls, type_cls, object_cls, 0, 0, sizeof(BoxedEnumerate), false, "enumerate", true,
                                        BoxedEnumerate::dealloc, NULL, true, BoxedEnumerate::traverse, NOCLEAR);
     enumerate_cls->giveAttr(
         "__new__", new BoxedFunction(BoxedCode::create((void*)BoxedEnumerate::new_, UNKNOWN, 3, "enumerate.__new__", "",
                                                        ParamNames({ "", "sequence", "start" }, "", "")),
                                      { autoDecref(boxInt(0)) }));
     enumerate_cls->giveAttr(
-        "__iter__", new BoxedFunction(BoxedCode::create((void*)BoxedEnumerate::iter, typeFromClass(enumerate_cls), 1,
+        "__iter__", new BoxedFunction(BoxedCode::create((void*)BoxedEnumerate::iter, UNKNOWN, 1,
                                                         "enumerate.__iter__")));
-    enumerate_cls->giveAttr(
-        "next", new BoxedFunction(BoxedCode::create((void*)BoxedEnumerate::next, BOXED_TUPLE, 1, "enumerate.next")));
+    enumerate_cls->giveAttr("__next__", new BoxedFunction(BoxedCode::create((void*)BoxedEnumerate::next, BOXED_TUPLE,
+                                                                             1, "enumerate.__next__")));
     enumerate_cls->giveAttr(
         "__hasnext__",
         new BoxedFunction(BoxedCode::create((void*)BoxedEnumerate::hasnext, BOXED_BOOL, 1, "enumerate.__hasnext__")));
@@ -2519,24 +1215,7 @@ void setupBuiltins() {
     builtins_module->giveAttrBorrowed("True", Py_True);
     builtins_module->giveAttrBorrowed("False", Py_False);
 
-    range_obj = new BoxedBuiltinFunctionOrMethod(
-        BoxedCode::create((void*)range, LIST, 3, false, false, "range", range_doc), { NULL, NULL }, NULL);
-    builtins_module->giveAttr("range", range_obj);
 
-    auto* round_obj
-        = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)builtinRound, BOXED_FLOAT, 2, "round", round_doc,
-                                                             ParamNames({ "number", "ndigits" }, "", "")),
-                                           { autoDecref(boxInt(0)) }, NULL);
-    builtins_module->giveAttr("round", round_obj);
-
-    setupXrange();
-    builtins_module->giveAttrBorrowed("xrange", xrange_cls);
-
-    open_obj = new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)open, typeFromClass(&PyFile_Type), 3, false,
-                                                                  false, "open", open_doc,
-                                                                  ParamNames({ "name", "mode", "buffering" }, "", "")),
-                                                { autoDecref(boxString("r")), autoDecref(boxInt(-1)) }, NULL);
-    builtins_module->giveAttr("open", open_obj);
 
     builtins_module->giveAttr("globals", new BoxedBuiltinFunctionOrMethod(BoxedCode::create(
                                              (void*)globals, UNKNOWN, 0, false, false, "globals", globals_doc)));
@@ -2548,21 +1227,9 @@ void setupBuiltins() {
                     BoxedCode::create((void*)builtinIter, UNKNOWN, 2, false, false, "iter", iter_doc), { NULL }, NULL));
     builtins_module->giveAttr("reversed", new BoxedBuiltinFunctionOrMethod(BoxedCode::create(
                                               (void*)getreversed, UNKNOWN, 1, false, false, "reversed")));
-    builtins_module->giveAttr("coerce", new BoxedBuiltinFunctionOrMethod(BoxedCode::create(
-                                            (void*)coerceFunc, UNKNOWN, 2, false, false, "coerce", coerce_doc)));
     builtins_module->giveAttr(
         "divmod", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)divmod, UNKNOWN, 2, "divmod", divmod_doc)));
 
-    builtins_module->giveAttr(
-        "map", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)map, LIST, 1, true, false, "map", map_doc)));
-    builtins_module->giveAttr(
-        "reduce",
-        new BoxedBuiltinFunctionOrMethod(
-            BoxedCode::create((void*)reduce, UNKNOWN, 3, false, false, "reduce", reduce_doc), { NULL }, NULL));
-    builtins_module->giveAttr("filter", new BoxedBuiltinFunctionOrMethod(
-                                            BoxedCode::create((void*)filter2, UNKNOWN, 2, "filter", filter_doc)));
-    builtins_module->giveAttr(
-        "zip", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)zip, LIST, 0, true, false, "zip", zip_doc)));
     builtins_module->giveAttr(
         "dir", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)dir, LIST, 1, false, false, "dir", dir_doc),
                                                 { NULL }, NULL));
@@ -2571,18 +1238,13 @@ void setupBuiltins() {
                     BoxedCode::create((void*)vars, UNKNOWN, 1, false, false, "vars", vars_doc), { NULL }, NULL));
     builtins_module->giveAttrBorrowed("object", object_cls);
     builtins_module->giveAttrBorrowed("str", str_cls);
-    builtins_module->giveAttrBorrowed("bytes", str_cls);
-    assert(unicode_cls);
-    builtins_module->giveAttrBorrowed("unicode", unicode_cls);
-    builtins_module->giveAttrBorrowed("basestring", basestring_cls);
-    // builtins_module->giveAttr("unicode", unicode_cls);
+    builtins_module->giveAttrBorrowed("bytes", bytes_cls);
     builtins_module->giveAttrBorrowed("int", int_cls);
-    builtins_module->giveAttrBorrowed("long", long_cls);
     builtins_module->giveAttrBorrowed("float", float_cls);
     builtins_module->giveAttrBorrowed("list", list_cls);
     builtins_module->giveAttrBorrowed("slice", slice_cls);
     builtins_module->giveAttrBorrowed("type", type_cls);
-    builtins_module->giveAttrBorrowed("file", &PyFile_Type);
+    builtins_module->giveAttrBorrowed("range", range_cls);
     builtins_module->giveAttrBorrowed("bool", bool_cls);
     builtins_module->giveAttrBorrowed("dict", dict_cls);
     builtins_module->giveAttrBorrowed("set", set_cls);
@@ -2600,40 +1262,30 @@ void setupBuiltins() {
     builtins_module->giveAttrBorrowed("memoryview", memoryview_cls);
     PyType_Ready(&PyByteArray_Type);
     builtins_module->giveAttrBorrowed("bytearray", &PyByteArray_Type);
-    Py_TYPE(&PyBuffer_Type) = &PyType_Type;
-    PyType_Ready(&PyBuffer_Type);
-    builtins_module->giveAttrBorrowed("buffer", &PyBuffer_Type);
 
     builtins_module->giveAttr("callable", new BoxedBuiltinFunctionOrMethod(BoxedCode::create(
                                               (void*)callable, UNKNOWN, 1, "callable", callable_doc)));
 
-    builtins_module->giveAttr(
-        "raw_input",
-        new BoxedBuiltinFunctionOrMethod(
-            BoxedCode::create((void*)rawInput, UNKNOWN, 1, false, false, "raw_input", raw_input_doc), { NULL }, NULL));
-    builtins_module->giveAttr(
-        "input", new BoxedBuiltinFunctionOrMethod(
-                     BoxedCode::create((void*)input, UNKNOWN, 1, false, false, "input", input_doc), { NULL }, NULL));
-    builtins_module->giveAttr(
-        "cmp", new BoxedBuiltinFunctionOrMethod(BoxedCode::create((void*)builtinCmp, UNKNOWN, 2, "cmp", cmp_doc)));
-    builtins_module->giveAttr(
-        "format", new BoxedBuiltinFunctionOrMethod(
-                      BoxedCode::create((void*)builtinFormat, UNKNOWN, 2, "format", format_doc), { NULL }, NULL));
 
 
     static PyMethodDef builtin_methods[] = {
-        { "bin", builtin_bin, METH_O, bin_doc },
-        { "compile", (PyCFunction)builtin_compile, METH_VARARGS | METH_KEYWORDS, compile_doc },
         { "eval", builtin_eval, METH_VARARGS, eval_doc },
-        { "execfile", builtin_execfile, METH_VARARGS, execfile_doc },
-        { "hex", builtin_hex, METH_O, hex_doc },
-        { "oct", builtin_oct, METH_O, oct_doc },
-        { "print", (PyCFunction)builtin_print, METH_VARARGS | METH_KEYWORDS, print_doc },
-        { "reload", builtin_reload, METH_O, reload_doc },
-        { "sorted", (PyCFunction)builtin_sorted, METH_VARARGS | METH_KEYWORDS, sorted_doc },
+        { "exec", (PyCFunction)builtin_exec, METH_VARARGS | METH_KEYWORDS, exec_doc },
     };
     for (auto& md : builtin_methods) {
-        builtins_module->giveAttr(md.ml_name, new BoxedCApiFunction(&md, NULL, autoDecref(boxString("__builtin__"))));
+        builtins_module->giveAttr(md.ml_name, new BoxedCApiFunction(&md, NULL, autoDecref(boxString("builtins"))));
     }
+
+    // Everything that Pyston doesn't implement itself comes from CPython's Python/bltinmodule.c.
+    PyMethodDef* cpython_methods = _PystonBuiltin_GetMethods();
+    RELEASE_ASSERT(cpython_methods, "");
+    for (PyMethodDef* md = cpython_methods; md->ml_name; md++) {
+        if (builtins_module->getattr(autoDecref(internStringMortal(md->ml_name))))
+            continue;
+        builtins_module->giveAttr(md->ml_name, new BoxedCApiFunction(md, NULL, autoDecref(boxString("builtins"))));
+    }
+    builtins_module->giveAttrBorrowed("map", &PyMap_Type);
+    builtins_module->giveAttrBorrowed("filter", &PyFilter_Type);
+    builtins_module->giveAttrBorrowed("zip", &PyZip_Type);
 }
 }

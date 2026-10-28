@@ -51,7 +51,30 @@ void _setAddStolen(BoxedSet* self, STOLEN(Box*) val) {
     _setAddStolen(self, val_hashed);
 }
 
+// Calls f on each element of `container`. Adding to or removing from a set can run __eq__,
+// which may mutate `container`, so this walks a copy of its elements and keeps them alive.
+template <typename F> static void forEachInSnapshot(BoxedSet* container, F f) {
+    llvm::SmallVector<BoxAndHash, 16> elts(container->s.begin(), container->s.end());
+    for (auto&& elt : elts)
+        Py_INCREF(elt.value);
+    try {
+        for (auto&& elt : elts)
+            f(elt);
+    } catch (ExcInfo e) {
+        for (auto&& elt : elts)
+            Py_DECREF(elt.value);
+        throw e;
+    }
+    for (auto&& elt : elts)
+        Py_DECREF(elt.value);
+}
+
 namespace set {
+// Operations on set and frozenset subclasses return plain sets and frozensets, like CPython.
+static BoxedClass* baseSetType(BoxedSet* s) {
+    return PySet_Check(s) ? set_cls : frozenset_cls;
+}
+
 
 class BoxedSetIterator : public Box {
 public:
@@ -63,7 +86,11 @@ public:
 
     DEFAULT_CLASS_SIMPLE(set_iterator_cls, true);
 
-    bool hasNext() { return it != s->s.end(); }
+    // Changing the set's size invalidates `it`, so that is checked before using it. -1 means a
+    // size change was already reported.
+    bool sizeChanged() const { return size == -1 || s->s.size() != size; }
+
+    bool hasNext() { return !sizeChanged() && it != s->s.end(); }
 
     Box* next() {
         Box* rtn = it->value;
@@ -87,28 +114,59 @@ public:
 
 Box* setiteratorHasnext(BoxedSetIterator* self) {
     RELEASE_ASSERT(self->cls == set_iterator_cls, "");
+    // A size change is reported by the next call to next().
+    if (self->size != -1 && self->sizeChanged())
+        Py_RETURN_TRUE;
     return boxBool(self->hasNext());
-}
-
-Box* setiteratorNext(BoxedSetIterator* self) {
-    RELEASE_ASSERT(self->cls == set_iterator_cls, "");
-    if (self->s->s.size() != self->size) {
-        raiseExcHelper(RuntimeError, "Set changed size during iteration");
-    }
-    return self->next();
-}
-
-Box* setiteratorLength(BoxedSetIterator* self) {
-    RELEASE_ASSERT(self->cls == set_iterator_cls, "");
-    return boxInt(self->s->s.size());
 }
 
 Box* setiter_next(Box* _self) noexcept {
     RELEASE_ASSERT(_self->cls == set_iterator_cls, "");
     BoxedSetIterator* self = (BoxedSetIterator*)_self;
+    if (self->size == -1)
+        return NULL;
+    if (self->sizeChanged()) {
+        self->size = -1;
+        PyErr_SetString(PyExc_RuntimeError, "Set changed size during iteration");
+        return NULL;
+    }
     if (!self->hasNext())
         return NULL;
     return self->next();
+}
+
+Box* setiteratorNext(BoxedSetIterator* self) {
+    Box* r = setiter_next(self);
+    if (!r) {
+        if (PyErr_Occurred())
+            throwCAPIException();
+        raiseExcHelper(StopIteration, (const char*)NULL);
+    }
+    return r;
+}
+
+Box* setiteratorLength(BoxedSetIterator* self) {
+    RELEASE_ASSERT(self->cls == set_iterator_cls, "");
+    if (!self->hasNext())
+        return boxInt(0);
+    long n = 0;
+    for (auto it = self->it; it != self->s->s.end(); ++it)
+        n++;
+    return boxInt(n);
+}
+
+// Like CPython: an iterator over a list of the remaining items.
+Box* setiteratorReduce(BoxedSetIterator* self) {
+    RELEASE_ASSERT(self->cls == set_iterator_cls, "");
+    BoxedList* remaining = new BoxedList();
+    AUTO_DECREF(remaining);
+    if (self->hasNext()) {
+        for (auto it = self->it; it != self->s->s.end(); ++it)
+            PyList_Append(remaining, it->value);
+    }
+    Box* iter_func = getattr(builtins_module, autoDecref(internStringMortal("iter")));
+    AUTO_DECREF(iter_func);
+    return BoxedTuple::create({ iter_func, autoDecref(BoxedTuple::create({ remaining })) });
 }
 
 Box* setiteratorIter(BoxedSetIterator* self) {
@@ -140,9 +198,7 @@ BoxedSet* makeNewSet(BoxedClass* cls, Box* container) {
     if (container) {
         AUTO_DECREF(rtn);
         if (PyAnySet_Check(container)) {
-            for (auto&& elt : ((BoxedSet*)container)->s) {
-                rtn->s.insert(incref(elt));
-            }
+            forEachInSnapshot((BoxedSet*)container, [&](BoxAndHash elt) { _setAdd(rtn, elt); });
         } else if (PyDict_CheckExact(container)) {
             for (auto&& elt : ((BoxedDict*)container)->d) {
                 rtn->s.insert(incref(elt.first));
@@ -231,9 +287,7 @@ Box* setInit(Box* _self, Box* container, BoxedDict* kwargs) {
     setClearInternal(self);
 
     if (PyAnySet_Check(container)) {
-        for (auto&& elt : ((BoxedSet*)container)->s) {
-            self->s.insert(incref(elt));
-        }
+        forEachInSnapshot((BoxedSet*)container, [&](BoxAndHash elt) { _setAdd(self, elt); });
     } else if (PyDict_CheckExact(container)) {
         for (auto&& elt : ((BoxedDict*)container)->d) {
             self->s.insert(incref(elt.first));
@@ -253,60 +307,53 @@ static Box* setRepr(Box* _self) {
         return setDescrTypeError<CXX>(_self, "set", "__repr__");
 
     BoxedSet* self = (BoxedSet*)_self;
-    std::vector<char> chars;
-    int status = Py_ReprEnter((PyObject*)self);
+    std::string ty = std::string(_PyType_Name(self->cls));
 
+    // shortcut for the empty set
+    if (self->s.empty())
+        return boxString(ty + "()");
+
+    int status = Py_ReprEnter((PyObject*)self);
     if (status != 0) {
         if (status < 0)
             throwCAPIException();
-
-        std::string ty = std::string(self->cls->tp_name);
-        chars.insert(chars.end(), ty.begin(), ty.end());
-        chars.push_back('(');
-        chars.push_back('.');
-        chars.push_back('.');
-        chars.push_back('.');
-        chars.push_back(')');
-
-        return boxString(llvm::StringRef(&chars[0], chars.size()));
+        return boxString(ty + "(...)");
     }
 
+    std::string chars;
     try {
-        std::string ty = std::string(self->cls->tp_name);
-        chars.insert(chars.end(), ty.begin(), ty.end());
-
-        chars.push_back('(');
-        chars.push_back('[');
+        bool exact_set = self->cls == set_cls;
+        if (!exact_set)
+            chars += ty + "(";
+        chars += '{';
 
         bool first = true;
         for (auto&& elt : self->s) {
-
-            if (!first) {
-                chars.push_back(',');
-                chars.push_back(' ');
-            }
+            if (!first)
+                chars += ", ";
             BoxedString* str = static_cast<BoxedString*>(repr(elt.value));
             AUTO_DECREF(str);
-            chars.insert(chars.end(), str->s().begin(), str->s().end());
-
+            chars += str->s();
             first = false;
         }
-        chars.push_back(']');
-        chars.push_back(')');
+        chars += '}';
+        if (!exact_set)
+            chars += ')';
     } catch (ExcInfo e) {
         Py_ReprLeave((PyObject*)self);
         throw e;
     }
     Py_ReprLeave((PyObject*)self);
-    return boxString(llvm::StringRef(&chars[0], chars.size()));
+    return boxString(chars);
 }
+
 static Box* set_repr(Box* self) noexcept {
     return callCXXFromStyle<CAPI>(setRepr, self);
 }
 
 static void _setSymmetricDifferenceUpdate(BoxedSet* self, Box* other) {
     if (!PyAnySet_Check(other)) {
-        other = makeNewSet(self->cls, other);
+        other = makeNewSet(baseSetType(self), other);
     } else {
         Py_INCREF(other);
     }
@@ -327,7 +374,7 @@ static void _setSymmetricDifferenceUpdate(BoxedSet* self, Box* other) {
 static BoxedSet* setIntersection2(BoxedSet* self, Box* container) {
     RELEASE_ASSERT(PyAnySet_Check(self), "");
 
-    BoxedSet* rtn = makeNewSet(self->cls, NULL);
+    BoxedSet* rtn = makeNewSet(baseSetType(self), NULL);
     AUTO_DECREF(rtn);
     for (auto elt : container->pyElements()) {
         AUTO_DECREF(elt);
@@ -351,9 +398,7 @@ Box* setIOr(BoxedSet* lhs, BoxedSet* rhs) {
         return incref(NotImplemented);
 
     // TODO just [write and] call setUnionUpdate2
-    for (auto&& elt : rhs->s) {
-        _setAdd(lhs, elt);
-    }
+    forEachInSnapshot(rhs, [&](BoxAndHash elt) { _setAdd(lhs, elt); });
     return incref(lhs);
 }
 
@@ -362,7 +407,7 @@ Box* setOr(BoxedSet* lhs, BoxedSet* rhs) {
     if (!PyAnySet_Check(rhs))
         return incref(NotImplemented);
 
-    BoxedSet* rtn = makeNewSet(lhs->cls, lhs);
+    BoxedSet* rtn = makeNewSet(baseSetType(lhs), lhs);
     AUTO_DECREF(rtn);
     return setIOr(rtn, rhs);
 }
@@ -391,9 +436,7 @@ Box* setISub(BoxedSet* lhs, BoxedSet* rhs) {
         return incref(NotImplemented);
 
     // TODO: write and call setDifferenceUpdate2
-    for (auto&& elt : rhs->s) {
-        _setRemove(lhs, elt);
-    }
+    forEachInSnapshot(rhs, [&](BoxAndHash elt) { _setRemove(lhs, elt); });
     return incref(lhs);
 }
 
@@ -402,7 +445,7 @@ Box* setSub(BoxedSet* lhs, BoxedSet* rhs) {
     if (!PyAnySet_Check(rhs))
         return incref(NotImplemented);
 
-    BoxedSet* rtn = makeNewSet(lhs->cls, lhs);
+    BoxedSet* rtn = makeNewSet(baseSetType(lhs), lhs);
     AUTO_DECREF(rtn);
     return setISub(rtn, rhs);
 }
@@ -422,7 +465,7 @@ Box* setXor(BoxedSet* lhs, BoxedSet* rhs) {
     if (!PyAnySet_Check(rhs))
         return incref(NotImplemented);
 
-    BoxedSet* rtn = makeNewSet(lhs->cls, lhs);
+    BoxedSet* rtn = makeNewSet(baseSetType(lhs), lhs);
     AUTO_DECREF(rtn);
     return setIXor(rtn, rhs);
 }
@@ -462,6 +505,58 @@ extern "C" int PySet_Add(PyObject* set, PyObject* key) noexcept {
     }
 }
 
+Box* setContains(BoxedSet* self, Box* key);
+
+extern "C" int PySet_Contains(PyObject* anyset, PyObject* key) noexcept {
+    if (!PyAnySet_Check(anyset)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    try {
+        Box* r = setContains(static_cast<BoxedSet*>(anyset), key);
+        AUTO_DECREF(r);
+        return r == Py_True;
+    } catch (ExcInfo e) {
+        setCAPIException(e);
+        return -1;
+    }
+}
+
+extern "C" int PySet_Discard(PyObject* set, PyObject* key) noexcept {
+    if (!PySet_Check(set)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    try {
+        return _setRemove(static_cast<BoxedSet*>(set), key) ? 1 : 0;
+    } catch (ExcInfo e) {
+        setCAPIException(e);
+        return -1;
+    }
+}
+
+// TODO: this is O(n) per call, since DenseSet iterators can't be stored in *pos.
+extern "C" int _PySet_NextEntry(PyObject* set, Py_ssize_t* pos, PyObject** key, Py_hash_t* hash) noexcept {
+    if (!PyAnySet_Check(set)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    BoxedSet* self = static_cast<BoxedSet*>(set);
+    auto it = self->s.begin();
+    for (Py_ssize_t i = 0; i < *pos && it != self->s.end(); i++)
+        ++it;
+    if (it == self->s.end())
+        return 0;
+    (*pos)++;
+    *key = it->value;
+    *hash = it->hash;
+    return 1;
+}
+
+extern "C" int PySet_ClearFreeList(void) noexcept {
+    return 0;
+}
+
 extern "C" Py_ssize_t PySet_Size(PyObject* anyset) noexcept {
     if (!PyAnySet_Check(anyset)) {
         PyErr_BadInternalCall();
@@ -495,9 +590,7 @@ Box* setUpdate(BoxedSet* self, BoxedTuple* args) {
     for (auto l : *args) {
         if (l->cls == set_cls) {
             BoxedSet* s2 = static_cast<BoxedSet*>(l);
-            for (auto&& p : s2->s) {
-                _setAdd(self, p);
-            }
+            forEachInSnapshot(s2, [&](BoxAndHash p) { _setAdd(self, p); });
         } else {
             for (auto e : l->pyElements()) {
                 _setAddStolen(self, e);
@@ -512,7 +605,7 @@ Box* setUnion(BoxedSet* self, BoxedTuple* args) {
     if (!PyAnySet_Check(self))
         raiseExcHelper(TypeError, "descriptor 'union' requires a 'set' object but received a '%s'", getTypeName(self));
 
-    BoxedSet* rtn = makeNewSet(self->cls, self);
+    BoxedSet* rtn = makeNewSet(baseSetType(self), self);
     AUTO_DECREF(rtn);
 
     for (auto container : args->pyElements()) {
@@ -528,9 +621,7 @@ static void _setDifferenceUpdate(BoxedSet* self, BoxedTuple* args) {
     for (auto container : args->pyElements()) {
         AUTO_DECREF(container);
         if (PyAnySet_Check(container)) {
-            for (auto&& elt : ((BoxedSet*)container)->s) {
-                _setRemove(self, elt);
-            }
+            forEachInSnapshot((BoxedSet*)container, [&](BoxAndHash elt) { _setRemove(self, elt); });
         } else if (PyDict_CheckExact(container)) {
             for (auto&& elt : ((BoxedDict*)container)->d) {
                 _setRemove(self, elt.first);
@@ -558,7 +649,7 @@ Box* setDifference(BoxedSet* self, BoxedTuple* args) {
         raiseExcHelper(TypeError, "descriptor 'difference' requires a 'set' object but received a '%s'",
                        getTypeName(self));
 
-    BoxedSet* rtn = makeNewSet(self->cls, self);
+    BoxedSet* rtn = makeNewSet(baseSetType(self), self);
     AUTO_DECREF(rtn);
     _setDifferenceUpdate(rtn, args);
     return incref(rtn);
@@ -579,7 +670,7 @@ Box* setSymmetricDifference(BoxedSet* self, Box* other) {
         raiseExcHelper(TypeError, "descriptor 'symmetric_difference' requires a 'set' object but received a '%s'",
                        getTypeName(self));
 
-    BoxedSet* rtn = makeNewSet(self->cls, self);
+    BoxedSet* rtn = makeNewSet(baseSetType(self), self);
     AUTO_DECREF(rtn);
     _setSymmetricDifferenceUpdate(rtn, other);
     return incref(rtn);
@@ -637,7 +728,7 @@ static Box* setIntersection(BoxedSet* self, BoxedTuple* args) {
                        getTypeName(self));
 
     if (args->size() == 0)
-        return makeNewSet(self->cls, self);
+        return makeNewSet(baseSetType(self), self);
 
     BoxedSet* rtn = incref(self);
     for (auto container : *args) {
@@ -688,7 +779,7 @@ Box* setPop(BoxedSet* self) {
 Box* setEq(BoxedSet* self, BoxedSet* rhs) {
     RELEASE_ASSERT(PyAnySet_Check(self), "");
     if (!PyAnySet_Check(rhs))
-        Py_RETURN_FALSE;
+        return incref(NotImplemented);
 
     if (self->s.size() != rhs->s.size())
         Py_RETURN_FALSE;
@@ -698,6 +789,8 @@ Box* setEq(BoxedSet* self, BoxedSet* rhs) {
 
 Box* setNe(BoxedSet* self, BoxedSet* rhs) {
     Box* r = setEq(self, rhs);
+    if (r == NotImplemented)
+        return r;
     AUTO_DECREF(r);
     assert(r->cls == bool_cls);
     return boxBool(r == Py_False);
@@ -706,7 +799,7 @@ Box* setNe(BoxedSet* self, BoxedSet* rhs) {
 Box* setLe(BoxedSet* self, BoxedSet* rhs) {
     RELEASE_ASSERT(PyAnySet_Check(self), "");
     if (!PyAnySet_Check(rhs))
-        raiseExcHelper(TypeError, "can only compare to a set");
+        return incref(NotImplemented);
 
     return setIssubset(self, rhs);
 }
@@ -714,7 +807,7 @@ Box* setLe(BoxedSet* self, BoxedSet* rhs) {
 Box* setLt(BoxedSet* self, BoxedSet* rhs) {
     RELEASE_ASSERT(PyAnySet_Check(self), "");
     if (!PyAnySet_Check(rhs))
-        raiseExcHelper(TypeError, "can only compare to a set");
+        return incref(NotImplemented);
 
     if (self->s.size() >= rhs->s.size())
         Py_RETURN_FALSE;
@@ -725,7 +818,7 @@ Box* setLt(BoxedSet* self, BoxedSet* rhs) {
 Box* setGe(BoxedSet* self, BoxedSet* rhs) {
     RELEASE_ASSERT(PyAnySet_Check(self), "");
     if (!PyAnySet_Check(rhs))
-        raiseExcHelper(TypeError, "can only compare to a set");
+        return incref(NotImplemented);
 
     return setIssuperset(self, rhs);
 }
@@ -733,7 +826,7 @@ Box* setGe(BoxedSet* self, BoxedSet* rhs) {
 Box* setGt(BoxedSet* self, BoxedSet* rhs) {
     RELEASE_ASSERT(PyAnySet_Check(self), "");
     if (!PyAnySet_Check(rhs))
-        raiseExcHelper(TypeError, "can only compare to a set");
+        return incref(NotImplemented);
 
     if (self->s.size() <= rhs->s.size())
         Py_RETURN_FALSE;
@@ -820,11 +913,6 @@ Box* setNocmp(BoxedSet* self, BoxedSet* rhs) {
     raiseExcHelper(TypeError, "cannot compare sets using cmp()");
 }
 
-Box* setNonzero(BoxedSet* self) {
-    RELEASE_ASSERT(PyAnySet_Check(self), "");
-    return boxBool(self->s.size());
-}
-
 Box* setNotImplemented(BoxedSet* self) {
     raiseExcHelper(TypeError, "unhashable type: 'set'");
 }
@@ -861,7 +949,8 @@ extern "C" PyObject* PySet_New(PyObject* iterable) noexcept {
 
 extern "C" PyObject* PyFrozenSet_New(PyObject* iterable) noexcept {
     try {
-        return runtimeCall(frozenset_cls, ArgPassSpec(iterable ? 1 : 0), iterable, NULL, NULL, NULL, NULL);
+        // Always a new object, never the shared empty frozenset: callers may fill it in with PySet_Add.
+        return makeNewSet(frozenset_cls, iterable);
     } catch (ExcInfo e) {
         setCAPIException(e);
         return NULL;
@@ -947,7 +1036,7 @@ void setupSet() {
 
     set_cls->tp_dealloc = frozenset_cls->tp_dealloc = BoxedSet::dealloc;
 
-    set_iterator_cls = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(BoxedSetIterator), false, "setiterator",
+    set_iterator_cls = BoxedClass::create(type_cls, object_cls, 0, 0, sizeof(BoxedSetIterator), false, "set_iterator",
                                           false, (destructor)BoxedSetIterator::dealloc, NULL, true,
                                           (traverseproc)BoxedSetIterator::traverse, NOCLEAR);
     set_iterator_cls->giveAttr(
@@ -956,10 +1045,12 @@ void setupSet() {
     set_iterator_cls->giveAttr("__hasnext__", new BoxedFunction(BoxedCode::create((void*)setiteratorHasnext, BOXED_BOOL,
                                                                                   1, "setiterator.__hasnext__")));
     set_iterator_cls->giveAttr(
-        "next", new BoxedFunction(BoxedCode::create((void*)setiteratorNext, UNKNOWN, 1, "setiterator.next")));
+        "__next__", new BoxedFunction(BoxedCode::create((void*)setiteratorNext, UNKNOWN, 1, "setiterator.next")));
     set_iterator_cls->giveAttr(
         "__length_hint__",
         new BoxedFunction(BoxedCode::create((void*)setiteratorLength, BOXED_INT, 1, "setiterator.__length_hint__")));
+    set_iterator_cls->giveAttr("__reduce__", new BoxedFunction(BoxedCode::create((void*)setiteratorReduce, UNKNOWN, 1,
+                                                                                 "set_iterator.__reduce__")));
     set_iterator_cls->freeze();
     set_iterator_cls->tp_iternext = setiter_next;
     set_iterator_cls->tp_iter = PyObject_SelfIter;
@@ -1028,24 +1119,19 @@ void setupSet() {
                       new BoxedFunction(BoxedCode::create((void*)setContains, BOXED_BOOL, 2, "set.__contains__")));
     frozenset_cls->giveAttrBorrowed("__contains__", set_cls->getattr(getStaticString("__contains__")));
 
-    set_cls->giveAttr("__cmp__", new BoxedFunction(BoxedCode::create((void*)setNocmp, NONE, 2, "set.__cmp__")));
-    frozenset_cls->giveAttr("__cmp__", new BoxedFunction(BoxedCode::create((void*)setNocmp, NONE, 2, "set.__cmp__")));
-    set_cls->giveAttr("__eq__", new BoxedFunction(BoxedCode::create((void*)setEq, BOXED_BOOL, 2, "set.__eq__")));
+    set_cls->giveAttr("__eq__", new BoxedFunction(BoxedCode::create((void*)setEq, UNKNOWN, 2, "set.__eq__")));
     frozenset_cls->giveAttrBorrowed("__eq__", set_cls->getattr(getStaticString("__eq__")));
-    set_cls->giveAttr("__ne__", new BoxedFunction(BoxedCode::create((void*)setNe, BOXED_BOOL, 2, "set.__ne__")));
+    set_cls->giveAttr("__ne__", new BoxedFunction(BoxedCode::create((void*)setNe, UNKNOWN, 2, "set.__ne__")));
     frozenset_cls->giveAttrBorrowed("__ne__", set_cls->getattr(getStaticString("__ne__")));
-    set_cls->giveAttr("__le__", new BoxedFunction(BoxedCode::create((void*)setLe, BOXED_BOOL, 2, "set.__le__")));
+    set_cls->giveAttr("__le__", new BoxedFunction(BoxedCode::create((void*)setLe, UNKNOWN, 2, "set.__le__")));
     frozenset_cls->giveAttrBorrowed("__le__", set_cls->getattr(getStaticString("__le__")));
-    set_cls->giveAttr("__lt__", new BoxedFunction(BoxedCode::create((void*)setLt, BOXED_BOOL, 2, "set.__lt__")));
+    set_cls->giveAttr("__lt__", new BoxedFunction(BoxedCode::create((void*)setLt, UNKNOWN, 2, "set.__lt__")));
     frozenset_cls->giveAttrBorrowed("__lt__", set_cls->getattr(getStaticString("__lt__")));
-    set_cls->giveAttr("__ge__", new BoxedFunction(BoxedCode::create((void*)setGe, BOXED_BOOL, 2, "set.__ge__")));
+    set_cls->giveAttr("__ge__", new BoxedFunction(BoxedCode::create((void*)setGe, UNKNOWN, 2, "set.__ge__")));
     frozenset_cls->giveAttrBorrowed("__ge__", set_cls->getattr(getStaticString("__ge__")));
-    set_cls->giveAttr("__gt__", new BoxedFunction(BoxedCode::create((void*)setGt, BOXED_BOOL, 2, "set.__gt__")));
+    set_cls->giveAttr("__gt__", new BoxedFunction(BoxedCode::create((void*)setGt, UNKNOWN, 2, "set.__gt__")));
     frozenset_cls->giveAttrBorrowed("__gt__", set_cls->getattr(getStaticString("__gt__")));
 
-    set_cls->giveAttr("__nonzero__",
-                      new BoxedFunction(BoxedCode::create((void*)setNonzero, BOXED_BOOL, 1, "set.__nonzero__")));
-    frozenset_cls->giveAttrBorrowed("__nonzero__", set_cls->getattr(getStaticString("__nonzero__")));
 
     frozenset_cls->giveAttr("__hash__",
                             new BoxedFunction(BoxedCode::create((void*)setHash, BOXED_INT, 1, "set.__hash__")));

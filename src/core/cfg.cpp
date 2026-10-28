@@ -30,6 +30,7 @@
 #include "runtime/complex.h"
 #include "runtime/long.h"
 #include "runtime/objmodel.h"
+#include "runtime/generator.h"
 #include "runtime/types.h"
 
 //#undef VERBOSITY
@@ -116,6 +117,22 @@ template <typename Node> void fillScopingInfo(Node* node, InternedString id, Sco
     assert(node->lookup_type != ScopeInfo::VarScopeType::UNKNOWN);
 }
 
+// A nested function can change a closure variable through `nonlocal`, so the copy of it in the
+// vregs may be stale; read it straight from the closure.
+template <> void fillScopingInfo(BST_LoadName* node, InternedString id, ScopeInfo* scope_info) {
+    node->lookup_type = scope_info->getScopeTypeOfName(id);
+
+    if (node->lookup_type == ScopeInfo::VarScopeType::CLOSURE && scope_info->isModifiedFromNested(id)) {
+        node->lookup_type = ScopeInfo::VarScopeType::DEREF;
+        node->deref_info = DerefInfo{ DerefInfo::FROM_CREATED_CLOSURE, scope_info->getClosureOffset(id) };
+    } else if (node->lookup_type == ScopeInfo::VarScopeType::CLOSURE)
+        node->closure_offset = scope_info->getClosureOffset(id);
+    else if (node->lookup_type == ScopeInfo::VarScopeType::DEREF)
+        node->deref_info = scope_info->getDerefInfo(id);
+
+    assert(node->lookup_type != ScopeInfo::VarScopeType::UNKNOWN);
+}
+
 void fillScopingInfo(BST_Name* node, ScopeInfo* scope_info) {
     node->lookup_type = scope_info->getScopeTypeOfName(node->id);
 
@@ -132,6 +149,7 @@ ParamNames::ParamNames(AST_arguments* arguments, InternedStringPool& pool)
     if (!arguments)
         return;
 
+    num_posonly = arguments->num_posonly;
     for (int i = 0; i < arguments->args.size(); i++) {
         AST_expr* arg = arguments->args[i];
         if (arg->type == AST_TYPE::Name) {
@@ -145,6 +163,10 @@ ParamNames::ParamNames(AST_arguments* arguments, InternedStringPool& pool)
             all_args.emplace_back(new_name);
         }
     }
+
+    // Keyword-only arguments come right after the positional ones, like in CPython's co_varnames.
+    for (AST_expr* arg : arguments->kwonlyargs)
+        all_args.emplace_back(new BST_Name(ast_cast<AST_Name>(arg)->id));
 
     auto vararg_name = arguments->vararg;
     if (vararg_name) {
@@ -161,11 +183,12 @@ ParamNames::ParamNames(AST_arguments* arguments, InternedStringPool& pool)
     }
 }
 
-ParamNames::ParamNames(const std::vector<const char*>& args, const char* vararg, const char* kwarg)
+ParamNames::ParamNames(const std::vector<const char*>& args, const char* vararg, const char* kwarg, int num_posonly)
     : all_args_contains_names(0),
       takes_param_names(1),
       has_vararg_name(vararg && *vararg),
-      has_kwarg_name(kwarg && *kwarg) {
+      has_kwarg_name(kwarg && *kwarg),
+      num_posonly(num_posonly) {
     all_args.reserve(args.size() + has_vararg_name + has_kwarg_name);
     for (auto&& arg : args) {
         all_args.emplace_back(arg);
@@ -314,6 +337,8 @@ public:
     FutureFlags future_flags;
     BoxedString* fn;
     BoxedModule* bm;
+    // The __qualname__ of each scope being processed, together with the prefix its children get.
+    std::vector<std::pair<std::string, std::string>> qualnames;
 
     ModuleCFGProcessor(AST* ast, bool globals_from_module, FutureFlags future_flags, BoxedString* fn, BoxedModule* bm)
         : scoping(ast, globals_from_module),
@@ -408,6 +433,9 @@ private:
         int did_why;
         // name of the variable to store the reason Why we jumped in.
         InternedString why_name;
+        // set for an except handler, whose cleanup has to run when break or continue leaves it.
+        AST_ExceptHandler* exc_handler = NULL;
+        InternedString saved_exc_name;
 
         ContInfo(CFGBlock* continue_dest, CFGBlock* break_dest, CFGBlock* return_dest, bool say_why,
                  InternedString why_name)
@@ -452,7 +480,7 @@ private:
     CodeConstants code_constants;
 
     llvm::StringMap<BoxedString*> str_constants;
-    llvm::StringMap<Box*> unicode_constants;
+    llvm::StringMap<Box*> bytes_constants;
     // I'm not sure how well it works to use doubles as hashtable keys; thankfully
     // it's not a big deal if we get misses.
     std::unordered_map<int64_t, Box*> imaginary_constants;
@@ -598,7 +626,35 @@ private:
         continuations.emplace_back(finally_block, finally_block, finally_block, true, why_name);
     }
 
+    void pushExceptHandlerContinuation(AST_ExceptHandler* exc_handler, InternedString saved_exc_name) {
+        continuations.emplace_back(nullptr, nullptr, nullptr, false, internString(""));
+        continuations.back().exc_handler = exc_handler;
+        continuations.back().saved_exc_name = saved_exc_name;
+    }
+
     void popContinuation() { continuations.pop_back(); }
+
+    // A resumed generator sees its caller's exception state again, unless it is inside an except handler.
+    void pushUncacheExcInfoAfterYield() {
+        for (auto& cont : continuations) {
+            if (cont.exc_handler)
+                return;
+        }
+        allocAndPush<BST_UncacheExcInfo>();
+    }
+
+    // Restores the exception state saved before the try statement and unbinds `except E as e:`'s name.
+    void emitExceptHandlerCleanup(AST_ExceptHandler* exc_handler, InternedString saved_exc_name) {
+        int lineno = exc_handler->lineno;
+        makeCall(TmpValue(addConst(incref(restore_exc_info_func)), lineno), { _dup(TmpValue(saved_exc_name, lineno)) });
+        if (exc_handler->name) {
+            pushAssign(exc_handler->name, TmpValue(addConst(incref(Py_None)), lineno));
+            AST_Delete del;
+            del.lineno = lineno;
+            del.targets.push_back(exc_handler->name);
+            visit_delete(&del);
+        }
+    }
 
     void doReturn(TmpValue value) {
         assert(curblock);
@@ -625,6 +681,8 @@ private:
     void doContinue(AST* value) {
         assert(curblock);
         for (auto& cont : llvm::make_range(continuations.rbegin(), continuations.rend())) {
+            if (cont.exc_handler)
+                emitExceptHandlerCleanup(cont.exc_handler, cont.saved_exc_name);
             if (cont.continue_dest) {
                 if (cont.say_why) {
                     pushAssign(cont.why_name, makeNum(Why::CONTINUE, value->lineno));
@@ -642,6 +700,8 @@ private:
     void doBreak(AST* value) {
         assert(curblock);
         for (auto& cont : llvm::make_range(continuations.rbegin(), continuations.rend())) {
+            if (cont.exc_handler)
+                emitExceptHandlerCleanup(cont.exc_handler, cont.saved_exc_name);
             if (cont.break_dest) {
                 if (cont.say_why) {
                     pushAssign(cont.why_name, makeNum(Why::BREAK, value->lineno));
@@ -678,9 +738,14 @@ private:
         if (!name)
             return TmpValue();
 
-        // we treat None as a constant because it can never get modified
+        // None, True and False are keywords, so they can never get modified
         if (name->id == "None")
             return makeNone(name->lineno);
+        if (name->id == "True" || name->id == "False")
+            return TmpValue(addConst(incref(name->id == "True" ? Py_True : Py_False)), name->lineno);
+        // The front end names the `...` literal "...", which can't be rebound.
+        if (name->id == "...")
+            return TmpValue(addConst(incref(Py_Ellipsis)), name->lineno);
 
         auto rtn = allocAndPush<BST_LoadName>();
         rtn->lineno = name->lineno;
@@ -738,11 +803,6 @@ private:
         return TmpValue(vreg_const, lineno);
     }
 
-    TmpValue applyComprehensionCall(AST_ListComp* node, TmpValue name) {
-        TmpValue elt = remapExpr(node->elt);
-        return makeCallAttr(name, internString("append"), true, { elt });
-    }
-
     TmpValue _dup(TmpValue val) {
         if (val.isName()) {
             BST_CopyVReg* assign = allocAndPush<BST_CopyVReg>();
@@ -755,109 +815,6 @@ private:
             return createDstName(assign);
         }
         return val;
-    }
-
-    template <typename CompType> TmpValue remapComprehension(CompType* node) {
-        assert(curblock);
-
-        auto* list = allocAndPush<BST_List>(0);
-        list->lineno = node->lineno;
-        TmpValue rtn_name = createDstName(list);
-        struct BlockInfo {
-            CFGBlock* exit_block;
-            CFGBlock* test_block;
-            InternedString is;
-        };
-        llvm::SmallVector<BlockInfo, 4> blocks;
-
-        for (int i = 0, n = node->generators.size(); i < n; i++) {
-            AST_comprehension* c = node->generators[i];
-            bool is_innermost = (i == n - 1);
-
-            TmpValue remapped_iter = remapExpr(c->iter);
-            BST_GetIter* iter_call = allocAndPush<BST_GetIter>();
-            unmapExpr(remapped_iter, &iter_call->vreg_value);
-            iter_call->lineno = c->target->lineno; // Not sure if this should be c->target or c->iter
-            TmpValue iter_name(nodeName("lc_iter", i), node->lineno);
-            unmapExpr(iter_name, &iter_call->vreg_dst);
-
-            CFGBlock* test_block = cfg->addDeferredBlock();
-            test_block->info = "comprehension_test";
-            // printf("Test block for comp %d is %d\n", i, test_block->idx);
-            pushJump(test_block);
-
-            setInsertPoint(test_block);
-            auto dup_iter_name = _dup(iter_name);
-            BST_HasNext* test_call = allocAndPush<BST_HasNext>();
-            unmapExpr(dup_iter_name, &test_call->vreg_value);
-            test_call->lineno = c->target->lineno;
-            TmpValue tmp_test_name = createDstName(test_call);
-
-            CFGBlock* body_block = cfg->addDeferredBlock();
-            body_block->info = "comprehension_body";
-            CFGBlock* exit_block = cfg->addDeferredBlock();
-            exit_block->info = "comprehension_exit";
-            blocks.emplace_back(BlockInfo{ exit_block, test_block, iter_name.is });
-            // printf("Body block for comp %d is %d\n", i, body_block->idx);
-
-            BST_Branch* br = allocAndPush<BST_Branch>();
-            br->lineno = node->lineno;
-            unmapExpr(tmp_test_name, &br->vreg_test);
-            br->iftrue = (CFGBlock*)body_block;
-            br->iffalse = (CFGBlock*)exit_block;
-            curblock->connectTo(body_block);
-            curblock->connectTo(exit_block);
-
-            setInsertPoint(body_block);
-            TmpValue next_name(nodeName(), node->lineno);
-            pushAssign(next_name, makeCallAttr(_dup(iter_name), internString("next"), true));
-            pushAssign(c->target, next_name);
-
-            for (AST_expr* if_condition : c->ifs) {
-                TmpValue remapped = callNonzero(remapExpr(if_condition));
-                BST_Branch* br = allocAndPush<BST_Branch>();
-                unmapExpr(remapped, &br->vreg_test);
-
-                // Put this below the entire body?
-                CFGBlock* body_tramp = cfg->addDeferredBlock();
-                body_tramp->info = "comprehension_if_trampoline";
-                // printf("body_tramp for %d is %d\n", i, body_tramp->idx);
-                CFGBlock* body_continue = cfg->addDeferredBlock();
-                body_continue->info = "comprehension_if_continue";
-                // printf("body_continue for %d is %d\n", i, body_continue->idx);
-
-                br->iffalse = (CFGBlock*)body_tramp;
-                curblock->connectTo(body_tramp);
-                br->iftrue = (CFGBlock*)body_continue;
-                curblock->connectTo(body_continue);
-
-                setInsertPoint(body_tramp);
-                pushJump(test_block, true);
-
-                setInsertPoint(body_continue);
-            }
-
-            if (is_innermost) {
-                applyComprehensionCall(node, _dup(rtn_name));
-
-                pushJump(test_block, true);
-            } else {
-                // continue onto the next comprehension and add to this body
-            }
-        }
-
-        assert(blocks.size());
-        for (int i = blocks.size() - 1; i >= 0; --i) {
-            // every exit block except the first one jumps to the previous test block (because we add them in reverse)
-            // the first one is the block where we continue execution
-            setInsertPoint(blocks[i].exit_block);
-            if (i > 0) {
-                makeKill(blocks[i].is);
-                pushJump(blocks[i - 1].test_block, true);
-            }
-        }
-
-        return rtn_name;
     }
 
     void pushJump(CFGBlock* target, bool allow_backedge = false, int lineno = 0) {
@@ -889,6 +846,15 @@ private:
         curblock->connectTo(iftrue);
         curblock->connectTo(iffalse);
         curblock = nullptr;
+    }
+
+    // Sets the frame's exception info to copies of the given values, which stay usable afterwards.
+    void pushSetExcInfo(TmpValue type, TmpValue value, TmpValue traceback) {
+        TmpValue dup_type = _dup(type), dup_value = _dup(value), dup_traceback = _dup(traceback);
+        BST_SetExcInfo* set_exc_info = allocAndPush<BST_SetExcInfo>();
+        unmapExpr(dup_type, &set_exc_info->vreg_type);
+        unmapExpr(dup_value, &set_exc_info->vreg_value);
+        unmapExpr(dup_traceback, &set_exc_info->vreg_traceback);
     }
 
     void pushReraise(int lineno, InternedString exc_type_name, InternedString exc_value_name,
@@ -1034,14 +1000,29 @@ private:
             a_target->lineno = a->lineno;
         } else if (target->type == AST_TYPE::Tuple || target->type == AST_TYPE::List) {
             std::vector<AST_expr*>* elts;
+            std::vector<bool>* starred;
             if (target->type == AST_TYPE::Tuple) {
                 AST_Tuple* _t = ast_cast<AST_Tuple>(target);
                 assert(_t->ctx_type == AST_TYPE::Store);
                 elts = &_t->elts;
+                starred = &_t->elt_starred;
             } else {
                 AST_List* _t = ast_cast<AST_List>(target);
                 assert(_t->ctx_type == AST_TYPE::Store);
                 elts = &_t->elts;
+                starred = &_t->elt_starred;
+            }
+
+            // `a, *b, c = val` becomes `a, b, c = unpack_starred(val, 1, 1)`
+            if (!starred->empty()) {
+                int star_idx = std::find(starred->begin(), starred->end(), true) - starred->begin();
+                if (std::count(starred->begin(), starred->end(), true) > 1)
+                    raiseSyntaxError("multiple starred expressions in assignment", target->lineno, target->col_offset,
+                                     filename->s(), "", true);
+                int after = elts->size() - star_idx - 1;
+                val = makeCall(TmpValue(addConst(incref(unpack_starred_func)), val.lineno),
+                               { val, TmpValue(addConst(boxInt(star_idx)), val.lineno),
+                                 TmpValue(addConst(boxInt(after)), val.lineno) });
             }
 
             BST_UnpackIntoArray* unpack = allocAndPush<BST_UnpackIntoArray>(elts->size());
@@ -1210,12 +1191,12 @@ private:
         for (int i = 0; i < node->args.size(); ++i) {
             remapped_args.emplace_back(remapExpr(node->args[i]));
         }
+        // Python 3 evaluates *args before the keyword arguments.
+        auto remapped_starargs = remapExpr(node->starargs);
         llvm::SmallVector<TmpValue, 8> remapped_keywords;
         for (int i = 0; i < node->keywords.size(); ++i) {
             remapped_keywords.emplace_back(remapExpr(node->keywords[i]->value));
         }
-
-        auto remapped_starargs = remapExpr(node->starargs);
         auto remapped_kwargs = remapExpr(node->kwargs);
 
         if (node->func->type == AST_TYPE::Attribute) {
@@ -1344,9 +1325,17 @@ private:
         TmpValue dict_name = createDstName(rtn);
 
         for (int i = 0; i < node->keys.size(); i++) {
+            if (!node->keys[i]) {
+                // `{**value}`
+                auto remapped_value = remapExpr(node->values[i]);
+                makeCall(TmpValue(addConst(incref(dict_merge_mapping_func)), node->lineno),
+                         { _dup(dict_name), remapped_value });
+                continue;
+            }
+            // Python 3.8 evaluates the key first.
+            auto remapped_slice = remapExpr(node->keys[i]);
             auto remapped_value = remapExpr(node->values[i]);
             auto remapped_target = _dup(dict_name);
-            auto remapped_slice = remapExpr(node->keys[i]);
 
             BST_StoreSub* store = allocAndPush<BST_StoreSub>();
             store->lineno = node->values[i]->lineno;
@@ -1452,6 +1441,13 @@ private:
         insert_point->push_back(makeASTExpr(allocator, makeASTCall(allocator, setitem, node->key, node->value)));
     }
 
+    void emitComprehensionYield(ASTAllocator& allocator, AST_ListComp* node, InternedString list_name,
+                                std::vector<AST_stmt*>* insert_point) {
+        AST_expr* append = makeASTLoadAttribute(
+            allocator, makeASTName(allocator, list_name, AST_TYPE::Load, node->lineno), internString("append"), true);
+        insert_point->push_back(makeASTExpr(allocator, makeASTCall(allocator, append, node->elt)));
+    }
+
     void emitComprehensionYield(ASTAllocator& allocator, AST_SetComp* node, InternedString set_name,
                                 std::vector<AST_stmt*>* insert_point) {
         // add entry to the dictionary
@@ -1459,6 +1455,9 @@ private:
                                              internString("add"), true);
         insert_point->push_back(makeASTExpr(allocator, makeASTCall(allocator, add, node->elt)));
     }
+
+    static void setLoadContext(AST_List* node) { node->ctx_type = AST_TYPE::Load; }
+    static void setLoadContext(AST_expr* node) {}
 
     template <typename ResultType, typename CompType> TmpValue remapScopedComprehension(CompType* node) {
         // See comment in remapGeneratorExp re early vs. late binding.
@@ -1474,7 +1473,9 @@ private:
         InternedString rtn_name = internString("#comp_rtn");
         auto asgn = new (allocator) AST_Assign();
         asgn->targets.push_back(makeASTName(allocator, rtn_name, AST_TYPE::Store, node->lineno));
-        asgn->value = new (allocator) ResultType();
+        auto empty = new (allocator) ResultType();
+        setLoadContext(empty);
+        asgn->value = empty;
         asgn->lineno = node->lineno;
         new_body.push_back(asgn);
 
@@ -1490,8 +1491,13 @@ private:
         rtn->lineno = node->lineno;
         new_body.push_back(rtn);
 
-        // I'm not sure this actually gets used
-        static BoxedString* comp_name = getStaticString("<comperehension>");
+        // The code object's name, as in CPython.
+        static BoxedString* listcomp_name = getStaticString("<listcomp>");
+        static BoxedString* setcomp_name = getStaticString("<setcomp>");
+        static BoxedString* dictcomp_name = getStaticString("<dictcomp>");
+        BoxedString* comp_name = node->type == AST_TYPE::ListComp
+                                     ? listcomp_name
+                                     : (node->type == AST_TYPE::SetComp ? setcomp_name : dictcomp_name);
 
         BoxedCode* code = cfgizer->runRecursively(new_body, comp_name, node->lineno, args, node);
         BST_MakeFunction* mkfunc = allocAndPush<BST_MakeFunction>(0, 0);
@@ -1500,6 +1506,12 @@ private:
         TmpValue func_var_name = createDstName(mkfunc);
 
         return makeCall(func_var_name, { first });
+    }
+
+    TmpValue remapNamedExpr(AST_NamedExpr* node) {
+        TmpValue value = remapExpr(node->value);
+        pushAssign(node->target, _dup(value));
+        return value;
     }
 
     TmpValue remapIfExp(AST_IfExp* node) {
@@ -1530,6 +1542,42 @@ private:
         return TmpValue(rtn_name, node->lineno);
     }
 
+    // Evaluates the defaults of the keyword-only arguments into a dict.  Returns an undefined TmpValue
+    // if none of them has a default.
+    TmpValue remapKwDefaults(AST_arguments* args) {
+        ASTAllocator allocator;
+        AST_Dict* d = NULL;
+        for (int i = 0; i < args->kwonlyargs.size(); i++) {
+            if (!args->kw_defaults[i])
+                continue;
+            if (!d) {
+                d = new (allocator) AST_Dict();
+                d->lineno = args->kw_defaults[i]->lineno;
+            }
+            d->keys.push_back(new (allocator) AST_Str(ast_cast<AST_Name>(args->kwonlyargs[i])->id.s().str()));
+            d->values.push_back(args->kw_defaults[i]);
+        }
+        if (!d)
+            return TmpValue();
+        return remapExpr(d);
+    }
+
+    // Stores the keyword-only defaults on a freshly made function and then applies the decorators,
+    // which BST_MakeFunction would otherwise have done itself.
+    TmpValue finishFunction(TmpValue func, TmpValue kwdefaults, llvm::ArrayRef<TmpValue> decorators) {
+        auto func_copy = _dup(func);
+        BST_StoreAttr* store = allocAndPush<BST_StoreAttr>();
+        store->lineno = func.lineno;
+        unmapExpr(kwdefaults, &store->vreg_value);
+        unmapExpr(func, &store->vreg_target);
+        store->index_attr = remapInternedString(internString("__kwdefaults__"));
+
+        func = func_copy;
+        for (int i = decorators.size() - 1; i >= 0; i--)
+            func = makeCall(decorators[i], { func });
+        return func;
+    }
+
     TmpValue remapLambda(AST_Lambda* node) {
         ASTAllocator allocator;
         auto stmt = new (allocator) AST_Return;
@@ -1541,6 +1589,7 @@ private:
         for (int i = 0; i < node->args->defaults.size(); ++i) {
             remapped_defaults.emplace_back(remapExpr(node->args->defaults[i]));
         }
+        TmpValue kwdefaults = remapKwDefaults(node->args);
 
         auto mkfn = allocAndPush<BST_MakeFunction>(0 /* decorators */, node->args->defaults.size());
         mkfn->lineno = node->lineno;
@@ -1553,11 +1602,17 @@ private:
         auto* code = cfgizer->runRecursively({ stmt }, name, mkfn->lineno, node->args, node);
         mkfn->vreg_code_obj = addConst(code);
 
+        if (!kwdefaults.isUndefined())
+            return finishFunction(createDstName(mkfn), kwdefaults, {});
         return createDstName(mkfn);
     }
 
     TmpValue remapLangPrimitive(AST_LangPrimitive* node) {
-        // AST_LangPrimitive can be PRINT_EXPR
+        if (node->opcode == AST_LangPrimitive::SETUP_ANNOTATIONS) {
+            makeCall(TmpValue(addConst(incref(setup_annotations_func)), node->lineno));
+            return TmpValue();
+        }
+        // Otherwise AST_LangPrimitive can only be PRINT_EXPR
         assert(node->opcode == AST_LangPrimitive::PRINT_EXPR);
         assert(node->args.size() == 1);
         auto remapped_value = remapExpr(node->args[0]);
@@ -1567,8 +1622,33 @@ private:
         return TmpValue();
     }
 
+    // A display with `*starred` elements: build a list (or set) and extend it piece by piece.
+    TmpValue remapStarredDisplay(const std::vector<AST_expr*>& elts, const std::vector<bool>& starred, bool is_set,
+                                 int lineno) {
+        TmpValue rtn;
+        if (is_set) {
+            auto* s = allocAndPush<BST_Set>(0);
+            s->lineno = lineno;
+            rtn = createDstName(s);
+        } else {
+            auto* l = allocAndPush<BST_List>(0);
+            l->lineno = lineno;
+            rtn = createDstName(l);
+        }
+        TmpValue rtn_name(nodeName("display"), lineno);
+        pushAssign(rtn_name, rtn);
+        for (int i = 0; i < elts.size(); i++) {
+            TmpValue v = remapExpr(elts[i]);
+            const char* method = is_set ? (starred[i] ? "update" : "add") : (starred[i] ? "extend" : "append");
+            makeCallAttr(_dup(rtn_name), internString(method), true, { v });
+        }
+        return rtn_name;
+    }
+
     TmpValue remapList(AST_List* node) {
         assert(node->ctx_type == AST_TYPE::Load);
+        if (!node->elt_starred.empty())
+            return remapStarredDisplay(node->elts, node->elt_starred, false, node->lineno);
         llvm::SmallVector<TmpValue, 8> remapped_elts;
         for (int i = 0; i < node->elts.size(); ++i) {
             remapped_elts.emplace_back(remapExpr(node->elts[i]));
@@ -1590,6 +1670,8 @@ private:
     }
 
     TmpValue remapSet(AST_Set* node) {
+        if (!node->elt_starred.empty())
+            return remapStarredDisplay(node->elts, node->elt_starred, true, node->lineno);
         llvm::SmallVector<TmpValue, 8> remapped_elts;
         for (int i = 0; i < node->elts.size(); ++i) {
             remapped_elts.emplace_back(remapExpr(node->elts[i]));
@@ -1650,10 +1732,13 @@ private:
                 else
                     incref(o);
                 return o;
-            } else if (str->str_type == AST_Str::UNICODE) {
-                Box*& r = unicode_constants[str->str_data];
-                if (!r)
-                    r = decodeUTF8StringPtr(str->str_data);
+            } else if (str->str_type == AST_Str::BYTES) {
+                Box*& r = bytes_constants[str->str_data];
+                if (!r) {
+                    r = PyBytes_FromStringAndSize(str->str_data.data(), str->str_data.size());
+                    if (!r)
+                        throwCAPIException();
+                }
                 else
                     incref(r);
                 return r;
@@ -1687,6 +1772,10 @@ private:
 
     TmpValue remapTuple(AST_Tuple* node) {
         assert(node->ctx_type == AST_TYPE::Load);
+        if (!node->elt_starred.empty()) {
+            TmpValue l = remapStarredDisplay(node->elts, node->elt_starred, false, node->lineno);
+            return makeCall(TmpValue(addConst(incref(tuple_cls)), node->lineno), { l });
+        }
         llvm::SmallVector<TmpValue, 8> remapped_elts;
         for (int i = 0; i < node->elts.size(); ++i) {
             remapped_elts.emplace_back(remapExpr(node->elts[i]));
@@ -1734,7 +1823,71 @@ private:
         return createDstName(rtn);
     }
 
+    // `yield from x` becomes
+    //     it = yield_from_iter(x); sent = None
+    //     while True:
+    //         done, val = yield_from_step(it, sent)
+    //         if done: break
+    //         sent = yield val
+    // and evaluates to val.
+    TmpValue remapYieldFrom(AST_Yield* node) {
+        int lineno = node->lineno;
+        if (root_type != AST_TYPE::FunctionDef && root_type != AST_TYPE::Lambda)
+            raiseSyntaxError("'yield' outside function", node->lineno, node->col_offset, filename->s(), "", true);
+
+        TmpValue iter_name(nodeName("yf_iter"), lineno);
+        TmpValue sent_name(nodeName("yf_sent"), lineno);
+        TmpValue done_name(nodeName("yf_done"), lineno);
+        TmpValue val_name(nodeName("yf_val"), lineno);
+
+        auto remapped_value = remapExpr(node->value);
+        pushAssign(iter_name, makeCall(TmpValue(addConst(incref(yield_from_iter_func)), lineno), { remapped_value }));
+        pushAssign(sent_name, makeNone(lineno));
+
+        CFGBlock* test_block = cfg->addDeferredBlock();
+        test_block->info = "yield_from_test";
+        pushJump(test_block);
+
+        setInsertPoint(test_block);
+        TmpValue step
+            = makeCall(TmpValue(addConst(incref(yield_from_step_func)), lineno), { _dup(iter_name), sent_name });
+        BST_UnpackIntoArray* unpack = allocAndPush<BST_UnpackIntoArray>(2);
+        unpack->lineno = lineno;
+        unmapExpr(step, &unpack->vreg_src);
+        unmapExpr(done_name, &unpack->vreg_dst[0]);
+        unmapExpr(val_name, &unpack->vreg_dst[1]);
+
+        CFGBlock* body_block = cfg->addDeferredBlock();
+        body_block->info = "yield_from_body";
+        CFGBlock* exit_block = cfg->addDeferredBlock();
+        exit_block->info = "yield_from_exit";
+        auto done_test = callNonzero(done_name);
+        BST_Branch* br = allocAndPush<BST_Branch>();
+        br->lineno = lineno;
+        unmapExpr(done_test, &br->vreg_test);
+        br->iftrue = exit_block;
+        br->iffalse = body_block;
+        curblock->connectTo(body_block);
+        curblock->connectTo(exit_block);
+
+        setInsertPoint(body_block);
+        TmpValue yielded = _dup(val_name);
+        BST_Yield* y = allocAndPush<BST_Yield>();
+        y->lineno = lineno;
+        unmapExpr(yielded, &y->vreg_value);
+        pushAssign(sent_name, createDstName(y));
+        pushUncacheExcInfoAfterYield();
+        pushJump(test_block, true);
+
+        setInsertPoint(exit_block);
+        makeKill(iter_name.is);
+        return val_name;
+    }
+
     TmpValue remapYield(AST_Yield* node) {
+        if (node->yield_from)
+            return remapYieldFrom(node);
+
         auto remapped_value = remapExpr(node->value);
         BST_Yield* rtn = allocAndPush<BST_Yield>();
         rtn->lineno = node->lineno;
@@ -1742,10 +1895,10 @@ private:
 
         TmpValue val = createDstName(rtn);
 
-        allocAndPush<BST_UncacheExcInfo>();
+        pushUncacheExcInfoAfterYield();
 
         if (root_type != AST_TYPE::FunctionDef && root_type != AST_TYPE::Lambda)
-            raiseExcHelper(SyntaxError, "'yield' outside function");
+            raiseSyntaxError("'yield' outside function", node->lineno, node->col_offset, filename->s(), "", true);
 
         return val;
     }
@@ -1791,6 +1944,9 @@ private:
             case AST_TYPE::IfExp:
                 rtn = remapIfExp(ast_cast<AST_IfExp>(node));
                 break;
+            case AST_TYPE::NamedExpr:
+                rtn = remapNamedExpr(ast_cast<AST_NamedExpr>(node));
+                break;
             case AST_TYPE::Lambda:
                 rtn = remapLambda(ast_cast<AST_Lambda>(node));
                 break;
@@ -1801,7 +1957,7 @@ private:
                 rtn = remapList(ast_cast<AST_List>(node));
                 break;
             case AST_TYPE::ListComp:
-                rtn = remapComprehension(ast_cast<AST_ListComp>(node));
+                rtn = remapScopedComprehension<AST_List>(ast_cast<AST_ListComp>(node));
                 break;
             case AST_TYPE::Name:
                 rtn = remapName(ast_cast<AST_Name>(node));
@@ -1919,6 +2075,20 @@ public:
         }
         TmpValue bases_name = createDstName(bases);
 
+        TmpValue kwargs_name;
+        ASTAllocator allocator;
+        if (!node->keywords.empty()) {
+            AST_Dict* kwargs = new (allocator) AST_Dict();
+            kwargs->lineno = node->lineno;
+            for (AST_keyword* kw : node->keywords) {
+                AST_Str* key = new (allocator) AST_Str(kw->arg.s().str());
+                key->lineno = node->lineno;
+                kwargs->keys.push_back(key);
+                kwargs->values.push_back(kw->value);
+            }
+            kwargs_name = remapExpr(kwargs);
+        }
+
         auto mkclass = allocAndPush<BST_MakeClass>(node->decorator_list.size());
         mkclass->lineno = node->lineno;
         mkclass->index_name = remapInternedString(node->name);
@@ -1928,6 +2098,8 @@ public:
         }
 
         unmapExpr(bases_name, &mkclass->vreg_bases_tuple);
+        if (!node->keywords.empty())
+            unmapExpr(kwargs_name, &mkclass->vreg_kwargs);
 
         auto* code = cfgizer->runRecursively(node->body, node->name.getBox(), node->lineno, NULL, node);
         mkclass->vreg_code_obj = addConst(code);
@@ -1949,23 +2121,28 @@ public:
         for (int i = 0; i < node->args->defaults.size(); ++i) {
             remapped_defaults.emplace_back(remapExpr(node->args->defaults[i]));
         }
+        TmpValue kwdefaults = remapKwDefaults(node->args);
+        // With keyword-only defaults, the decorators get applied after storing __kwdefaults__.
+        int num_decorator = kwdefaults.isUndefined() ? node->decorator_list.size() : 0;
 
-        auto mkfunc = allocAndPush<BST_MakeFunction>(node->decorator_list.size(), node->args->defaults.size());
+        auto mkfunc = allocAndPush<BST_MakeFunction>(num_decorator, node->args->defaults.size());
         mkfunc->lineno = node->lineno;
         mkfunc->index_name = remapInternedString(node->name);
 
         // Decorators are evaluated before the defaults, so this *must* go before remapArguments().
         // TODO(rntz): do we have a test for this
-        for (int i = 0; i < node->decorator_list.size(); ++i) {
+        for (int i = 0; i < num_decorator; ++i) {
             unmapExpr(remapped_deco[i], &mkfunc->elts[i]);
         }
         for (int i = 0; i < node->args->defaults.size(); ++i) {
-            unmapExpr(remapped_defaults[i], &mkfunc->elts[node->decorator_list.size() + i]);
+            unmapExpr(remapped_defaults[i], &mkfunc->elts[num_decorator + i]);
         }
 
         auto* code = cfgizer->runRecursively(node->body, node->name.getBox(), node->lineno, node->args, node);
         mkfunc->vreg_code_obj = addConst(code);
         auto tmp = createDstName(mkfunc);
+        if (!kwdefaults.isUndefined())
+            tmp = finishFunction(tmp, kwdefaults, remapped_deco);
         pushAssign(TmpValue(scoping->mangleName(node->name), node->lineno), tmp);
 
         return true;
@@ -2410,7 +2587,7 @@ public:
         assert(curblock);
 
         if (root_type != AST_TYPE::FunctionDef && root_type != AST_TYPE::Lambda && root_type != AST_TYPE::Expression) {
-            raiseExcHelper(SyntaxError, "'return' outside function");
+            raiseSyntaxError("'return' outside function", node->lineno, node->col_offset, filename->s(), "", true);
         }
 
         if (!curblock)
@@ -2614,7 +2791,7 @@ public:
         pushLoopContinuation(test_block, break_block);
 
         setInsertPoint(loop_block);
-        TmpValue next_name = makeCallAttr(_dup(itername), internString("next"), true);
+        TmpValue next_name = makeCallAttr(_dup(itername), internString("__next__"), true);
         pushAssign(node->target, next_name);
 
         for (int i = 0; i < node->body.size(); i++) {
@@ -2682,7 +2859,13 @@ public:
         TmpValue remapped_arg0, remapped_arg1, remapped_arg2;
         if (node->arg0)
             remapped_arg0 = remapExpr(node->arg0);
-        if (node->arg1)
+        // 'raise X from Y'
+        bool has_cause = node->arg1 && !node->arg2;
+        if (has_cause) {
+            TmpValue cause = remapExpr(node->arg1);
+            remapped_arg0
+                = makeCall(TmpValue(addConst(incref(raise_from_func)), node->lineno), { remapped_arg0, cause });
+        } else if (node->arg1)
             remapped_arg1 = remapExpr(node->arg1);
         if (node->arg2)
             remapped_arg2 = remapExpr(node->arg2);
@@ -2691,7 +2874,7 @@ public:
         remapped->lineno = node->lineno;
         if (node->arg0)
             unmapExpr(remapped_arg0, &remapped->vreg_arg0);
-        if (node->arg1)
+        if (node->arg1 && !has_cause)
             unmapExpr(remapped_arg1, &remapped->vreg_arg1);
         if (node->arg2)
             unmapExpr(remapped_arg2, &remapped->vreg_arg2);
@@ -2712,6 +2895,11 @@ public:
         TmpValue exc_type_name(nodeName("type"), node->lineno);
         TmpValue exc_value_name(nodeName("value"), node->lineno);
         TmpValue exc_traceback_name(nodeName("traceback"), node->lineno);
+        // Python 3 restores the exception state from before the try statement once a handler is done.
+        // Saving it here rather than in the handler keeps it right when an inner handler raised.
+        TmpValue saved_exc(nodeName("saved_exc"), node->lineno);
+        pushAssign(saved_exc, makeCall(TmpValue(addConst(incref(get_exc_value_func)), node->lineno)));
+
         exc_handlers.push_back(
             { exc_handler_block, exc_type_name.is, exc_value_name.is, exc_traceback_name.is, false });
 
@@ -2783,13 +2971,18 @@ public:
                 unmapExpr(exc_value_name, &set_exc_info->vreg_value);
                 unmapExpr(exc_traceback_name, &set_exc_info->vreg_traceback);
 
+                pushExceptHandlerContinuation(exc_handler, saved_exc.is);
                 for (AST_stmt* subnode : exc_handler->body) {
                     subnode->accept(this);
                     if (!curblock)
                         break;
                 }
+                popContinuation();
 
                 if (curblock) {
+                    emitExceptHandlerCleanup(exc_handler, saved_exc.is);
+
+                    // TODO: CPython also unbinds `e` when the handler raises.
                     pushJump(join_block);
                 }
 
@@ -2861,6 +3054,9 @@ public:
             delete exc_handler_block;
         } else {
             setInsertPoint(exc_handler_block);
+            // While the finally block runs for an exception, that exception is the one being handled.
+            pushSetExcInfo(TmpValue(exc_type_name, node->lineno), TmpValue(exc_value_name, node->lineno),
+                           TmpValue(exc_traceback_name, node->lineno));
             pushAssign(exc_why_name, makeNum(Why::EXCEPTION, node->lineno));
             pushJump(finally_block);
         }
@@ -2943,6 +3139,11 @@ public:
         if (node->optional_vars)
             pushAssign(node->optional_vars, enter);
 
+        // __exit__ runs with the exception set as the one being handled, and the previous state comes back
+        // when it suppresses the exception.
+        TmpValue saved_exc(nodeName("saved_exc"), node->lineno);
+        pushAssign(saved_exc, makeCall(TmpValue(addConst(incref(get_exc_value_func)), node->lineno)));
+
         // push continuations
         CFGBlock* finally_block = cfg->addDeferredBlock();
         finally_block->info = "with_finally";
@@ -2975,6 +3176,8 @@ public:
         } else {
             setInsertPoint(exc_block);
 
+            pushSetExcInfo(exc_type_name, exc_value_name, exc_traceback_name);
+
             // call the context-manager's exit method
             TmpValue suppressname(nodeName("suppress"), node->lineno);
             pushAssign(suppressname,
@@ -2989,6 +3192,7 @@ public:
             pushBranch(suppressname, exiter, reraise_block);
 
             setInsertPoint(exiter);
+            makeCall(TmpValue(addConst(incref(restore_exc_info_func)), node->lineno), { saved_exc });
             pushJump(exit_block);
 
             // otherwise, reraise the exception
@@ -3326,6 +3530,8 @@ static std::pair<CFG*, CodeConstants> computeCFG(llvm::ArrayRef<AST_stmt*> body,
         fillScopingInfo(module_name_value, id, scoping);
         TmpValue module_name = visitor.createDstName(module_name_value);
         visitor.pushStoreName(stringpool.get("__module__"), module_name);
+        visitor.pushStoreName(stringpool.get("__qualname__"),
+                              TmpValue(visitor.addConst(boxString(cfgizer->qualnames.back().first)), lineno));
 
         // If the first statement is just a single string, transform it to an assignment to __doc__
         if (body.size() && body[0]->type == AST_TYPE::Expr) {
@@ -3531,6 +3737,16 @@ BoxedCode* ModuleCFGProcessor::runRecursively(llvm::ArrayRef<AST_stmt*> body, Bo
     ScopeInfo* scope_info = scoping.getScopeInfoForNode(orig_node);
 
     AST_TYPE::AST_TYPE ast_type = orig_node->type;
+
+    // TODO: CPython also resets the prefix for names declared global in the enclosing function.
+    std::string qualname = (qualnames.empty() ? std::string() : qualnames.back().second) + name->s().str();
+    std::string child_prefix;
+    if (ast_type == AST_TYPE::ClassDef)
+        child_prefix = qualname + ".";
+    else if (ast_type != AST_TYPE::Module && ast_type != AST_TYPE::Expression && ast_type != AST_TYPE::Suite)
+        child_prefix = qualname + ".<locals>.";
+    qualnames.emplace_back(qualname, child_prefix);
+
     bool is_generator;
     switch (ast_type) {
         case AST_TYPE::ClassDef:
@@ -3541,6 +3757,7 @@ BoxedCode* ModuleCFGProcessor::runRecursively(llvm::ArrayRef<AST_stmt*> body, Bo
             break;
         case AST_TYPE::GeneratorExp:
         case AST_TYPE::DictComp:
+        case AST_TYPE::ListComp:
         case AST_TYPE::SetComp:
             is_generator = ast_type == AST_TYPE::GeneratorExp;
             assert(containsYield(body) == is_generator);
@@ -3574,13 +3791,16 @@ BoxedCode* ModuleCFGProcessor::runRecursively(llvm::ArrayRef<AST_stmt*> body, Bo
         = computeCFG(body, ast_type, lineno, args, fn, si.get(), param_names, scope_info, this);
 
     BoxedCode* code;
-    if (args)
-        code = new BoxedCode(args->args.size(), args->vararg, args->kwarg, lineno, std::move(si),
-                             std::move(code_constants), std::move(param_names), fn, name,
+    if (args) {
+        code = new BoxedCode(args->args.size() + args->kwonlyargs.size(), args->vararg, args->kwarg, lineno,
+                             std::move(si), std::move(code_constants), std::move(param_names), fn, name,
                              autoDecref(getDocString(body)));
-    else
+        code->num_kwonly = args->kwonlyargs.size();
+    } else
         code = new BoxedCode(0, false, false, lineno, std::move(si), std::move(code_constants), std::move(param_names),
                              fn, name, autoDecref(getDocString(body)));
+    code->qualname = boxString(qualname);
+    qualnames.pop_back();
 
     return code;
 }

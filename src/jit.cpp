@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cassert>
 #include <csignal>
 #include <cstdio>
@@ -56,7 +57,6 @@
 
 namespace pyston {
 
-extern void setEncodingAndErrors();
 
 
 static bool unbuffered = false;
@@ -194,8 +194,15 @@ int handleArg(char code) {
         GLOBAL_VERBOSITY++;
     } else if (code == 'd')
         SHOW_DISASM = true;
-    else if (code == 'I')
+    else if (code == 'Y')
         FORCE_INTERPRETER = true;
+    else if (code == 'I') {
+        // CPython's isolated mode.
+        Py_IsolatedFlag = 1;
+        Py_IgnoreEnvironmentFlag = 1;
+        Py_NoUserSiteDirectory = 1;
+    } else if (code == 's')
+        Py_NoUserSiteDirectory = 1;
     else if (code == 'i') {
         Py_InspectFlag = true;
         Py_InteractiveFlag = true;
@@ -211,8 +218,6 @@ int handleArg(char code) {
         Stats::setEnabled(true);
     } else if (code == 'S') {
         Py_NoSiteFlag = 1;
-    } else if (code == 'U') {
-        Py_UnicodeFlag++;
     } else if (code == 'u') {
         unbuffered = true;
     } else if (code == 'r') {
@@ -236,6 +241,19 @@ int handleArg(char code) {
         return 2;
     }
     return 0;
+}
+
+extern "C" int _Py_int_max_str_digits, _Py_global_config_int_max_str_digits;
+
+static bool setIntMaxStrDigits(const char* value, const char* source) {
+    char* end;
+    long n = strtol(value, &end, 10);
+    if (!*value || *end || n < 0 || (n > 0 && n < 640) || n > INT_MAX) {
+        fprintf(stderr, "%s: invalid limit; must be >= 640 or 0 for unlimited.\n", source);
+        return false;
+    }
+    _Py_int_max_str_digits = _Py_global_config_int_max_str_digits = n;
+    return true;
 }
 
 static int RunModule(const char* module, int set_argv0) {
@@ -275,8 +293,8 @@ static int RunModule(const char* module, int set_argv0) {
 static int RunMainFromImporter(const char* filename) {
     PyObject* argv0 = NULL, * importer = NULL;
 
-    if ((argv0 = PyString_FromString(filename)) && (importer = PyImport_GetImporter(argv0))
-        && (importer->cls != &PyNullImporter_Type)) {
+    if ((argv0 = PyUnicode_FromString(filename)) && (importer = PyImport_GetImporter(argv0))
+        && importer != Py_None) {
         /* argv0 is usable as an import source, so
                put it in sys.path[0] and import __main__ */
         PyObject* sys_path = NULL;
@@ -317,6 +335,7 @@ static int main(int argc, char** argv) noexcept {
         int code;
         const char* command = NULL;
         const char* module = NULL;
+        std::vector<const char*> warn_options, x_options;
 
         char* env_args = getenv("PYSTON_RUN_ARGS");
 
@@ -331,8 +350,14 @@ static int main(int argc, char** argv) noexcept {
 
         // Suppress getopt errors so we can throw them ourselves
         opterr = 0;
-        while ((code = getopt(argc, argv, "+:OLqdIibpjtrTRSUvnxXEBac:FuPTGm:")) != -1) {
-            if (code == 'c') {
+        while ((code = getopt(argc, argv, "+:OLqdIYsibpjtrTRSUvnxEBac:FuPTGm:W:X:")) != -1) {
+            if (code == 'W') {
+                warn_options.push_back(optarg);
+            } else if (code == 'X') {
+                x_options.push_back(optarg);
+                if (!strncmp(optarg, "int_max_str_digits=", 19) && !setIntMaxStrDigits(optarg + 19, "-X int_max_str_digits"))
+                    return 1;
+            } else if (code == 'c') {
                 assert(optarg);
                 command = optarg;
                 // no more option parsing; the rest of our arguments go into sys.argv.
@@ -357,20 +382,24 @@ static int main(int argc, char** argv) noexcept {
                     return r;
             }
         }
-        /* The variable is only tested for existence here; _PyRandom_Init will
-           check its value further. */
-        char* p;
-        if (!Py_HashRandomizationFlag && (p = Py_GETENV("PYTHONHASHSEED")) && *p != '\0')
-            Py_HashRandomizationFlag = 1;
+        // -X int_max_str_digits wins over the environment.
+        const char* max_digits_env = getenv("PYTHONINTMAXSTRDIGITS");
+        bool max_digits_from_x = std::any_of(x_options.begin(), x_options.end(), [](const char* opt) {
+            return !strncmp(opt, "int_max_str_digits=", 19);
+        });
+        if (max_digits_env && *max_digits_env && !Py_IgnoreEnvironmentFlag && !max_digits_from_x
+            && !setIntMaxStrDigits(max_digits_env, "PYTHONINTMAXSTRDIGITS"))
+            return 1;
 
-        _PyRandom_Init();
+        // TODO: hash randomization (PYTHONHASHSEED).  _Py_HashSecret stays zeroed for now.
         Stats::startEstimatingCPUFreq();
 
         const char* fn = NULL;
 
         threading::registerMainThread();
 
-        Py_SetProgramName(argv[0]);
+        static wchar_t* wide_progname = Py_DecodeLocale(argv[0], NULL);
+        Py_SetProgramName(wide_progname);
 
         if (unbuffered) {
             setvbuf(stdin, (char*)NULL, _IONBF, BUFSIZ);
@@ -399,6 +428,16 @@ static int main(int argc, char** argv) noexcept {
             Py_Initialize();
         }
 
+        for (const char* opt : warn_options)
+            PyList_Append(PySys_GetObject("warnoptions"), autoDecref(PyUnicode_FromString(opt)));
+        // -X options go to sys._xoptions, but none of them change how Pyston runs.
+        for (const char* opt : x_options) {
+            const char* eq = strchr(opt, '=');
+            Box* key = eq ? PyUnicode_FromStringAndSize(opt, eq - opt) : PyUnicode_FromString(opt);
+            Box* value = eq ? PyUnicode_FromString(eq + 1) : incref(Py_True);
+            PyDict_SetItem(PySys_GetObject("_xoptions"), autoDecref(key), autoDecref(value));
+        }
+
         // Arguments left over after option parsing are of the form:
         //     [ script | - ] [ arguments... ]
         // unless we've been already parsed a `-c command` option, in which case only:
@@ -421,18 +460,20 @@ static int main(int argc, char** argv) noexcept {
             addToSysArgv(argv[i]);
         }
 
-        llvm::StringRef module_search_path = Py_GetPath();
-        while (true) {
-            std::pair<llvm::StringRef, llvm::StringRef> split_str = module_search_path.split(DELIM);
-            if (split_str.first == module_search_path)
-                break; // could not find the delimiter
-            appendToSysPath(split_str.first);
-            module_search_path = split_str.second;
-        }
+        for (auto& p : getModuleSearchPath())
+            appendToSysPath(p);
 
         if (!fn) {
             // if we are in repl or command mode prepend "" to the path
             prependToSysPath("");
+        }
+
+        try {
+            setupStdio();
+        } catch (ExcInfo e) {
+            e.printExcAndTraceback();
+            e.clear();
+            return 1;
         }
 
         if (!Py_NoSiteFlag) {
@@ -451,7 +492,6 @@ static int main(int argc, char** argv) noexcept {
         // Set encoding for standard streams. This needs to be done after
         // sys.path is properly set up, so that we can import the
         // encodings module.
-        setEncodingAndErrors();
 
         Stats::endOfInit();
 

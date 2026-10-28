@@ -230,10 +230,12 @@ struct ScopeNameUsageEntry {
     unsigned char read : 1;
     unsigned char written : 1;
     unsigned char forced_globals : 1;
+    unsigned char nonlocal : 1;
     unsigned char params : 1;
 
     // Properties determined by looking at other scopes as well:
     unsigned char referenced_from_nested : 1;
+    unsigned char modified_from_nested : 1; // a nested scope assigns to it through `nonlocal`
     unsigned char got_from_closure : 1;
     unsigned char passthrough_accesses : 1; // what names a child scope accesses a name from a parent scope
 
@@ -241,8 +243,10 @@ struct ScopeNameUsageEntry {
         : read(0),
           written(0),
           forced_globals(0),
+          nonlocal(0),
           params(0),
           referenced_from_nested(0),
+          modified_from_nested(0),
           got_from_closure(0),
           passthrough_accesses(0) {}
 };
@@ -391,6 +395,11 @@ public:
     bool takesClosure() override { return takes_closure; }
 
     bool passesThroughClosure() override { return passthrough_accesses && !createsClosure(); }
+
+    bool isModifiedFromNested(InternedString name) override {
+        auto it = usage->results.find(name);
+        return it != usage->results.end() && it->second.modified_from_nested;
+    }
 
     VarScopeType getScopeTypeOfName(InternedString name) override {
         if (name.isCompilerCreatedName())
@@ -593,7 +602,6 @@ public:
     bool visit_index(AST_Index* node) override { return false; }
     bool visit_keyword(AST_keyword* node) override { return false; }
     bool visit_list(AST_List* node) override { return false; }
-    bool visit_listcomp(AST_ListComp* node) override { return false; }
     bool visit_expression(AST_Expression* node) override { return false; }
     bool visit_suite(AST_Suite* node) override { return false; }
     // bool visit_module(AST_Module *node) override { return false; }
@@ -614,8 +622,79 @@ public:
     bool visit_unaryop(AST_UnaryOp* node) override { return false; }
     bool visit_while(AST_While* node) override { return false; }
     bool visit_with(AST_With* node) override { return false; }
-    bool visit_yield(AST_Yield* node) override { return false; }
+    bool visit_langprimitive(AST_LangPrimitive* node) override { return false; }
+    bool visit_yield(AST_Yield* node) override {
+        const char* kind = NULL;
+        switch (orig_node->type) {
+            case AST_TYPE::ListComp:
+                kind = "list comprehension";
+                break;
+            case AST_TYPE::SetComp:
+                kind = "set comprehension";
+                break;
+            case AST_TYPE::DictComp:
+                kind = "dict comprehension";
+                break;
+            case AST_TYPE::GeneratorExp:
+                kind = "generator expression";
+                break;
+            default:
+                return false;
+        }
+        raiseSyntaxError(("'yield' inside " + std::string(kind)).c_str(), node->lineno, node->col_offset, "", "",
+                         true);
+        return false;
+    }
     bool visit_delete(AST_Delete* node) override { return false; }
+
+    // `x := value` inside a comprehension binds x in the closest enclosing scope that is not a
+    // comprehension (PEP 572), so the comprehension scopes in between treat it as nonlocal.
+    bool visit_namedexpr(AST_NamedExpr* node) override {
+        node->value->accept(this);
+
+        auto is_comprehension = [](AST* n) {
+            return n->type == AST_TYPE::ListComp || n->type == AST_TYPE::SetComp || n->type == AST_TYPE::DictComp
+                   || n->type == AST_TYPE::GeneratorExp;
+        };
+        if (!is_comprehension(cur->node)) {
+            node->target->accept(this);
+            return true;
+        }
+
+        InternedString name = node->target->id;
+        mangleNameInPlace(name, cur->private_name, scoping->getInternedStrings());
+        node->target->id = name;
+
+        // A NULL owner is the module, which has no ScopeNameUsage of its own.
+        ScopingAnalysis::ScopeNameUsage* owner = cur;
+        while (owner && is_comprehension(owner->node))
+            owner = owner->parent;
+        bool module_level = !owner || owner->node->type == AST_TYPE::Module;
+        // A name the owner declares global is bound in the module too.
+        if (owner && owner->results.count(name) && owner->results[name].forced_globals)
+            module_level = true;
+
+        if (owner && owner->node->type == AST_TYPE::ClassDef)
+            raiseSyntaxError("assignment expression within a comprehension cannot be used in a class body",
+                             node->lineno, node->col_offset, "", "", true);
+
+        for (ScopingAnalysis::ScopeNameUsage* u = cur; u != owner; u = u->parent) {
+            auto& r = u->results[name];
+            r.read = 1;
+            if (module_level)
+                r.forced_globals = 1;
+            else
+                r.nonlocal = 1;
+            if (u == cur)
+                r.written = 1;
+        }
+        if (!module_level) {
+            auto& r = owner->results[name];
+            r.read = 1;
+            r.written = 1;
+        }
+        return true;
+    }
 
     bool visit_global(AST_Global* node) override {
         for (int i = 0; i < node->names.size(); i++) {
@@ -625,7 +704,13 @@ public:
                 // Throw an exception if a name is both declared global and a parameter
                 raiseGlobalAndLocalException(node->names[i], this->orig_node);
             }
-            r.forced_globals = 1;
+            if (node->is_nonlocal) {
+                // Resolved to the enclosing function's variable in processNameUsages()
+                r.nonlocal = 1;
+                r.read = 1;
+            } else {
+                r.forced_globals = 1;
+            }
         }
         return true;
     }
@@ -638,6 +723,8 @@ public:
         } else {
             for (auto* e : node->bases)
                 e->accept(this);
+            for (auto* k : node->keywords)
+                k->value->accept(this);
             for (auto* e : node->decorator_list)
                 e->accept(this);
 
@@ -662,6 +749,8 @@ public:
             counter++;
             e->accept(this);
         }
+        for (AST_expr* e : args->kwonlyargs)
+            e->accept(this);
 
         if (args->vararg) {
             mangleNameInPlace(args->vararg->id, cur->private_name, scoping->getInternedStrings());
@@ -685,6 +774,10 @@ public:
         } else {
             for (auto* e : node->args->defaults)
                 e->accept(this);
+            for (auto* e : node->args->kw_defaults) {
+                if (e)
+                    e->accept(this);
+            }
             for (auto* e : node->decorator_list)
                 e->accept(this);
 
@@ -700,6 +793,7 @@ public:
 
     // helper methods for visit_{generatorexp,dictcomp,setcomp}
     void visit_comp_values(AST_GeneratorExp* node) { node->elt->accept(this); }
+    void visit_comp_values(AST_ListComp* node) { node->elt->accept(this); }
     void visit_comp_values(AST_SetComp* node) { node->elt->accept(this); }
     void visit_comp_values(AST_DictComp* node) {
         node->key->accept(this);
@@ -731,6 +825,7 @@ public:
     bool visit_generatorexp(AST_GeneratorExp* node) override { return visit_comp(node); }
     bool visit_dictcomp(AST_DictComp* node) override { return visit_comp(node); }
     bool visit_setcomp(AST_SetComp* node) override { return visit_comp(node); }
+    bool visit_listcomp(AST_ListComp* node) override { return visit_comp(node); }
 
     bool visit_lambda(AST_Lambda* node) override {
         if (node == orig_node) {
@@ -739,6 +834,10 @@ public:
         } else {
             for (auto* e : node->args->defaults)
                 e->accept(this);
+            for (auto* e : node->args->kw_defaults) {
+                if (e)
+                    e->accept(this);
+            }
             (*map)[node] = new ScopingAnalysis::ScopeNameUsage(node, cur, scoping);
             collect(node, map, scoping);
         }
@@ -859,7 +958,7 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
                 continue;
             if (r.second.forced_globals)
                 continue;
-            if (r.second.written)
+            if (r.second.written && !r.second.nonlocal)
                 continue;
 
             auto&& name = r.first;
@@ -878,9 +977,11 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
                 } else if (found_parent && parent_result->second.forced_globals) {
                     is_name_free = false;
                     break;
-                } else if (found_parent && parent_result->second.written) {
+                } else if (found_parent && parent_result->second.written && !parent_result->second.nonlocal) {
                     r.second.got_from_closure = 1;
                     parent_result->second.referenced_from_nested = 1;
+                    if (r.second.nonlocal && r.second.written)
+                        parent_result->second.modified_from_nested = 1;
 
                     for (ScopeNameUsage* iparent : intermediate_parents) {
                         iparent->results[name].passthrough_accesses = 1;
@@ -891,6 +992,12 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
                     intermediate_parents.push_back(parent);
                     parent = parent->parent;
                 }
+            }
+
+            if (r.second.nonlocal && !r.second.got_from_closure) {
+                char buf[1024];
+                snprintf(buf, sizeof(buf), "no binding for nonlocal '%s' found", name.c_str());
+                raiseSyntaxError(buf, usage->node->lineno, 0, "", "");
             }
 
             if (is_name_free)
@@ -919,20 +1026,6 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
                 raiseNameForcingSyntaxError("is a nested function", usage);
         }
 
-        // Trying to `del` a varaible in the closure in a SyntaxError.
-        // NOTE(travis): I'm not sure why this is a syntax error;
-        // it doesn't seem like there is anything intrinisically difficult about supporting
-        // `del` for closure variables. But it is, so, there you go:
-        for (AST_Name* name_node : usage->del_name_nodes) {
-            InternedString name = name_node->id;
-            if (usage->results.count(name) && usage->results[name].referenced_from_nested) {
-                char buf[1024];
-                snprintf(buf, sizeof(buf), "can not delete variable '%s' referenced in nested scope", name.c_str());
-                assert(usage->node->type == AST_TYPE::FunctionDef);
-                AST_FunctionDef* funcNode = static_cast<AST_FunctionDef*>(usage->node);
-                raiseSyntaxError(buf, name_node->lineno, 0, "" /* file?? */, funcNode->name);
-            }
-        }
     }
 
     std::vector<ScopeNameUsage*> sorted_usages = sortNameUsages(usages);
@@ -955,6 +1048,7 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
             case AST_TYPE::Lambda:
             case AST_TYPE::GeneratorExp:
             case AST_TYPE::DictComp:
+            case AST_TYPE::ListComp:
             case AST_TYPE::SetComp: {
                 this->scopes[node] = std::make_unique<ScopeInfoBase>(parent_info, usage, usage->node,
                                                                       usage->getNameLookupUsage(), globals_from_module);

@@ -33,8 +33,16 @@
 #include "runtime/objmodel.h" // _printStacktrace
 #include "runtime/types.h"
 
+// This has to come last, since pycore_atomic.h pulls in C11 <stdatomic.h> macros
+#define Py_BUILD_CORE 1
+#include "pycore_pystate.h"
+#undef Py_BUILD_CORE
+
 extern "C" {
 PyThreadState* _PyThreadState_Current;
+// Defined in from_cpython/Python/pyston_pystate.c
+extern PyInterpreterState _Pyston_main_interp;
+void _PystonRuntime_Init(void);
 }
 
 namespace pyston {
@@ -62,7 +70,7 @@ static PyThread_type_lock head_mutex = NULL; /* Protects interp->tstate_head */
 #define HEAD_UNLOCK() /* Nothing */
 #endif
 
-static PyInterpreterState interpreter_state;
+#define interpreter_state _Pyston_main_interp
 
 std::unordered_set<PerThreadSetBase*> PerThreadSetBase::all_instances;
 
@@ -90,6 +98,10 @@ public:
         : pthread_id(pthread_id), public_thread_state(tstate) {
         HEAD_LOCK();
 
+        tstate->interp = &interpreter_state;
+        tstate->gilstate_counter = 1;
+        tstate->exc_info = &tstate->exc_state;
+        tstate->context_ver = 1;
         tstate->thread_id = pthread_id;
 
         tstate->next = interpreter_state.tstate_head;
@@ -307,6 +319,8 @@ void registerMainThread() {
 
     main_thread_id = pthread_self();
 
+    _PystonRuntime_Init();
+
     assert(!interpreter_state.tstate_head);
     assert(!current_internal_thread_state);
     current_internal_thread_state = new ThreadStateInternal(pthread_self(), &cur_thread_state);
@@ -465,25 +479,6 @@ void _allowGLReadPreemption() {
     current_internal_thread_state->gilTaken();
 }
 
-// We don't support CPython's TLS (yet?)
-extern "C" void PyThread_ReInitTLS(void) noexcept {
-    // don't have to do anything since we don't support TLS
-}
-extern "C" int PyThread_create_key(void) noexcept {
-    Py_FatalError("unimplemented");
-}
-extern "C" void PyThread_delete_key(int) noexcept {
-    Py_FatalError("unimplemented");
-}
-extern "C" int PyThread_set_key_value(int, void*) noexcept {
-    Py_FatalError("unimplemented");
-}
-extern "C" void* PyThread_get_key_value(int) noexcept {
-    Py_FatalError("unimplemented");
-}
-extern "C" void PyThread_delete_key_value(int key) noexcept {
-    Py_FatalError("unimplemented");
-}
 
 
 extern "C" {
@@ -561,6 +556,30 @@ extern "C" int Py_AddPendingCall(int (*func)(void*), void* arg) noexcept {
     return result;
 }
 
+extern "C" int _PyEval_AddPendingCall(PyThreadState* tstate, struct _ceval_runtime_state* ceval,
+                                      int (*func)(void*), void* arg) noexcept {
+    return Py_AddPendingCall(func, arg);
+}
+
+static int checkSignalsPendingCall(void*) noexcept {
+    return PyErr_CheckSignals();
+}
+
+// Called by the signal handler.  CPython sets the eval breaker; we run PyErr_CheckSignals as a
+// pending call instead.
+extern "C" void _PyEval_SignalReceived(struct _ceval_runtime_state* ceval) noexcept {
+    Py_AddPendingCall(checkSignalsPendingCall, NULL);
+}
+
+extern "C" void _PyEval_ReInitThreads(_PyRuntimeState* runtime) noexcept {
+    // TODO: Pyston's GIL is reinitialized by its own fork handling.
+}
+
+extern "C" int PyGILState_Check(void) noexcept {
+    // TODO: we don't track which thread holds the GIL.
+    return 1;
+}
+
 extern "C" int Py_MakePendingCalls(void) noexcept {
     int i;
     int r = 0;
@@ -628,7 +647,7 @@ extern "C" void makePendingCalls() {
         throwCAPIException();
 }
 
-extern "C" int PyThreadState_SetAsyncExc(long id, PyObject* exc) noexcept {
+extern "C" int PyThreadState_SetAsyncExc(unsigned long id, PyObject* exc) noexcept {
     PyThreadState* tstate = PyThreadState_GET();
     PyInterpreterState* interp = tstate->interp;
     PyThreadState* p;
@@ -742,6 +761,10 @@ extern "C" PyThreadState* PyThreadState_Get(void) noexcept {
     return _PyThreadState_Current;
 }
 
+extern "C" PyThreadState* _PyThreadState_UncheckedGet(void) noexcept {
+    return _PyThreadState_Current;
+}
+
 extern "C" PyThreadState* PyEval_SaveThread(void) noexcept {
     auto rtn = PyThreadState_GET();
     assert(rtn);
@@ -756,7 +779,7 @@ extern "C" void PyEval_RestoreThread(PyThreadState* tstate) noexcept {
 
 } // namespace threading
 
-__thread PyThreadState cur_thread_state
-    = { NULL, &threading::interpreter_state, NULL, 0, 1, NULL, NULL, NULL, NULL, 0, NULL, NULL, 0 };
+// Initialized by ThreadStateInternal
+__thread PyThreadState cur_thread_state;
 
 } // namespace pyston

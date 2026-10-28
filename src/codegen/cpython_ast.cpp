@@ -14,6 +14,7 @@
 
 #include "codegen/cpython_ast.h"
 
+#include <cstdarg>
 #include <set>
 
 #include "llvm/ADT/STLExtras.h"
@@ -68,6 +69,148 @@ private:
 
     ASTAllocator& getAlloc() { return *ast_allocator; }
 
+    // Emits a SyntaxWarning like CPython's compiler_warn(); an error filter turns it into a SyntaxError.
+    void warn(int lineno, int col_offset, const char* fmt, ...) {
+        char buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+
+        PyObject* filename = PyUnicode_DecodeFSDefaultAndSize(fn.data(), fn.size());
+        if (!filename)
+            throwCAPIException();
+        AUTO_DECREF(filename);
+        PyObject* msg = PyUnicode_FromString(buf);
+        if (!msg)
+            throwCAPIException();
+        AUTO_DECREF(msg);
+        if (PyErr_WarnExplicitObject(PyExc_SyntaxWarning, msg, filename, lineno, NULL, NULL) < 0) {
+            if (PyErr_ExceptionMatches(PyExc_SyntaxWarning)) {
+                PyErr_Clear();
+                raiseSyntaxError(buf, lineno, col_offset, fn, "", true);
+            }
+            throwCAPIException();
+        }
+    }
+
+    // The type of a literal expression, or NULL (CPython's infer_type()).
+    static const char* inferTypeName(expr_ty e) {
+        switch (e->kind) {
+            case Tuple_kind:
+                return "tuple";
+            case List_kind:
+            case ListComp_kind:
+                return "list";
+            case Dict_kind:
+            case DictComp_kind:
+                return "dict";
+            case Set_kind:
+            case SetComp_kind:
+                return "set";
+            case GeneratorExp_kind:
+                return "generator";
+            case Lambda_kind:
+                return "function";
+            case JoinedStr_kind:
+            case FormattedValue_kind:
+                return "str";
+            case Constant_kind:
+                return PyLong_Check(e->v.Constant.value) && !PyBool_Check(e->v.Constant.value)
+                           ? "int"
+                           : Py_TYPE(e->v.Constant.value)->tp_name;
+            default:
+                return NULL;
+        }
+    }
+
+    static bool isNamedSingletonOrNotConstant(expr_ty e) {
+        if (e->kind != Constant_kind)
+            return true;
+        PyObject* value = e->v.Constant.value;
+        return value == Py_None || value == Py_False || value == Py_True || value == Py_Ellipsis;
+    }
+
+    void checkCompare(expr_ty e) {
+        bool left = isNamedSingletonOrNotConstant(e->v.Compare.left);
+        for (int i = 0; i < asdl_seq_LEN(e->v.Compare.ops); i++) {
+            cmpop_ty op = (cmpop_ty)asdl_seq_GET(e->v.Compare.ops, i);
+            bool right = isNamedSingletonOrNotConstant((expr_ty)asdl_seq_GET(e->v.Compare.comparators, i));
+            if ((op == Is || op == IsNot) && (!left || !right)) {
+                warn(e->lineno, e->col_offset, op == Is ? "\"is\" with a literal. Did you mean \"==\"?"
+                                                        : "\"is not\" with a literal. Did you mean \"!=\"?");
+                return;
+            }
+            left = right;
+        }
+    }
+
+    void checkCaller(expr_ty e) {
+        switch (e->kind) {
+            case Constant_kind:
+            case Tuple_kind:
+            case List_kind:
+            case ListComp_kind:
+            case Dict_kind:
+            case DictComp_kind:
+            case Set_kind:
+            case SetComp_kind:
+            case GeneratorExp_kind:
+            case JoinedStr_kind:
+            case FormattedValue_kind:
+                warn(e->lineno, e->col_offset, "'%.200s' object is not callable; perhaps you missed a comma?",
+                     inferTypeName(e));
+            default:
+                break;
+        }
+    }
+
+    void checkSubscript(expr_ty value, slice_ty slice) {
+        switch (value->kind) {
+            case Constant_kind: {
+                PyObject* v = value->v.Constant.value;
+                if (!(v == Py_None || v == Py_Ellipsis || PyLong_Check(v) || PyFloat_Check(v) || PyComplex_Check(v)
+                      || PyAnySet_Check(v)))
+                    break;
+            }
+            // fallthrough
+            case Set_kind:
+            case SetComp_kind:
+            case GeneratorExp_kind:
+            case Lambda_kind:
+                warn(value->lineno, value->col_offset,
+                     "'%.200s' object is not subscriptable; perhaps you missed a comma?", inferTypeName(value));
+                return;
+            default:
+                break;
+        }
+
+        if (slice->kind != Index_kind)
+            return;
+        expr_ty index = slice->v.Index.value;
+        const char* index_type = inferTypeName(index);
+        if (!index_type || (index->kind == Constant_kind && PyLong_Check(index->v.Constant.value)))
+            return;
+        switch (value->kind) {
+            case Constant_kind: {
+                PyObject* v = value->v.Constant.value;
+                if (!(PyUnicode_Check(v) || PyBytes_Check(v) || PyTuple_Check(v)))
+                    break;
+            }
+            // fallthrough
+            case Tuple_kind:
+            case List_kind:
+            case ListComp_kind:
+            case JoinedStr_kind:
+            case FormattedValue_kind:
+                warn(value->lineno, value->col_offset,
+                     "%.200s indices must be integers or slices, not %.200s; perhaps you missed a comma?",
+                     inferTypeName(value), index_type);
+            default:
+                break;
+        }
+    }
+
 public:
     Converter(llvm::StringRef fn) : fn(fn) {}
 
@@ -76,9 +219,132 @@ public:
         if (!seq)
             return rtn;
         for (int i = 0; i < seq->size; i++) {
-            rtn.push_back(convert((T)seq->elements[i]));
+            auto converted = convert((T)seq->elements[i]);
+            if constexpr (std::is_same<T, stmt_ty>::value) {
+                for (AST_stmt* extra : stmts_before)
+                    rtn.push_back(extra);
+                stmts_before.clear();
+            }
+            rtn.push_back(converted);
+            if constexpr (std::is_same<T, stmt_ty>::value) {
+                for (AST_stmt* extra : stmts_after)
+                    rtn.push_back(extra);
+                stmts_after.clear();
+            }
         }
         return rtn;
+    }
+
+    // Statements that a converted statement expands to, emitted right before and after it.
+    std::vector<AST_stmt*> stmts_before, stmts_after;
+    int num_temp_names = 0;
+
+    // What kind of scope the statements being converted are in, for annotations.
+    enum class ScopeKind { Module, Class, Function };
+    std::vector<ScopeKind> scope_kinds{ ScopeKind::Module };
+    // Name of the innermost enclosing class, which private names in annotation keys get mangled with.
+    std::vector<PyObject*> class_names{ NULL };
+
+    AST_Str* makeMangledStr(PyObject* name) {
+        PyObject* mangled = _Py_Mangle(class_names.back(), name);
+        if (!mangled)
+            throwCAPIException();
+        AUTO_DECREF(mangled);
+        return new (getAlloc()) AST_Str(PyUnicode_AsUTF8(mangled));
+    }
+
+    // Whether a module or class body has annotated assignments, which means it needs an
+    // `__annotations__` dict (SETUP_ANNOTATIONS in CPython).
+    static bool hasAnnotations(asdl_seq* body) {
+        for (int i = 0; i < asdl_seq_LEN(body); i++) {
+            stmt_ty st = (stmt_ty)asdl_seq_GET(body, i);
+            switch (st->kind) {
+                case AnnAssign_kind:
+                    return true;
+                case For_kind:
+                    if (hasAnnotations(st->v.For.body) || hasAnnotations(st->v.For.orelse))
+                        return true;
+                    break;
+                case While_kind:
+                    if (hasAnnotations(st->v.While.body) || hasAnnotations(st->v.While.orelse))
+                        return true;
+                    break;
+                case If_kind:
+                    if (hasAnnotations(st->v.If.body) || hasAnnotations(st->v.If.orelse))
+                        return true;
+                    break;
+                case With_kind:
+                    if (hasAnnotations(st->v.With.body))
+                        return true;
+                    break;
+                case Try_kind:
+                    if (hasAnnotations(st->v.Try.body) || hasAnnotations(st->v.Try.orelse)
+                        || hasAnnotations(st->v.Try.finalbody))
+                        return true;
+                    for (int j = 0; j < asdl_seq_LEN(st->v.Try.handlers); j++) {
+                        excepthandler_ty h = (excepthandler_ty)asdl_seq_GET(st->v.Try.handlers, j);
+                        if (hasAnnotations(h->v.ExceptHandler.body))
+                            return true;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        return false;
+    }
+
+    AST_Name* makeName(const char* name, AST_TYPE::AST_TYPE ctx, int lineno) {
+        return new (getAlloc()) AST_Name(pool->get(name), ctx, lineno);
+    }
+
+    AST_Assign* makeAssign(AST_expr* target, AST_expr* value, int lineno) {
+        auto r = new (getAlloc()) AST_Assign();
+        r->targets.push_back(target);
+        r->value = value;
+        r->lineno = lineno;
+        return r;
+    }
+
+    // Converts a module or class body, starting it with `__annotations__ = {}` if needed.
+    std::vector<AST_stmt*> convertScopeBody(asdl_seq* body, ScopeKind kind, int lineno) {
+        scope_kinds.push_back(kind);
+        std::vector<AST_stmt*> rtn;
+        if (kind != ScopeKind::Function && hasAnnotations(body)) {
+            auto setup = new (getAlloc()) AST_LangPrimitive(AST_LangPrimitive::SETUP_ANNOTATIONS);
+            setup->lineno = lineno;
+            auto e = new (getAlloc()) AST_Expr(setup);
+            e->lineno = lineno;
+            rtn.push_back(e);
+        }
+        for (AST_stmt* st : convert<stmt_ty, AST_stmt*>(body))
+            rtn.push_back(st);
+        scope_kinds.pop_back();
+        return rtn;
+    }
+
+    // Collects the annotations of a def into a dict display, or returns NULL if there are none.
+    AST_Dict* convertFunctionAnnotations(arguments_ty args, expr_ty returns) {
+        auto r = new (getAlloc()) AST_Dict();
+        auto add = [&](arg_ty a) {
+            if (a && a->annotation) {
+                r->keys.push_back(makeMangledStr(a->arg));
+                r->values.push_back(convert(a->annotation));
+            }
+        };
+        for (auto seq : { args->posonlyargs, args->args }) {
+            for (int i = 0; i < asdl_seq_LEN(seq); i++)
+                add((arg_ty)asdl_seq_GET(seq, i));
+        }
+        add(args->vararg);
+        for (int i = 0; i < asdl_seq_LEN(args->kwonlyargs); i++)
+            add((arg_ty)asdl_seq_GET(args->kwonlyargs, i));
+        add(args->kwarg);
+        if (returns) {
+            r->keys.push_back(new (getAlloc()) AST_Str("return"));
+            r->values.push_back(convert(returns));
+        }
+        return r->keys.empty() ? NULL : r;
     }
 
     template <typename T, typename P> std::vector<P> convert(asdl_int_seq* seq) {
@@ -106,13 +372,37 @@ public:
         return new (getAlloc()) AST_Name(convert(ident), AST_TYPE::Store, -1, -1);
     }
 
+    // Raises a SyntaxError for Python 3 features that Pyston can parse but doesn't support yet.
+    void __attribute__((__noreturn__)) unsupported(const char* what, int lineno, int col_offset) {
+        char buf[1024];
+        snprintf(buf, sizeof(buf), "%s %s not supported by Pyston yet", what,
+                 llvm::StringRef(what).ends_with("s") ? "are" : "is");
+        raiseSyntaxError(buf, lineno, col_offset, fn, "", true);
+        __builtin_unreachable();
+    }
+
+    AST_Name* convertArg(arg_ty arg) {
+        return new (getAlloc()) AST_Name(convert(arg->arg), AST_TYPE::Param, arg->lineno, arg->col_offset);
+    }
+
     AST_arguments* convert(arguments_ty ident, AST* parent) {
         auto r = new (getAlloc()) AST_arguments();
 
-        convertAll<expr_ty>(ident->args, r->args);
+        r->num_posonly = asdl_seq_LEN(ident->posonlyargs);
+        for (auto seq : { ident->posonlyargs, ident->args }) {
+            for (int i = 0; i < asdl_seq_LEN(seq); i++)
+                r->args.push_back(convertArg((arg_ty)asdl_seq_GET(seq, i)));
+        }
         convertAll<expr_ty>(ident->defaults, r->defaults);
-        r->vararg = convertToName(ident->vararg);
-        r->kwarg = convertToName(ident->kwarg);
+        for (int i = 0; i < asdl_seq_LEN(ident->kwonlyargs); i++) {
+            r->kwonlyargs.push_back(convertArg((arg_ty)asdl_seq_GET(ident->kwonlyargs, i)));
+            expr_ty d = (expr_ty)asdl_seq_GET(ident->kw_defaults, i);
+            r->kw_defaults.push_back(d ? convert(d) : NULL);
+        }
+        if (ident->vararg)
+            r->vararg = convertToName(ident->vararg->arg);
+        if (ident->kwarg)
+            r->kwarg = convertToName(ident->kwarg->arg);
 
         if (r->vararg && r->kwarg && (r->vararg->id == r->kwarg->id)) {
             char buf[1024];
@@ -128,8 +418,24 @@ public:
             seen.insert(r->kwarg->id);
         }
         checkDuplicateArgs(parent, r->args, &seen);
+        checkDuplicateArgs(parent, r->kwonlyargs, &seen);
 
         return r;
+    }
+
+    // Elements of a list, tuple or set display (or assignment target).  `*x` elements are stored
+    // unwrapped, with a flag in `starred`.
+    void convertStarredElts(asdl_seq* seq, std::vector<AST_expr*>& elts, std::vector<bool>& starred) {
+        bool any = false;
+        for (int i = 0; i < asdl_seq_LEN(seq); i++) {
+            expr_ty e = (expr_ty)asdl_seq_GET(seq, i);
+            bool is_starred = e->kind == Starred_kind;
+            elts.push_back(convert(is_starred ? e->v.Starred.value : e));
+            starred.push_back(is_starred);
+            any = any || is_starred;
+        }
+        if (!any)
+            starred.clear();
     }
 
     void checkDuplicateArgs(AST* parent, std::vector<AST_expr*> args, std::set<InternedString>* seen) {
@@ -171,7 +477,10 @@ public:
             CASE(Add);
             CASE(Sub);
             CASE(Mult);
-            CASE(Div);
+            // In Python 3, / is always true division.
+            case Div:
+                return AST_TYPE::TrueDiv;
+            CASE(MatMult);
             CASE(Mod);
             CASE(Pow);
             CASE(LShift);
@@ -260,8 +569,6 @@ public:
                 r->value = convert(v.value);
                 return r;
             }
-            case Ellipsis_kind:
-                return new (getAlloc()) AST_Ellipsis();
         }
         RELEASE_ASSERT(0, "invalid slice type: %d", slice->kind);
     }
@@ -310,6 +617,7 @@ public:
             case Dict_kind: {
                 auto r = new (getAlloc()) AST_Dict();
                 auto v = expr->v.Dict;
+                // A NULL key means `**value`.
                 r->keys = convert<expr_ty, AST_expr*>(v.keys);
                 r->values = convert<expr_ty, AST_expr*>(v.values);
                 return r;
@@ -317,7 +625,7 @@ public:
             case Set_kind: {
                 auto r = new (getAlloc()) AST_Set();
                 auto v = expr->v.Set;
-                r->elts = convert<expr_ty, AST_expr*>(v.elts);
+                convertStarredElts(v.elts, r->elts, r->elt_starred);
                 return r;
             }
             case ListComp_kind: {
@@ -356,6 +664,7 @@ public:
                 return r;
             }
             case Compare_kind: {
+                checkCompare(expr);
                 auto r = new (getAlloc()) AST_Compare();
                 auto v = expr->v.Compare;
                 r->left = convert(v.left);
@@ -364,19 +673,69 @@ public:
                 return r;
             }
             case Call_kind: {
+                checkCaller(expr->v.Call.func);
                 auto r = new (getAlloc()) AST_Call();
                 auto v = expr->v.Call;
                 r->func = convert(v.func);
-                r->args = convert<expr_ty, AST_expr*>(v.args);
-                r->keywords = convert<keyword_ty, AST_keyword*>(v.keywords);
-                r->starargs = convert(v.starargs);
-                r->kwargs = convert(v.kwargs);
-                return r;
-            }
-            case Repr_kind: {
-                auto r = new (getAlloc()) AST_Repr();
-                auto v = expr->v.Repr;
-                r->value = convert(v.value);
+                // Pyston's AST only has the Python 2 form f(a, b, *args, k=v, **kwargs).  Other forms are
+                // rewritten to it: positional arguments from the first non-final *arg on are collected with a
+                // starred tuple display, and keywords from the first non-final **kwargs on with a dict display.
+                // TODO: CPython raises on duplicate keys between several **kwargs, the dict display merges them.
+                int nargs = asdl_seq_LEN(v.args);
+                int first_star = nargs;
+                for (int i = 0; i < nargs; i++) {
+                    if (((expr_ty)asdl_seq_GET(v.args, i))->kind == Starred_kind) {
+                        first_star = i;
+                        break;
+                    }
+                }
+                for (int i = 0; i < first_star; i++)
+                    r->args.push_back(convert((expr_ty)asdl_seq_GET(v.args, i)));
+                if (first_star == nargs - 1) {
+                    r->starargs = convert(((expr_ty)asdl_seq_GET(v.args, first_star))->v.Starred.value);
+                } else if (first_star < nargs) {
+                    auto t = new (getAlloc()) AST_Tuple();
+                    t->lineno = expr->lineno;
+                    t->col_offset = expr->col_offset;
+                    t->ctx_type = AST_TYPE::Load;
+                    for (int i = first_star; i < nargs; i++) {
+                        expr_ty arg = (expr_ty)asdl_seq_GET(v.args, i);
+                        bool is_starred = arg->kind == Starred_kind;
+                        t->elts.push_back(convert(is_starred ? arg->v.Starred.value : arg));
+                        t->elt_starred.push_back(is_starred);
+                    }
+                    r->starargs = t;
+                }
+
+                int nkeywords = asdl_seq_LEN(v.keywords);
+                int first_dstar = nkeywords;
+                for (int i = 0; i < nkeywords; i++) {
+                    if (((keyword_ty)asdl_seq_GET(v.keywords, i))->arg == NULL) {
+                        first_dstar = i;
+                        break;
+                    }
+                }
+                for (int i = 0; i < first_dstar; i++)
+                    r->keywords.push_back(convert((keyword_ty)asdl_seq_GET(v.keywords, i)));
+                if (first_dstar == nkeywords - 1) {
+                    r->kwargs = convert(((keyword_ty)asdl_seq_GET(v.keywords, first_dstar))->value);
+                } else if (first_dstar < nkeywords) {
+                    auto d = new (getAlloc()) AST_Dict();
+                    d->lineno = expr->lineno;
+                    d->col_offset = expr->col_offset;
+                    for (int i = first_dstar; i < nkeywords; i++) {
+                        keyword_ty kw = (keyword_ty)asdl_seq_GET(v.keywords, i);
+                        AST_Str* key = NULL;
+                        if (kw->arg) {
+                            key = new (getAlloc()) AST_Str(PyUnicode_AsUTF8(kw->arg));
+                            key->lineno = kw->value->lineno;
+                            key->col_offset = kw->value->col_offset;
+                        }
+                        d->keys.push_back(key);
+                        d->values.push_back(convert(kw->value));
+                    }
+                    r->kwargs = d;
+                }
                 return r;
             }
             case Attribute_kind: {
@@ -388,6 +747,8 @@ public:
                 return r;
             }
             case Subscript_kind: {
+                if (expr->v.Subscript.ctx == Load)
+                    checkSubscript(expr->v.Subscript.value, expr->v.Subscript.slice);
                 auto r = new (getAlloc()) AST_Subscript();
                 auto v = expr->v.Subscript;
                 r->value = convert(v.value);
@@ -403,42 +764,48 @@ public:
             case List_kind: {
                 auto r = new (getAlloc()) AST_List();
                 auto v = expr->v.List;
-                r->elts = convert<expr_ty, AST_expr*>(v.elts);
+                convertStarredElts(v.elts, r->elts, r->elt_starred);
                 r->ctx_type = convert(v.ctx);
                 return r;
             }
             case Tuple_kind: {
                 auto r = new (getAlloc()) AST_Tuple();
                 auto v = expr->v.Tuple;
-                r->elts = convert<expr_ty, AST_expr*>(v.elts);
+                convertStarredElts(v.elts, r->elts, r->elt_starred);
                 r->ctx_type = convert(v.ctx);
                 return r;
             }
-            case Num_kind: {
-                PyObject* o = expr->v.Num.n;
-                if (o->cls == int_cls) {
+            case Constant_kind: {
+                PyObject* o = expr->v.Constant.value;
+                // None, True, False and Ellipsis become names; the CFG turns True, False and "..." into constants.
+                // TODO: None is still looked up by name.
+                if (o == Py_None || o == Py_True || o == Py_False || o == Py_Ellipsis) {
+                    const char* name = o == Py_None ? "None" : o == Py_True ? "True" : o == Py_False ? "False"
+                                                                                                      : "...";
+                    return new (getAlloc()) AST_Name(pool->get(name), AST_TYPE::Load, expr->lineno, expr->col_offset);
+                }
+                if (PyInt_Check(o)) {
                     auto r = new (getAlloc()) AST_Num();
                     r->num_type = AST_Num::INT;
-                    r->n_int = unboxInt(o);
+                    r->n_int = PyInt_AS_LONG(o);
                     return r;
                 }
-                if (o->cls == float_cls) {
-                    auto r = new (getAlloc()) AST_Num();
-                    r->num_type = AST_Num::FLOAT;
-                    r->n_float = unboxFloat(o);
-                    return r;
-                }
-                if (o->cls == long_cls) {
+                if (PyLong_Check(o)) {
                     auto r = new (getAlloc()) AST_Num();
                     r->num_type = AST_Num::LONG;
-                    // XXX This is pretty silly:
-                    auto s = _PyLong_Format(o, 10, 0, 0);
-                    AUTO_DECREF(s);
+                    auto s = _PyLong_Format(o, 10);
                     RELEASE_ASSERT(s, "");
-                    r->n_long = PyString_AsString(s);
+                    AUTO_DECREF(s);
+                    r->n_long = PyUnicode_AsUTF8(s);
                     return r;
                 }
-                if (o->cls == complex_cls) {
+                if (PyFloat_Check(o)) {
+                    auto r = new (getAlloc()) AST_Num();
+                    r->num_type = AST_Num::FLOAT;
+                    r->n_float = PyFloat_AS_DOUBLE(o);
+                    return r;
+                }
+                if (PyComplex_Check(o)) {
                     auto r = new (getAlloc()) AST_Num();
                     r->num_type = AST_Num::COMPLEX;
 
@@ -464,30 +831,93 @@ public:
 
                     return binop;
                 }
-                RELEASE_ASSERT(0, "unhandled num type: %s\n", o->cls->tp_name);
-            }
-            case Str_kind: {
-                PyObject* o = expr->v.Str.s;
-                if (o->cls == unicode_cls) {
-                    o = PyUnicode_AsUTF8String(o);
-                    RELEASE_ASSERT(o, "");
-                    AUTO_DECREF(o);
-
+                if (PyUnicode_Check(o)) {
+                    // surrogatepass, since string literals can contain lone surrogates.
+                    PyObject* utf8 = PyUnicode_AsEncodedString(o, "utf-8", "surrogatepass");
+                    RELEASE_ASSERT(utf8, "");
+                    AUTO_DECREF(utf8);
                     auto r = new (getAlloc()) AST_Str();
-                    r->str_data = static_cast<BoxedString*>(o)->s();
-                    r->str_type = AST_Str::UNICODE;
+                    r->str_data = std::string(PyBytes_AS_STRING(utf8), PyBytes_GET_SIZE(utf8));
+                    r->str_type = AST_Str::STR;
                     return r;
                 }
-
-                if (o->cls == str_cls) {
-                    return new (getAlloc()) AST_Str(static_cast<BoxedString*>(o)->s().str());
+                if (PyBytes_Check(o)) {
+                    auto r = new (getAlloc()) AST_Str();
+                    r->str_data = std::string(PyBytes_AS_STRING(o), PyBytes_GET_SIZE(o));
+                    r->str_type = AST_Str::BYTES;
+                    return r;
                 }
-                RELEASE_ASSERT(0, "unhandled str type: %s\n", o->cls->tp_name);
+                RELEASE_ASSERT(0, "unhandled constant type: %s\n", o->cls->tp_name);
             }
+            case JoinedStr_kind:
+            case FormattedValue_kind: {
+                std::string fmt;
+                std::vector<AST_expr*> args;
+                appendFString(expr, fmt, args);
+                auto str = new (getAlloc()) AST_Str(std::move(fmt));
+                str->lineno = expr->lineno;
+                str->col_offset = expr->col_offset;
+                auto r = new (getAlloc()) AST_Call();
+                r->func = new (getAlloc()) AST_Attribute(str, AST_TYPE::Load, pool->get("format"));
+                r->func->lineno = expr->lineno;
+                r->func->col_offset = expr->col_offset;
+                r->args = std::move(args);
+                return r;
+            }
+            case Starred_kind:
+                unsupported("starred expressions", expr->lineno, expr->col_offset);
+            case NamedExpr_kind: {
+                auto r = new (getAlloc()) AST_NamedExpr();
+                auto v = expr->v.NamedExpr;
+                r->value = convert(v.value);
+                r->target = ast_cast<AST_Name>(convert(v.target));
+                return r;
+            }
+            case YieldFrom_kind: {
+                auto r = new (getAlloc()) AST_Yield();
+                r->value = convert(expr->v.YieldFrom.value);
+                r->yield_from = true;
+                return r;
+            }
+            case Await_kind:
+                unsupported("'await' expressions", expr->lineno, expr->col_offset);
             default:
                 RELEASE_ASSERT(0, "unhandled kind: %d\n", expr->kind);
         };
         Py_FatalError("unimplemented");
+    }
+
+    // f-strings are converted to a str.format() call: f"a{x!r:>{w}}" becomes "a{!r:>{}}".format(x, w).
+    // TODO: CPython calls format() directly, so this differs if the format spec contains '{' or '}'
+    // after the nested fields are substituted.
+    void appendFString(expr_ty e, std::string& fmt, std::vector<AST_expr*>& args) {
+        if (e->kind == Constant_kind) {
+            PyObject* utf8 = PyUnicode_AsEncodedString(e->v.Constant.value, "utf-8", "surrogatepass");
+            RELEASE_ASSERT(utf8, "");
+            AUTO_DECREF(utf8);
+            for (char c : llvm::StringRef(PyBytes_AS_STRING(utf8), PyBytes_GET_SIZE(utf8))) {
+                fmt += c;
+                if (c == '{' || c == '}')
+                    fmt += c;
+            }
+        } else if (e->kind == JoinedStr_kind) {
+            for (int i = 0; i < asdl_seq_LEN(e->v.JoinedStr.values); i++)
+                appendFString((expr_ty)asdl_seq_GET(e->v.JoinedStr.values, i), fmt, args);
+        } else {
+            assert(e->kind == FormattedValue_kind);
+            auto v = e->v.FormattedValue;
+            fmt += '{';
+            if (v.conversion != -1) {
+                fmt += '!';
+                fmt += (char)v.conversion;
+            }
+            args.push_back(convert(v.value));
+            if (v.format_spec) {
+                fmt += ':';
+                appendFString(v.format_spec, fmt, args);
+            }
+            fmt += '}';
+        }
     }
 
     AST_expr* convert(expr_ty expr) {
@@ -506,7 +936,7 @@ public:
         auto r = new (getAlloc()) AST_ExceptHandler();
         auto v = eh->v.ExceptHandler;
         r->type = convert(v.type);
-        r->name = convert(v.name);
+        r->name = convertToName(v.name);
         r->body = convert<stmt_ty, AST_stmt*>(v.body);
         r->lineno = eh->lineno;
         r->col_offset = eh->col_offset;
@@ -527,18 +957,64 @@ public:
                 r->name = convert(v.name);
                 r->args = convert(v.args, r);
                 nestlevel++;
-                r->body = convert<stmt_ty, AST_stmt*>(v.body);
+                r->body = convertScopeBody(v.body, ScopeKind::Function, stmt->lineno);
                 nestlevel--;
                 r->decorator_list = convert<expr_ty, AST_expr*>(v.decorator_list);
+
+                // Pyston doesn't pass annotations to the function object, so they are set on it
+                // right after the def: `f.__annotations__ = {...}`. With decorators that has to
+                // happen before they are applied, so `@d def f` becomes `def f; ...; f = d(f)`.
+                if (AST_Dict* annotations = convertFunctionAnnotations(v.args, v.returns)) {
+                    int lineno = stmt->lineno;
+                    auto target = new (getAlloc()) AST_Attribute(
+                        new (getAlloc()) AST_Name(r->name, AST_TYPE::Load, lineno), AST_TYPE::Store,
+                        pool->get("__annotations__"));
+                    stmts_after.push_back(makeAssign(target, annotations, lineno));
+                    if (!r->decorator_list.empty()) {
+                        // The decorator expressions are still evaluated before the def, e.g.
+                        // `@x.setter` has to see the old x.
+                        std::vector<InternedString> decorators;
+                        for (AST_expr* d : r->decorator_list) {
+                            InternedString tmp = pool->get("#decorator" + std::to_string(num_temp_names++));
+                            stmts_before.push_back(
+                                makeAssign(new (getAlloc()) AST_Name(tmp, AST_TYPE::Store, lineno), d, lineno));
+                            decorators.push_back(tmp);
+                        }
+                        AST_expr* value = new (getAlloc()) AST_Name(r->name, AST_TYPE::Load, lineno);
+                        for (int i = r->decorator_list.size() - 1; i >= 0; i--) {
+                            auto call = new (getAlloc()) AST_Call();
+                            call->func = new (getAlloc()) AST_Name(decorators[i], AST_TYPE::Load, lineno);
+                            call->args.push_back(value);
+                            call->lineno = lineno;
+                            value = call;
+                        }
+                        r->decorator_list.clear();
+                        stmts_after.push_back(
+                            makeAssign(new (getAlloc()) AST_Name(r->name, AST_TYPE::Store, lineno), value, lineno));
+                    }
+                }
                 return r;
             }
             case ClassDef_kind: {
                 auto r = new (getAlloc()) AST_ClassDef();
                 auto v = stmt->v.ClassDef;
                 r->name = convert(v.name);
-                r->bases = convert<expr_ty, AST_expr*>(v.bases);
+                for (int i = 0; i < asdl_seq_LEN(v.bases); i++) {
+                    expr_ty base = (expr_ty)asdl_seq_GET(v.bases, i);
+                    if (base->kind == Starred_kind)
+                        unsupported("starred class bases", stmt->lineno, stmt->col_offset);
+                    r->bases.push_back(convert(base));
+                }
+                for (int i = 0; i < asdl_seq_LEN(v.keywords); i++) {
+                    keyword_ty kw = (keyword_ty)asdl_seq_GET(v.keywords, i);
+                    if (kw->arg == NULL)
+                        unsupported("**kwargs in class definitions", stmt->lineno, stmt->col_offset);
+                    r->keywords.push_back(convert(kw));
+                }
                 nestlevel++;
-                r->body = convert<stmt_ty, AST_stmt*>(v.body);
+                class_names.push_back(v.name);
+                r->body = convertScopeBody(v.body, ScopeKind::Class, stmt->lineno);
+                class_names.pop_back();
                 nestlevel--;
                 r->decorator_list = convert<expr_ty, AST_expr*>(v.decorator_list);
                 return r;
@@ -570,13 +1046,46 @@ public:
                 r->value = convert(v.value);
                 return r;
             }
-            case Print_kind: {
-                auto r = new (getAlloc()) AST_Print();
-                auto v = stmt->v.Print;
-                r->dest = convert(v.dest);
-                r->values = convert<expr_ty, AST_expr*>(v.values);
-                r->nl = v.nl;
-                return r;
+            case AnnAssign_kind: {
+                // In a module or class body the annotation is evaluated and, for a plain name,
+                // stored in __annotations__. Annotations of locals are not evaluated.
+                auto v = stmt->v.AnnAssign;
+                std::vector<AST_stmt*> stmts;
+                if (v.value)
+                    stmts.push_back(makeAssign(convert(v.target), convert(v.value), stmt->lineno));
+                if (scope_kinds.back() != ScopeKind::Function) {
+                    AST_expr* annotation = convert(v.annotation);
+                    if (v.simple && v.target->kind == Name_kind) {
+                        auto index = new (getAlloc()) AST_Index();
+                        index->value = makeMangledStr(v.target->v.Name.id);
+                        auto sub = new (getAlloc()) AST_Subscript();
+                        sub->value = makeName("__annotations__", AST_TYPE::Load, stmt->lineno);
+                        sub->slice = index;
+                        sub->ctx_type = AST_TYPE::Store;
+                        stmts.push_back(makeAssign(sub, annotation, stmt->lineno));
+                    } else {
+                        auto e = new (getAlloc()) AST_Expr(annotation);
+                        e->lineno = stmt->lineno;
+                        stmts.push_back(e);
+                    }
+                } else if (!v.value && v.simple && v.target->kind == Name_kind) {
+                    // `x: int` still makes x a local: `if 0: x = None`.
+                    auto zero = new (getAlloc()) AST_Num();
+                    zero->num_type = AST_Num::INT;
+                    zero->n_int = 0;
+                    auto r = new (getAlloc()) AST_If();
+                    r->lineno = stmt->lineno;
+                    r->col_offset = stmt->col_offset;
+                    r->test = zero;
+                    r->body.push_back(makeAssign(convert(v.target), makeName("None", AST_TYPE::Load, stmt->lineno),
+                                                 stmt->lineno));
+                    stmts.push_back(r);
+                }
+                if (stmts.empty())
+                    return new (getAlloc()) AST_Pass();
+                for (int i = 1; i < stmts.size(); i++)
+                    stmts_after.push_back(stmts[i]);
+                return stmts[0];
             }
             case For_kind: {
                 auto r = new (getAlloc()) AST_For();
@@ -614,39 +1123,55 @@ public:
                 return r;
             }
             case With_kind: {
-                auto r = new (getAlloc()) AST_With();
+                // Python 3 allows several context managers in one with statement; nest them.
                 auto v = stmt->v.With;
-                r->context_expr = convert(v.context_expr);
-                r->optional_vars = convert(v.optional_vars);
-                r->body = convert<stmt_ty, AST_stmt*>(v.body);
-                return r;
+                std::vector<AST_stmt*> body = convert<stmt_ty, AST_stmt*>(v.body);
+                for (int i = asdl_seq_LEN(v.items) - 1; i >= 0; i--) {
+                    withitem_ty item = (withitem_ty)asdl_seq_GET(v.items, i);
+                    auto r = new (getAlloc()) AST_With();
+                    r->lineno = stmt->lineno;
+                    r->col_offset = stmt->col_offset;
+                    r->context_expr = convert(item->context_expr);
+                    r->optional_vars = convert(item->optional_vars);
+                    r->body = std::move(body);
+                    body = { r };
+                }
+                return body[0];
             }
             case Raise_kind: {
                 auto r = new (getAlloc()) AST_Raise();
                 auto v = stmt->v.Raise;
-                r->arg0 = convert(v.type);
-                r->arg1 = convert(v.inst);
-                r->arg2 = convert(v.tback);
+                r->lineno = stmt->lineno;
+                r->col_offset = stmt->col_offset;
+                r->arg0 = convert(v.exc);
+                // The CFG turns 'raise X from Y' into a call that sets the cause.
+                r->arg1 = convert(v.cause);
                 return r;
             }
-            case TryExcept_kind: {
-                auto r = new (getAlloc()) AST_TryExcept();
-                auto v = stmt->v.TryExcept;
-                r->body = convert<stmt_ty, AST_stmt*>(v.body);
-                r->handlers = convert<excepthandler_ty, AST_ExceptHandler*>(v.handlers);
-                r->orelse = convert<stmt_ty, AST_stmt*>(v.orelse);
-                return r;
-            }
-            case TryFinally_kind: {
+            case Try_kind: {
+                auto v = stmt->v.Try;
+                std::vector<AST_stmt*> body = convert<stmt_ty, AST_stmt*>(v.body);
+                if (asdl_seq_LEN(v.handlers)) {
+                    auto r = new (getAlloc()) AST_TryExcept();
+                    r->lineno = stmt->lineno;
+                    r->col_offset = stmt->col_offset;
+                    r->body = std::move(body);
+                    r->handlers = convert<excepthandler_ty, AST_ExceptHandler*>(v.handlers);
+                    r->orelse = convert<stmt_ty, AST_stmt*>(v.orelse);
+                    if (!asdl_seq_LEN(v.finalbody))
+                        return r;
+                    body = { r };
+                }
                 auto r = new (getAlloc()) AST_TryFinally();
-                auto v = stmt->v.TryFinally;
-                r->body = convert<stmt_ty, AST_stmt*>(v.body);
+                r->body = std::move(body);
                 in_finally++;
                 r->finalbody = convert<stmt_ty, AST_stmt*>(v.finalbody);
                 in_finally--;
                 return r;
             }
             case Assert_kind: {
+                if (stmt->v.Assert.test->kind == Tuple_kind && asdl_seq_LEN(stmt->v.Assert.test->v.Tuple.elts) > 0)
+                    warn(stmt->lineno, stmt->col_offset, "assertion is always true, perhaps remove parentheses?");
                 auto r = new (getAlloc()) AST_Assert();
                 auto v = stmt->v.Assert;
                 r->test = convert(v.test);
@@ -667,14 +1192,6 @@ public:
                 r->level = v.level;
                 return r;
             }
-            case Exec_kind: {
-                auto r = new (getAlloc()) AST_Exec();
-                auto v = stmt->v.Exec;
-                r->body = convert(v.body);
-                r->globals = convert(v.globals);
-                r->locals = convert(v.locals);
-                return r;
-            }
             case Global_kind: {
                 auto r = new (getAlloc()) AST_Global();
                 auto v = stmt->v.Global;
@@ -692,6 +1209,41 @@ public:
                 }
                 return r;
             }
+            case Nonlocal_kind: {
+                if (nestlevel == 0)
+                    raiseSyntaxError("nonlocal declaration not allowed at module level", stmt->lineno,
+                                     stmt->col_offset, fn, "", true);
+                auto r = new (getAlloc()) AST_Global();
+                r->names = convert<identifier, InternedString>(stmt->v.Nonlocal.names);
+                r->is_nonlocal = true;
+                return r;
+            }
+            case AsyncFunctionDef_kind: {
+                // TODO: coroutines.  For now an async function is defined as a plain function that raises
+                // when called, so that modules which define (but don't use) coroutines can be imported.
+                auto r = new (getAlloc()) AST_FunctionDef();
+                r->lineno = stmt->lineno;
+                r->col_offset = stmt->col_offset;
+                auto v = stmt->v.AsyncFunctionDef;
+                r->name = convert(v.name);
+                r->args = convert(v.args, r);
+                r->decorator_list = convert<expr_ty, AST_expr*>(v.decorator_list);
+
+                auto call = new (getAlloc()) AST_Call();
+                call->lineno = stmt->lineno;
+                call->func = new (getAlloc()) AST_Name(pool->get("SystemError"), AST_TYPE::Load, stmt->lineno);
+                auto msg = new (getAlloc()) AST_Str("coroutines are not supported by Pyston yet");
+                msg->lineno = stmt->lineno;
+                call->args.push_back(msg);
+                auto raise = new (getAlloc()) AST_Raise();
+                raise->lineno = stmt->lineno;
+                raise->arg0 = call;
+                r->body.push_back(raise);
+                return r;
+            }
+            case AsyncFor_kind:
+            case AsyncWith_kind:
+                unsupported("coroutines", stmt->lineno, stmt->col_offset);
             case Pass_kind:
                 return new (getAlloc()) AST_Pass();
             case Break_kind:
@@ -702,9 +1254,6 @@ public:
             case Continue_kind:
                 if (loop_depth == 0)
                     raiseSyntaxError("'continue' not properly in loop", stmt->lineno, stmt->col_offset, fn, "", true);
-                if (in_finally)
-                    raiseSyntaxError("'continue' not supported inside 'finally' clause", stmt->lineno, stmt->col_offset,
-                                     fn, "", true);
                 return new (getAlloc()) AST_Continue();
         };
         // GCC wants this:
@@ -733,7 +1282,7 @@ public:
                 rtn->lineno = 1;
                 assert(!this->pool);
                 this->pool = rtn->interned_strings.get();
-                convertAll<stmt_ty>(mod->v.Module.body, rtn->body);
+                rtn->body = convertScopeBody(mod->v.Module.body, ScopeKind::Module, 1);
                 return std::make_pair(rtn, std::move(ast_allocator));
             }
             case Interactive_kind: {
@@ -766,7 +1315,36 @@ public:
     }
 };
 
+extern "C" int _PystonCheckSymtable(mod_ty mod, PyObject* filename, int future_features);
+
+// Runs CPython's symbol table pass, which reports scoping errors such as an assignment expression
+// rebinding a comprehension iteration variable.
+static void checkSymtable(mod_ty mod, llvm::StringRef fn) {
+    int future_features = 0;
+    if (mod->kind == Module_kind) {
+        for (int i = 0; i < asdl_seq_LEN(mod->v.Module.body); i++) {
+            stmt_ty stmt = (stmt_ty)asdl_seq_GET(mod->v.Module.body, i);
+            if (stmt->kind != ImportFrom_kind || !stmt->v.ImportFrom.module
+                || !_PyUnicode_EqualToASCIIString(stmt->v.ImportFrom.module, "__future__"))
+                continue;
+            for (int j = 0; j < asdl_seq_LEN(stmt->v.ImportFrom.names); j++) {
+                alias_ty alias = (alias_ty)asdl_seq_GET(stmt->v.ImportFrom.names, j);
+                if (_PyUnicode_EqualToASCIIString(alias->name, "annotations"))
+                    future_features |= CO_FUTURE_ANNOTATIONS;
+            }
+        }
+    }
+
+    PyObject* filename = PyUnicode_DecodeFSDefaultAndSize(fn.data(), fn.size());
+    if (!filename)
+        throwCAPIException();
+    AUTO_DECREF(filename);
+    if (_PystonCheckSymtable(mod, filename, future_features) < 0)
+        throwCAPIException();
+}
+
 std::pair<AST*, std::unique_ptr<ASTAllocator>> cpythonToPystonAST(mod_ty mod, llvm::StringRef fn) {
+    checkSymtable(mod, fn);
     Converter c(fn);
     return c.convert(mod);
 }

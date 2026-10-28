@@ -139,7 +139,7 @@ Pyston-specific flags:
 <dt>-O</dt>
   <dd>Force Pyston to always run at the highest compilation tier.  This doesn't always produce the fastest running time due to the lack of type recording from lower compilation tiers, but similar to -n can help test the code generator.</dd>
 
-<dt>-I</dt>
+<dt>-Y</dt>
   <dd>Force always using the Pyston interpreter.  This is mostly used for debugging / testing. (Takes precedence over -n and -O)</dd>
 
 <dt>-r</dt>

@@ -46,8 +46,7 @@ Box* listiterHasnext(Box* s) {
 
     bool ans = (self->pos < self->l->size);
     if (!ans) {
-        Py_DECREF(self->l);
-        self->l = NULL;
+        Py_CLEAR(self->l);
     }
     return boxBool(ans);
 }
@@ -62,8 +61,7 @@ llvm_compat_bool listiterHasnextUnboxed(Box* s) {
 
     bool ans = (self->pos < self->l->size);
     if (!ans) {
-        Py_DECREF(self->l);
-        self->l = NULL;
+        Py_CLEAR(self->l);
     }
     return ans;
 }
@@ -76,8 +74,7 @@ Box* listiter_next(Box* s) noexcept {
         return NULL;
 
     if (!(self->pos >= 0 && self->pos < self->l->size)) {
-        Py_DECREF(self->l);
-        self->l = NULL;
+        Py_CLEAR(self->l);
         return NULL;
     }
 

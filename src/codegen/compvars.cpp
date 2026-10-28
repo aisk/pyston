@@ -83,10 +83,9 @@ std::string ValuedCompilerType<llvm::Value*>::debugName() {
 }
 
 struct RawInstanceMethod {
-    CompilerVariable* obj, *func, *im_class;
+    CompilerVariable* obj, *func;
 
-    RawInstanceMethod(CompilerVariable* obj, CompilerVariable* func, CompilerVariable* im_class)
-        : obj(obj), func(func), im_class(im_class) {}
+    RawInstanceMethod(CompilerVariable* obj, CompilerVariable* func) : obj(obj), func(func) {}
 };
 
 class InstanceMethodType : public ValuedCompilerType<RawInstanceMethod*> {
@@ -117,9 +116,9 @@ public:
         return rtn;
     }
 
-    static CompilerVariable* makeIM(CompilerVariable* obj, CompilerVariable* func, CompilerVariable* im_class) {
+    static CompilerVariable* makeIM(CompilerVariable* obj, CompilerVariable* func) {
         CompilerVariable* rtn = new ValuedCompilerVariable<RawInstanceMethod*>(
-            InstanceMethodType::get(obj->getType(), func->getType()), new RawInstanceMethod(obj, func, im_class));
+            InstanceMethodType::get(obj->getType(), func->getType()), new RawInstanceMethod(obj, func));
         return rtn;
     }
 
@@ -159,10 +158,9 @@ public:
         assert(im->func);
         ConcreteCompilerVariable* obj = im->obj->makeConverted(emitter, UNKNOWN);
         ConcreteCompilerVariable* func = im->func->makeConverted(emitter, UNKNOWN);
-        ConcreteCompilerVariable* im_class = im->im_class->makeConverted(emitter, UNKNOWN);
 
-        llvm::Value* boxed = emitter.getBuilder()->CreateCall(g.funcs.boxInstanceMethod, { obj->getValue(),
-                                                               func->getValue(), im_class->getValue() });
+        llvm::Value* boxed
+            = emitter.getBuilder()->CreateCall(g.funcs.boxInstanceMethod, { obj->getValue(), func->getValue() });
         emitter.setType(boxed, RefType::OWNED);
 
         return new ConcreteCompilerVariable(other_type, boxed);
@@ -173,8 +171,7 @@ public:
         CompilerVariable* rtn = cache[var];
         if (rtn == NULL) {
             RawInstanceMethod* im = var->getValue();
-            RawInstanceMethod* new_im
-                = new RawInstanceMethod(im->obj->dup(cache), im->func->dup(cache), im->im_class->dup(cache));
+            RawInstanceMethod* new_im = new RawInstanceMethod(im->obj->dup(cache), im->func->dup(cache));
             rtn = new VAR(this, new_im);
         }
         return rtn;
@@ -183,18 +180,16 @@ public:
     void serializeToFrame(VAR* var, std::vector<llvm::Value*>& stackmap_args) override {
         var->getValue()->obj->serializeToFrame(stackmap_args);
         var->getValue()->func->serializeToFrame(stackmap_args);
-        var->getValue()->im_class->serializeToFrame(stackmap_args);
     }
 
     Box* deserializeFromFrame(const FrameVals& vals) override {
-        assert(vals.size() == numFrameArgs() && vals.size() == 3);
+        assert(vals.size() == numFrameArgs() && vals.size() == 2);
         Box* obj = reinterpret_cast<Box*>(vals[0]);
         Box* func = reinterpret_cast<Box*>(vals[1]);
-        Box* im_class = reinterpret_cast<Box*>(vals[2]);
-        return boxInstanceMethod(obj, func, im_class);
+        return boxInstanceMethod(obj, func);
     }
 
-    int numFrameArgs() override { return obj_type->numFrameArgs() + function_type->numFrameArgs() + 1 /* im_class */; }
+    int numFrameArgs() override { return obj_type->numFrameArgs() + function_type->numFrameArgs(); }
 };
 std::unordered_map<std::pair<CompilerType*, CompilerType*>, InstanceMethodType*> InstanceMethodType::made;
 
@@ -1531,7 +1526,8 @@ public:
         } else if (op_type == AST_TYPE::FloorDiv) {
             v = emitter.createCall2(info.unw_info, g.funcs.floordiv_float_float, var->getValue()->val, rhs_val);
         } else if (op_type == AST_TYPE::Pow) {
-            v = emitter.createCall2(info.unw_info, g.funcs.pow_float_float, var->getValue()->val, rhs_val);
+            // A negative base with a fractional exponent gives a complex number in Python 3.
+            succeeded = false;
         } else if (exp_type == BinOp || exp_type == AugBinOp) {
             llvm::Instruction::BinaryOps binopcode;
             switch (op_type) {
@@ -1708,7 +1704,7 @@ public:
         RELEASE_ASSERT(!argspec.has_kwargs, "");
         RELEASE_ASSERT(argspec.num_keywords == 0, "");
 
-        bool is_well_defined = (cls == xrange_cls);
+        bool is_well_defined = (cls == range_cls);
         assert(is_well_defined);
         return typeFromClass(cls);
     }
@@ -1812,10 +1808,7 @@ public:
                     typeFromClass(function_cls),
                     emitter.setType(embedRelocatablePtr(rtattr, g.llvm_value_type_ptr), RefType::BORROWED));
 
-                return InstanceMethodType::makeIM(
-                    var, clattr,
-                    new ConcreteCompilerVariable(
-                        UNKNOWN, emitter.setType(embedRelocatablePtr(cls, g.llvm_value_type_ptr), RefType::BORROWED)));
+                return InstanceMethodType::makeIM(var, clattr);
             }
         }
 
@@ -1882,7 +1875,7 @@ public:
         assert(code);
 
         ParamReceiveSpec paramspec = rtattr_func->getParamspec();
-        if (code->takes_varargs || paramspec.takes_kwargs)
+        if (code->takes_varargs || paramspec.takes_kwargs || paramspec.num_kwonly)
             return NULL;
 
         RELEASE_ASSERT(paramspec.num_args == code->numReceivedArgs(), "");
@@ -2065,53 +2058,6 @@ public:
         static BoxedString* attr = getStaticString("__getitem__");
         bool no_attribute = false;
 
-        if (slice->getType() == UNBOXED_SLICE) {
-            UnboxedSlice slice_val = extractSlice(slice);
-
-            // This corresponds to the case in apply_slice that calls into PySequence_GetSlice.
-            // Other cases will get handled by UNKNOWN.getitem
-            if (!slice_val.step && canStaticallyResolveGetattrs() && cls->tp_as_sequence
-                && cls->tp_as_sequence->sq_slice) {
-                if ((!slice_val.start || slice_val.start->getType() == INT || slice_val.start->getType() == BOXED_INT)
-                    && (!slice_val.stop || slice_val.stop->getType() == INT
-                        || slice_val.stop->getType() == BOXED_INT)) {
-
-                    CompilerType* return_type = getattrType(attr, true)->callType(ArgPassSpec(1), { SLICE }, NULL);
-                    assert(return_type->getConcreteType() == return_type);
-
-                    llvm::Value* start = NULL;
-                    if (!slice_val.start)
-                        start = getConstantInt(0, g.i64);
-                    else {
-                        if (slice_val.start->getType() == BOXED_INT)
-                            slice_val.start
-                                = makeUnboxedInt(emitter, static_cast<ConcreteCompilerVariable*>(slice_val.start));
-                        start = IntType::extractInt(slice_val.start);
-                    }
-
-                    llvm::Value* stop = NULL;
-                    if (!slice_val.stop)
-                        stop = getConstantInt(PY_SSIZE_T_MAX, g.i64);
-                    else {
-                        if (slice_val.stop->getType() == BOXED_INT)
-                            slice_val.stop
-                                = makeUnboxedInt(emitter, static_cast<ConcreteCompilerVariable*>(slice_val.stop));
-                        stop = IntType::extractInt(slice_val.stop);
-                    }
-
-                    static llvm::FunctionType* ft = llvm::FunctionType::get(
-                        g.llvm_value_type_ptr, { g.llvm_value_type_ptr, g.i64, g.i64 }, false);
-                    llvm::Value* r = emitter.createCall3(
-                        info.unw_info, llvm::FunctionCallee(ft, embedConstantPtr((void*)PySequence_GetSlice, g.i8_ptr)),
-                        var->getValue(), start, stop, CAPI, getNullPtr(g.llvm_value_type_ptr));
-                    emitter.setType(r, RefType::OWNED);
-                    emitter.setNullable(r, true);
-
-                    return new ConcreteCompilerVariable(static_cast<ConcreteCompilerType*>(return_type), r);
-                }
-            }
-        }
-
         // Only try calling getitem if it's not a slice.  For the slice case, defer to UNKNOWN->getitem, which will
         // call into apply_slice
         if (slice->getType() != UNBOXED_SLICE || extractSlice(slice).step != NULL) {
@@ -2155,7 +2101,7 @@ public:
         if (cls == Py_None->cls)
             return makeBool(false);
 
-        static BoxedString* attr = getStaticString("__nonzero__");
+        static BoxedString* attr = getStaticString("__bool__");
         bool no_attribute = false;
         CompilerVariable* called_constant
             = tryCallattrConstant(emitter, info, var, attr, true, ArgPassSpec(0, 0, 0, 0), {}, NULL, &no_attribute);

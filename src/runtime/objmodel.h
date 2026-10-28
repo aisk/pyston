@@ -97,7 +97,16 @@ extern "C" Box* unaryop(Box* operand, int op_type) __attribute__((noinline));
 extern "C" Box* importFrom(Box* obj, BoxedString* attr) __attribute__((noinline));
 extern "C" Box* importStar(Box* from_module, Box* to_globals) __attribute__((noinline));
 extern "C" Box** unpackIntoArray(Box* obj, int64_t expected_size, Box** out_keep_alive);
+// Builtin function that the CFG uses for starred assignment targets (`a, *b = obj`).
+extern Box* unpack_starred_func, *dict_merge_mapping_func;
+// sys.exc_info, used by the CFG to save the exception state around except handlers.
+extern Box* sys_exc_info_func;
+extern Box* raise_from_func, *get_exc_value_func, *restore_exc_info_func, *setup_annotations_func;
+void setupRaiseFrom();
+void chainExceptionContext(Box* value);
+void setupUnpackStarred();
 extern "C" void assertNameDefined(bool b, const char* name, BoxedClass* exc_cls, bool local_var_msg);
+extern "C" void delClosureVar(BoxedClosure* closure, int64_t offset, const char* name, bool deref);
 extern "C" void assertFailDerefNameDefined(const char* name);
 extern "C" void assertFail(Box* assertion_type, Box* msg);
 extern "C" void dictSetInternal(Box* d, STOLEN(Box*) k, STOLEN(Box* v));

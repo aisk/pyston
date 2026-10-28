@@ -63,6 +63,7 @@ void force() {
     FORCE(createList);
     FORCE(createSlice);
     FORCE(createUserClass);
+    FORCE(createClassNamespace);
     FORCE(createClosure);
     FORCE(createGenerator);
     FORCE(createLong);
@@ -116,6 +117,7 @@ void force() {
     FORCE(raiseNotIterableError);
     FORCE(assertNameDefined);
     FORCE(assertFailDerefNameDefined);
+    FORCE(delClosureVar);
     FORCE(assertFail);
     FORCE(printExprHelper);
     FORCE(printHelper);
@@ -149,7 +151,6 @@ void force() {
     FORCE(div_float_float);
     FORCE(floordiv_float_float);
     FORCE(mod_float_float);
-    FORCE(pow_float_float);
 
     FORCE(exec);
 

@@ -313,9 +313,11 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
         builder.CreateStore(getNullPtr(g.llvm_value_type_ptr), boxed_locals_gep);
 
         if (getScopeInfo().usesNameLookup()) {
-            // frame_info.boxedLocals = createDict()
+            // frame_info.boxedLocals = createDict(), or the namespace prepared for a class body
             // (Since this can call into the GC, we have to initialize it to NULL first as we did above.)
-            this->boxed_locals = builder.CreateCall(g.funcs.createDict);
+            bool is_class_body = getCode()->source->ast_type == AST_TYPE::ClassDef;
+            this->boxed_locals
+                = builder.CreateCall(is_class_body ? g.funcs.createClassNamespace : g.funcs.createDict);
             getRefcounts()->setType(this->boxed_locals, RefType::OWNED);
             auto inst = builder.CreateStore(this->boxed_locals, boxed_locals_gep);
             getRefcounts()->refConsumed(this->boxed_locals, inst);
@@ -1192,7 +1194,6 @@ private:
     ConcreteCompilerVariable* getEllipsis() {
         llvm::Constant* ellipsis = embedRelocatablePtr(Ellipsis, g.llvm_value_type_ptr, "cEllipsis");
         emitter.setType(ellipsis, RefType::BORROWED);
-        auto ellipsis_cls = Ellipsis->cls;
         return new ConcreteCompilerVariable(typeFromClass(ellipsis_cls), ellipsis);
     }
 
@@ -1247,10 +1248,12 @@ private:
                 return new ConcreteCompilerVariable(LONG, rtn);
             else if (o->cls == str_cls)
                 return new ConcreteCompilerVariable(STR, rtn);
-            else if (o->cls == unicode_cls)
-                return new ConcreteCompilerVariable(typeFromClass(unicode_cls), rtn);
-            else
-                RELEASE_ASSERT(0, "");
+            else if (o->cls == bytes_cls)
+                return new ConcreteCompilerVariable(typeFromClass(bytes_cls), rtn);
+            else if (o->cls == bool_cls)
+                return new ConcreteCompilerVariable(BOXED_BOOL, rtn);
+            else // eg the runtime helper functions the CFG calls
+                return new ConcreteCompilerVariable(UNKNOWN, rtn);
         }
         CompilerVariable* rtn = symbol_table[vreg];
         if (is_kill) {
@@ -1271,10 +1274,10 @@ private:
         if (vst == ScopeInfo::VarScopeType::GLOBAL) {
             return _getGlobal(node, unw_info);
         } else if (vst == ScopeInfo::VarScopeType::DEREF) {
-            assert(scope_info.takesClosure());
-
             // This is the information on how to look up the variable in the closure object.
             DerefInfo deref_info = scope_info.getDerefInfo(node);
+            bool from_created = deref_info.num_parents_from_passed_closure == DerefInfo::FROM_CREATED_CLOSURE;
+            assert(from_created || scope_info.takesClosure());
 
             // This code is basically:
             // closure = created_closure;
@@ -1283,9 +1286,9 @@ private:
             // closure = closure->parent;
             // closure->elts[deref_info.offset]
             // Where the parent lookup is done `deref_info.num_parents_from_passed_closure` times
-            llvm::Value* closureValue = irstate->getPassedClosure();
+            llvm::Value* closureValue = from_created ? irstate->getCreatedClosure() : irstate->getPassedClosure();
             assert(closureValue);
-            for (int i = 0; i < deref_info.num_parents_from_passed_closure; i++) {
+            for (int i = 0; !from_created && i < deref_info.num_parents_from_passed_closure; i++) {
                 closureValue = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, getClosureParentGep(emitter, closureValue));
                 emitter.setType(closureValue, RefType::BORROWED);
             }
@@ -1310,8 +1313,18 @@ private:
             curblock = fail_bb;
             emitter.getBuilder()->SetInsertPoint(curblock);
 
-            llvm::CallBase* call = emitter.createCall(unw_info, g.funcs.assertFailDerefNameDefined,
-                                                     embedRelocatablePtr(id.c_str(), g.i8_ptr));
+            llvm::CallBase* call;
+            if (from_created) {
+                // The variable belongs to this function, so the error is about a local.
+                call = emitter.createCall(
+                    unw_info, g.funcs.assertNameDefined,
+                    { getConstantInt(0, g.i1), embedRelocatablePtr(id.c_str(), g.i8_ptr),
+                      emitter.setType(embedRelocatablePtr(NameError, g.llvm_class_type_ptr), RefType::BORROWED),
+                      getConstantInt(true /*local_error_msg*/, g.i1) });
+            } else {
+                call = emitter.createCall(unw_info, g.funcs.assertFailDerefNameDefined,
+                                          embedRelocatablePtr(id.c_str(), g.i8_ptr));
+            }
             call->setDoesNotReturn();
             emitter.getBuilder()->CreateUnreachable();
 
@@ -1490,6 +1503,12 @@ private:
         CompilerVariable* _bases_tuple = evalVReg(node->vreg_bases_tuple);
         ConcreteCompilerVariable* bases_tuple = _bases_tuple->makeConverted(emitter, _bases_tuple->getBoxType());
 
+        llvm::Value* kwargs = getNullPtr(g.llvm_value_type_ptr);
+        if (node->vreg_kwargs != VREG_UNDEFINED) {
+            CompilerVariable* _kwargs = evalVReg(node->vreg_kwargs);
+            kwargs = _kwargs->makeConverted(emitter, _kwargs->getBoxType())->getValue();
+        }
+
         std::vector<CompilerVariable*> decorators;
         for (int i = 0; i < node->num_decorator; ++i) {
             decorators.push_back(evalVReg(node->decorator[i]));
@@ -1519,15 +1538,13 @@ private:
         assert(irstate->getSourceInfo()->scoping.areGlobalsFromModule());
         CompilerVariable* func = makeFunction(emitter, code, this_closure, irstate->getGlobalsIfCustom(), {});
 
-        CompilerVariable* attr_dict = func->call(emitter, getEmptyOpInfo(unw_info), ArgPassSpec(0), {}, NULL);
-
-        ConcreteCompilerVariable* converted_attr_dict = attr_dict->makeConverted(emitter, attr_dict->getBoxType());
+        ConcreteCompilerVariable* converted_func = func->makeConverted(emitter, func->getBoxType());
 
         InternedString name = irstate->getCodeConstants().getInternedString(node->index_name);
-        llvm::Value* classobj = emitter.createCall3(
+        llvm::Value* classobj = emitter.createCall(
             unw_info, g.funcs.createUserClass,
-            emitter.setType(embedRelocatablePtr(name.getBox(), g.llvm_boxedstring_type_ptr), RefType::BORROWED),
-            bases_tuple->getValue(), converted_attr_dict->getValue());
+            { emitter.setType(embedRelocatablePtr(name.getBox(), g.llvm_boxedstring_type_ptr), RefType::BORROWED),
+              bases_tuple->getValue(), converted_func->getValue(), kwargs });
         emitter.setType(classobj, RefType::OWNED);
 
         // Note: createuserClass is free to manufacture non-class objects
@@ -1772,11 +1789,26 @@ private:
 
         auto vst = node->lookup_type;
         assert(vst != ScopeInfo::VarScopeType::UNKNOWN);
-        assert(vst != ScopeInfo::VarScopeType::DEREF);
 
         auto vreg = node->vreg;
 
-        if (vst == ScopeInfo::VarScopeType::GLOBAL) {
+        if (vst == ScopeInfo::VarScopeType::DEREF) {
+            // A `nonlocal` variable: closure->parent->...->elts[offset] = val
+            llvm::Value* closureValue = irstate->getPassedClosure();
+            assert(closureValue);
+            for (int i = 0; i < node->deref_info.num_parents_from_passed_closure; i++) {
+                closureValue = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr,
+                                                                getClosureParentGep(emitter, closureValue));
+                emitter.setType(closureValue, RefType::BORROWED);
+            }
+            llvm::Value* gep = getClosureElementGep(emitter, closureValue, node->deref_info.offset);
+            auto prev = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, gep);
+            emitter.setType(prev, RefType::OWNED);
+            emitter.setNullable(prev, true);
+            llvm::Value* v = val->makeConverted(emitter, UNKNOWN)->getValue();
+            auto store = emitter.getBuilder()->CreateStore(v, gep);
+            emitter.refConsumed(v, store);
+        } else if (vst == ScopeInfo::VarScopeType::GLOBAL) {
             if (irstate->getSourceInfo()->scoping.areGlobalsFromModule()) {
                 auto parent_module = irstate->getGlobals();
                 ConcreteCompilerVariable* module = new ConcreteCompilerVariable(MODULE, parent_module);
@@ -2030,9 +2062,23 @@ private:
             return;
         }
 
-        // Can't be in a closure because of this syntax error:
-        // SyntaxError: can not delete variable 'x' referenced in nested scope
-        assert(vst == ScopeInfo::VarScopeType::FAST);
+        if (vst == ScopeInfo::VarScopeType::DEREF) {
+            DerefInfo deref_info = target->deref_info;
+            bool from_created = deref_info.num_parents_from_passed_closure == DerefInfo::FROM_CREATED_CLOSURE;
+            llvm::Value* closureValue = from_created ? irstate->getCreatedClosure() : irstate->getPassedClosure();
+            assert(closureValue);
+            for (int i = 0; !from_created && i < deref_info.num_parents_from_passed_closure; i++) {
+                closureValue = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr,
+                                                                getClosureParentGep(emitter, closureValue));
+                emitter.setType(closureValue, RefType::BORROWED);
+            }
+            emitter.createCall(unw_info, g.funcs.delClosureVar,
+                               { closureValue, getConstantInt(deref_info.offset, g.i64),
+                                 embedConstantPtr(id.c_str(), g.i8_ptr), getConstantInt(true, g.i1) });
+            return;
+        }
+
+        assert(vst == ScopeInfo::VarScopeType::FAST || vst == ScopeInfo::VarScopeType::CLOSURE);
 
         CompilerVariable* prev = symbol_table[target->vreg];
 
@@ -2061,6 +2107,12 @@ private:
         }
 
         symbol_table[target->vreg] = NULL;
+
+        if (vst == ScopeInfo::VarScopeType::CLOSURE) {
+            emitter.createCall(unw_info, g.funcs.delClosureVar,
+                               { irstate->getCreatedClosure(), getConstantInt(target->closure_offset, g.i64),
+                                 embedConstantPtr(id.c_str(), g.i8_ptr), getConstantInt(false, g.i1) });
+        }
     }
 
     void doExec(BST_Exec* node, const UnwindInfo& unw_info) {
@@ -3135,10 +3187,9 @@ std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> createLandingpad(llvm::Basi
 
     llvm::Value* cxaexc_pointer = builder.CreateExtractValue(landing_pad, { 0 });
 
-    static llvm::Function* std_module_catch = g.stdlib_module->getFunction("__cxa_begin_catch");
-    auto begin_catch_func
-        = g.cur_module->getOrInsertFunction(std_module_catch->getName(), std_module_catch->getFunctionType());
-    assert(begin_catch_func);
+    // The runtime bitcode doesn't always declare __cxa_begin_catch (optimized builds drop it), so declare it here.
+    auto begin_catch_func = g.cur_module->getOrInsertFunction(
+        "__cxa_begin_catch", llvm::FunctionType::get(g.i8_ptr, { g.i8_ptr }, false));
 
     llvm::Value* excinfo_pointer = builder.CreateCall(begin_catch_func, cxaexc_pointer);
 

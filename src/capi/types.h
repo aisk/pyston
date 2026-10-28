@@ -23,16 +23,23 @@ namespace pyston {
 typedef PyObject* (*wrapperfunc)(PyObject* self, PyObject* args, void* wrapped);
 typedef PyObject* (*wrapperfunc_kwds)(PyObject* self, PyObject* args, void* wrapped, PyObject* kwds);
 
+// Call a METH_FASTCALL (or METH_FASTCALL | METH_KEYWORDS) function with a tuple of positional
+// arguments and an optional dict of keyword arguments.
+Box* capiCallFastcall(Box* passthrough, PyCFunction func, Box* args) noexcept;
+Box* capiCallFastcallKeywords(Box* passthrough, PyCFunction func, Box* args, Box* kwargs) noexcept;
+
 class BoxedCApiFunction : public Box {
 public:
     PyMethodDef* method_def;
     PyObject* passthrough;
     Box* module;
+    Box* weakreflist;
+    vectorcallfunc vectorcall;
 
 public:
     BoxedCApiFunction(PyMethodDef* method_def, Box* passthrough, Box* module_name)
-        : method_def(method_def), passthrough(passthrough), module(module_name) {
-        assert(!module || PyString_Check(module_name));
+        : method_def(method_def), passthrough(passthrough), module(module_name), weakreflist(NULL), vectorcall(NULL) {
+        assert(!module || PyUnicode_Check(module_name));
         Py_XINCREF(passthrough);
         Py_XINCREF(module);
     }
@@ -46,8 +53,8 @@ public:
             return setDescrTypeError<S>(_self, "capifunc", "__repr__");
         BoxedCApiFunction* self = (BoxedCApiFunction*)_self;
         if (self->passthrough == NULL)
-            return callCAPIFromStyle<S>(PyString_FromFormat, "<built-in function %s>", self->method_def->ml_name);
-        return callCAPIFromStyle<S>(PyString_FromFormat, "<built-in method %s of %s object at %p>",
+            return callCAPIFromStyle<S>(PyUnicode_FromFormat, "<built-in function %s>", self->method_def->ml_name);
+        return callCAPIFromStyle<S>(PyUnicode_FromFormat, "<built-in method %s of %s object at %p>",
                                     self->method_def->ml_name, self->passthrough->cls->tp_name, self->passthrough);
     }
 
@@ -101,10 +108,10 @@ static_assert(sizeof(BoxedCApiFunction) == sizeof(PyCFunctionObject), "");
 static_assert(offsetof(BoxedCApiFunction, method_def) == offsetof(PyCFunctionObject, m_ml), "");
 static_assert(offsetof(BoxedCApiFunction, passthrough) == offsetof(PyCFunctionObject, m_self), "");
 static_assert(offsetof(BoxedCApiFunction, module) == offsetof(PyCFunctionObject, m_module), "");
+static_assert(offsetof(BoxedCApiFunction, weakreflist) == offsetof(PyCFunctionObject, m_weakreflist), "");
 
-PyObject* try_3way_to_rich_compare(PyObject* v, PyObject* w, int op) noexcept;
+PyObject* richcompare_fallback(PyObject* v, PyObject* w, int op) noexcept;
 PyObject* convert_3way_to_object(int op, int c) noexcept;
-int default_3way_compare(PyObject* v, PyObject* w);
 
 } // namespace pyston
 

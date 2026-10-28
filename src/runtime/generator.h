@@ -23,9 +23,10 @@ namespace pyston {
 
 struct Context;
 
-extern BoxedClass* generator_cls;
 
 void setupGenerator();
+// Builtin functions that the CFG uses to implement `yield from`.
+extern Box* yield_from_iter_func, *yield_from_step_func;
 void generatorEntry(BoxedGenerator* g) noexcept;
 Context* getReturnContextForGeneratorFrame(void* frame_addr);
 

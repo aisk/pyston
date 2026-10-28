@@ -125,6 +125,7 @@ namespace AST_TYPE {
     /* like Module, but used for eval. */                                                                              \
     X(Expression, 88)                                                                                                  \
     X(SetComp, 89)                                                                                                     \
+    X(NamedExpr, 91)                                                                                                   \
     X(Suite, 90)                                                                                                       \
                                                                                                                        \
     /* Pseudo-nodes that are specific to this compiler: */                                                             \
@@ -142,7 +143,8 @@ namespace AST_TYPE {
     /* These aren't real AST types, but since we use AST types to represent binexp types */                            \
     /* and divmod+truediv are essentially types of binops, we add them here (at least for now): */                     \
     X(DivMod, 250)                                                                                                     \
-    X(TrueDiv, 251)
+    X(TrueDiv, 251)                                                                                                    \
+    X(MatMult, 252)
 
 #define GENERATE_ENUM(ENUM, N) ENUM = N,
 #define GENERATE_STRING(STRING, N) m[N] = #STRING;
@@ -292,6 +294,10 @@ class AST_arguments : public AST {
 public:
     // no lineno, col_offset attributes
     std::vector<AST_expr*> args, defaults;
+    // kw_defaults has one entry per keyword-only argument, NULL if it has no default
+    std::vector<AST_expr*> kwonlyargs, kw_defaults;
+    // The first num_posonly of args are positional-only.
+    int num_posonly = 0;
 
     AST_Name* kwarg = NULL, * vararg = NULL;
 
@@ -411,7 +417,7 @@ public:
 
     virtual void accept(ASTVisitor* v) override;
 
-    AST_Call() : AST_expr(AST_TYPE::Call) {}
+    AST_Call() : AST_expr(AST_TYPE::Call), starargs(NULL), kwargs(NULL), func(NULL) {}
 
     DEFINE_AST_NODE(Call)
 };
@@ -448,6 +454,7 @@ public:
     virtual void accept_stmt(ASTStmtVisitor* v) override;
 
     std::vector<AST_expr*> bases, decorator_list;
+    std::vector<AST_keyword*> keywords;
     std::vector<AST_stmt*> body;
     InternedString name;
 
@@ -619,6 +626,7 @@ public:
 class AST_Global : public AST_stmt {
 public:
     std::vector<InternedString> names;
+    bool is_nonlocal = false; // this is a `nonlocal` statement
 
     virtual void accept(ASTVisitor* v) override;
     virtual void accept_stmt(ASTStmtVisitor* v) override;
@@ -650,6 +658,19 @@ public:
     AST_IfExp() : AST_expr(AST_TYPE::IfExp) {}
 
     DEFINE_AST_NODE(IfExp)
+};
+
+// `target := value`
+class AST_NamedExpr : public AST_expr {
+public:
+    AST_Name* target;
+    AST_expr* value;
+
+    virtual void accept(ASTVisitor* v) override;
+
+    AST_NamedExpr() : AST_expr(AST_TYPE::NamedExpr) {}
+
+    DEFINE_AST_NODE(NamedExpr)
 };
 
 class AST_Import : public AST_stmt {
@@ -718,6 +739,8 @@ class AST_List : public AST_expr {
 public:
     std::vector<AST_expr*> elts;
     AST_TYPE::AST_TYPE ctx_type;
+    // Empty, or one flag per element saying whether it is a `*starred` one
+    std::vector<bool> elt_starred;
 
     virtual void accept(ASTVisitor* v) override;
 
@@ -879,6 +902,8 @@ public:
 class AST_Set : public AST_expr {
 public:
     std::vector<AST_expr*> elts;
+    // Empty, or one flag per element saying whether it is a `*starred` one
+    std::vector<bool> elt_starred;
 
     virtual void accept(ASTVisitor* v) override;
 
@@ -915,11 +940,11 @@ public:
     enum StrType : unsigned char {
         UNSET = 0x00,
         STR = 0x10,
-        UNICODE = 0x20,
+        BYTES = 0x20,
     } str_type;
 
-    // The meaning of str_data depends on str_type.  For STR, it's just the bytes value.
-    // For UNICODE, it's the utf-8 encoded value.
+    // The meaning of str_data depends on str_type.  For STR, it's the value encoded with utf-8
+    // (with surrogatepass).  For BYTES, it's just the bytes value.
     std::string str_data;
 
     virtual void accept(ASTVisitor* v) override;
@@ -972,6 +997,8 @@ class AST_Tuple : public AST_expr {
 public:
     std::vector<AST_expr*> elts;
     AST_TYPE::AST_TYPE ctx_type;
+    // Empty, or one flag per element saying whether it is a `*starred` one
+    std::vector<bool> elt_starred;
 
     virtual void accept(ASTVisitor* v) override;
 
@@ -1021,6 +1048,7 @@ public:
 class AST_Yield : public AST_expr {
 public:
     AST_expr* value;
+    bool yield_from = false; // `yield from value`
 
     virtual void accept(ASTVisitor* v) override;
 
@@ -1081,6 +1109,7 @@ public:
         UNCACHE_EXC_INFO,
         HASNEXT,
         PRINT_EXPR,
+        SETUP_ANNOTATIONS, // creates __annotations__ in the namespace unless it is there already
     } opcode;
     std::vector<AST_expr*> args;
 
@@ -1133,6 +1162,7 @@ public:
     virtual bool visit_global(AST_Global* node) { RELEASE_ASSERT(0, ""); }
     virtual bool visit_if(AST_If* node) { RELEASE_ASSERT(0, ""); }
     virtual bool visit_ifexp(AST_IfExp* node) { RELEASE_ASSERT(0, ""); }
+    virtual bool visit_namedexpr(AST_NamedExpr* node) { RELEASE_ASSERT(0, ""); }
     virtual bool visit_import(AST_Import* node) { RELEASE_ASSERT(0, ""); }
     virtual bool visit_importfrom(AST_ImportFrom* node) { RELEASE_ASSERT(0, ""); }
     virtual bool visit_index(AST_Index* node) { RELEASE_ASSERT(0, ""); }
@@ -1201,6 +1231,7 @@ public:
     virtual bool visit_global(AST_Global* node) { return false; }
     virtual bool visit_if(AST_If* node) { return false; }
     virtual bool visit_ifexp(AST_IfExp* node) { return false; }
+    virtual bool visit_namedexpr(AST_NamedExpr* node) { return false; }
     virtual bool visit_import(AST_Import* node) { return false; }
     virtual bool visit_importfrom(AST_ImportFrom* node) { return false; }
     virtual bool visit_index(AST_Index* node) { return false; }
@@ -1308,6 +1339,7 @@ public:
     virtual bool visit_global(AST_Global* node);
     virtual bool visit_if(AST_If* node);
     virtual bool visit_ifexp(AST_IfExp* node);
+    virtual bool visit_namedexpr(AST_NamedExpr* node);
     virtual bool visit_import(AST_Import* node);
     virtual bool visit_importfrom(AST_ImportFrom* node);
     virtual bool visit_index(AST_Index* node);
