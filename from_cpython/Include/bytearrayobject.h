@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 /* ByteArray object interface */
 
 #ifndef Py_BYTEARRAYOBJECT_H
@@ -21,13 +19,16 @@ extern "C" {
  */
 
 /* Object layout */
+#ifndef Py_LIMITED_API
 typedef struct {
     PyObject_VAR_HEAD
+    Py_ssize_t ob_alloc; /* How many bytes allocated in ob_bytes */
+    char *ob_bytes;      /* Physical backing buffer */
+    char *ob_start;      /* Logical start inside ob_bytes */
     /* XXX(nnorwitz): should ob_exports be Py_ssize_t? */
-    int ob_exports; /* how many buffer exports */
-    Py_ssize_t ob_alloc; /* How many bytes allocated */
-    char *ob_bytes;
+    int ob_exports;      /* How many buffer exports */
 } PyByteArrayObject;
+#endif
 
 /* Type object */
 PyAPI_DATA(PyTypeObject) PyByteArray_Type;
@@ -46,12 +47,14 @@ PyAPI_FUNC(char *) PyByteArray_AsString(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(int) PyByteArray_Resize(PyObject *, Py_ssize_t) PYSTON_NOEXCEPT;
 
 /* Macros, trading safety for speed */
+#ifndef Py_LIMITED_API
 #define PyByteArray_AS_STRING(self) \
     (assert(PyByteArray_Check(self)), \
-     Py_SIZE(self) ? ((PyByteArrayObject *)(self))->ob_bytes : _PyByteArray_empty_string)
-#define PyByteArray_GET_SIZE(self)  (assert(PyByteArray_Check(self)),Py_SIZE(self))
+     Py_SIZE(self) ? ((PyByteArrayObject *)(self))->ob_start : _PyByteArray_empty_string)
+#define PyByteArray_GET_SIZE(self) (assert(PyByteArray_Check(self)), Py_SIZE(self))
 
 PyAPI_DATA(char) _PyByteArray_empty_string[];
+#endif
 
 #ifdef __cplusplus
 }

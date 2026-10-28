@@ -4,8 +4,32 @@
 extern "C" {
 #endif
 
-PyAPI_FUNC(mod_ty) PyAST_FromNode(const node *, PyCompilerFlags *flags,
-				  const char *, PyArena *) PYSTON_NOEXCEPT;
+#include "Python-ast.h"   /* mod_ty */
+#include "node.h"         /* node */
+
+PyAPI_FUNC(int) PyAST_Validate(mod_ty) PYSTON_NOEXCEPT;
+PyAPI_FUNC(mod_ty) PyAST_FromNode(
+    const node *n,
+    PyCompilerFlags *flags,
+    const char *filename,       /* decoded from the filesystem encoding */
+    PyArena *arena) PYSTON_NOEXCEPT;
+PyAPI_FUNC(mod_ty) PyAST_FromNodeObject(
+    const node *n,
+    PyCompilerFlags *flags,
+    PyObject *filename,
+    PyArena *arena) PYSTON_NOEXCEPT;
+
+#ifndef Py_LIMITED_API
+
+/* _PyAST_ExprAsUnicode is defined in ast_unparse.c */
+PyAPI_FUNC(PyObject *) _PyAST_ExprAsUnicode(expr_ty) PYSTON_NOEXCEPT;
+
+/* Return the borrowed reference to the first literal string in the
+   sequence of statemnts or NULL if it doesn't start from a literal string.
+   Doesn't set exception. */
+PyAPI_FUNC(PyObject *) _PyAST_GetDocString(asdl_seq *) PYSTON_NOEXCEPT;
+
+#endif /* !Py_LIMITED_API */
 
 #ifdef __cplusplus
 }

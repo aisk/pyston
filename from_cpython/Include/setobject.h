@@ -1,4 +1,4 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
 
 /* Set object interface */
 
@@ -8,38 +8,46 @@
 extern "C" {
 #endif
 
-// Pyston change: comment this out since this is not the format we're using
-#if 0
-/*
-There are three kinds of slots in the table:
+#ifndef Py_LIMITED_API
 
-1. Unused:  key == NULL
-2. Active:  key != NULL and key != dummy
-3. Dummy:   key == dummy
+/* There are three kinds of entries in the table:
 
-Note: .pop() abuses the hash field of an Unused or Dummy slot to
-hold a search finger.  The hash field of Unused or Dummy slots has
-no meaning otherwise.
+1. Unused:  key == NULL and hash == 0
+2. Dummy:   key == dummy and hash == -1
+3. Active:  key != NULL and key != dummy and hash != -1
+
+The hash field of Unused slots is always zero.
+
+The hash field of Dummy slots are set to -1
+meaning that dummy entries can be detected by
+either entry->key==dummy or by entry->hash==-1.
 */
 
 #define PySet_MINSIZE 8
 
 typedef struct {
-    long hash;      /* cached hash code for the entry key */
     PyObject *key;
+    Py_hash_t hash;             /* Cached hash code of the key */
 } setentry;
 
+/* The SetObject data structure is shared by set and frozenset objects.
 
-/*
-This data structure is shared by set and frozenset objects.
+Invariant for sets:
+ - hash is -1
+
+Invariants for frozensets:
+ - data is immutable.
+ - hash is the hash of the frozenset or -1 if not computed yet.
+
 */
 
-typedef struct _setobject PySetObject;
-struct _setobject {
+// Pyston change: this is not the format we're using
+#if 0
+typedef struct {
     PyObject_HEAD
 
-    Py_ssize_t fill;  /* # Active + # Dummy */
-    Py_ssize_t used;  /* # Active */
+    Py_ssize_t fill;            /* Number active and dummy entries*/
+    Py_ssize_t used;            /* Number active entries */
 
     /* The table contains mask + 1 slots, and that's a power of 2.
      * We store the mask instead of the size because the mask is more
@@ -47,37 +55,44 @@ struct _setobject {
      */
     Py_ssize_t mask;
 
-    /* table points to smalltable for small tables, else to
-     * additional malloc'ed memory.  table is never NULL!  This rule
-     * saves repeated runtime null-tests.
+    /* The table points to a fixed-size smalltable for small tables
+     * or to additional malloc'ed memory for bigger tables.
+     * The table pointer is never NULL which saves us from repeated
+     * runtime null-tests.
      */
     setentry *table;
-    setentry *(*lookup)(PySetObject *so, PyObject *key, long hash);
-    setentry smalltable[PySet_MINSIZE];
+    Py_hash_t hash;             /* Only used by frozenset objects */
+    Py_ssize_t finger;          /* Search finger for pop() */
 
-    long hash;                  /* only used by frozenset objects */
+    setentry smalltable[PySet_MINSIZE];
     PyObject *weakreflist;      /* List of weak references */
-};
+} PySetObject;
 #endif
-struct _PySetObject;
 typedef struct _PySetObject PySetObject;
 
-// Pyston change: these are no longer static objects:
-#if 0
+#define PySet_GET_SIZE(so) PySet_Size((PyObject*)(so))
+
+PyAPI_DATA(PyObject *) _PySet_Dummy;
+
+PyAPI_FUNC(int) _PySet_NextEntry(PyObject *set, Py_ssize_t *pos, PyObject **key, Py_hash_t *hash) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) _PySet_Update(PyObject *set, PyObject *iterable) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PySet_ClearFreeList(void) PYSTON_NOEXCEPT;
+
+#endif /* Section excluded by Py_LIMITED_API */
+
 PyAPI_DATA(PyTypeObject) PySet_Type;
 PyAPI_DATA(PyTypeObject) PyFrozenSet_Type;
-#endif
-PyAPI_DATA(PyTypeObject*) set_cls;
-#define PySet_Type (*set_cls)
-PyAPI_DATA(PyTypeObject*) frozenset_cls;
-#define PyFrozenSet_Type (*frozenset_cls)
+PyAPI_DATA(PyTypeObject) PySetIter_Type;
 
-/* Invariants for frozensets:
- *     data is immutable.
- *     hash is the hash of the frozenset or -1 if not computed yet.
- * Invariants for sets:
- *     hash is -1
- */
+PyAPI_FUNC(PyObject *) PySet_New(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyFrozenSet_New(PyObject *) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(int) PySet_Add(PyObject *set, PyObject *key) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PySet_Clear(PyObject *set) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PySet_Contains(PyObject *anyset, PyObject *key) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PySet_Discard(PyObject *set, PyObject *key) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PySet_Pop(PyObject *set) PYSTON_NOEXCEPT;
+PyAPI_FUNC(Py_ssize_t) PySet_Size(PyObject *anyset) PYSTON_NOEXCEPT;
 
 #define PyFrozenSet_CheckExact(ob) (Py_TYPE(ob) == &PyFrozenSet_Type)
 #define PyAnySet_CheckExact(ob) \
@@ -92,23 +107,6 @@ PyAPI_DATA(PyTypeObject*) frozenset_cls;
 #define   PyFrozenSet_Check(ob) \
     (Py_TYPE(ob) == &PyFrozenSet_Type || \
       PyType_IsSubtype(Py_TYPE(ob), &PyFrozenSet_Type))
-
-PyAPI_FUNC(PyObject *) PySet_New(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PyFrozenSet_New(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(Py_ssize_t) PySet_Size(PyObject *anyset) PYSTON_NOEXCEPT;
-
-// Pyston change
-//#define PySet_GET_SIZE(so) (((PySetObject *)(so))->used)
-#define PySet_GET_SIZE(so) PySet_Size(so)
-
-PyAPI_FUNC(int) PySet_Clear(PyObject *set) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PySet_Contains(PyObject *anyset, PyObject *key) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PySet_Discard(PyObject *set, PyObject *key) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PySet_Add(PyObject *set, PyObject *key) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) _PySet_Next(PyObject *set, Py_ssize_t *pos, PyObject **key) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) _PySet_NextEntry(PyObject *set, Py_ssize_t *pos, PyObject **key, long *hash) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PySet_Pop(PyObject *set) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) _PySet_Update(PyObject *set, PyObject *iterable) PYSTON_NOEXCEPT;
 
 #ifdef __cplusplus
 }

@@ -1,3 +1,5 @@
+// This file is originally from CPython 3.8, with modifications for Pyston
+
 /* Weak references objects for Python. */
 
 #ifndef Py_WEAKREFOBJECT_H
@@ -12,6 +14,7 @@ typedef struct _PyWeakReference PyWeakReference;
 /* PyWeakReference is the base struct for the Python ReferenceType, ProxyType,
  * and CallableProxyType.
  */
+#ifndef Py_LIMITED_API
 struct _PyWeakReference {
     PyObject_HEAD
 
@@ -27,7 +30,7 @@ struct _PyWeakReference {
     /* A cache for wr_object's hash code.  As usual for hashes, this is -1
      * if the hash code isn't known yet.
      */
-    long hash;
+    Py_hash_t hash;
 
     /* If wr_object is weakly referenced, wr_object has a doubly-linked NULL-
      * terminated list of weak references to it.  These are the list pointers.
@@ -37,6 +40,7 @@ struct _PyWeakReference {
     PyWeakReference *wr_prev;
     PyWeakReference *wr_next;
 };
+#endif
 
 PyAPI_DATA(PyTypeObject) _PyWeakref_RefType;
 PyAPI_DATA(PyTypeObject) _PyWeakref_ProxyType;
@@ -59,9 +63,11 @@ PyAPI_FUNC(PyObject *) PyWeakref_NewProxy(PyObject *ob,
                                                 PyObject *callback) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyWeakref_GetObject(PyObject *ref) PYSTON_NOEXCEPT;
 
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(Py_ssize_t) _PyWeakref_GetWeakrefCount(PyWeakReference *head) PYSTON_NOEXCEPT;
 
 PyAPI_FUNC(void) _PyWeakref_ClearRef(PyWeakReference *self) PYSTON_NOEXCEPT;
+#endif
 
 /* Explanation for the Py_REFCNT() check: when a weakref's target is part
    of a long chain of deallocations which triggers the trashcan mechanism,
@@ -70,21 +76,11 @@ PyAPI_FUNC(void) _PyWeakref_ClearRef(PyWeakReference *self) PYSTON_NOEXCEPT;
    be able to "see" the target object even though it is supposed to be
    unreachable.  See issue #16602. */
 
-/*
-#define PyWeakref_GET_OBJECT(ref)                           \
-    (Py_REFCNT(((PyWeakReference *)(ref))->wr_object) > 0   \
-     ? ((PyWeakReference *)(ref))->wr_object                \
-     : Py_None)
-*/
-
-/* pyston version below.  we'll need to worry about ensuring we keep
-   the same semantics of weakrefs being cleared before destructors
-   fire */
-#define PyWeakref_GET_OBJECT(ref) ((PyWeakReference *)(ref))->wr_object
+// Pyston change: weakrefs are cleared before the referent's refcount reaches zero
+#define PyWeakref_GET_OBJECT(ref) (((PyWeakReference *)(ref))->wr_object)
 
 
 #ifdef __cplusplus
 }
 #endif
 #endif /* !Py_WEAKREFOBJECT_H */
-

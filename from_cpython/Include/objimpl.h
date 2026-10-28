@@ -1,4 +1,4 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
 
 /* The PyObject_ memory family:  high-level object memory interfaces.
    See pymem.h for the low-level PyMem_ family.
@@ -58,7 +58,7 @@ must use the platform malloc heap(s), or shared memory, or C++ local storage or
 operator new), you must first allocate the object with your custom allocator,
 then pass its pointer to PyObject_{Init, InitVar} for filling in its Python-
 specific fields:  reference count, type pointer, possibly others.  You should
-be aware that Python no control over these objects because they don't
+be aware that Python has no control over these objects because they don't
 cooperate with the Python memory manager.  Such objects may not be eligible
 for automatic garbage collection and you have to make sure that they are
 released accordingly whenever their destructor gets called (cf. the specific
@@ -96,52 +96,21 @@ PyObject_{New, NewVar, Del}.
    the object gets initialized via PyObject_{Init, InitVar} after obtaining
    the raw memory.
 */
-PyAPI_FUNC(void *) PyObject_Malloc(size_t) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void *) PyObject_Realloc(void *, size_t) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyObject_Free(void *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void *) PyObject_Malloc(size_t size) PYSTON_NOEXCEPT;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03050000
+PyAPI_FUNC(void *) PyObject_Calloc(size_t nelem, size_t elsize) PYSTON_NOEXCEPT;
+#endif
+PyAPI_FUNC(void *) PyObject_Realloc(void *ptr, size_t new_size) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyObject_Free(void *ptr) PYSTON_NOEXCEPT;
 
 
 /* Macros */
-#ifdef WITH_PYMALLOC
-#ifdef PYMALLOC_DEBUG   /* WITH_PYMALLOC && PYMALLOC_DEBUG */
-PyAPI_FUNC(void *) _PyObject_DebugMalloc(size_t nbytes) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void *) _PyObject_DebugRealloc(void *p, size_t nbytes) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyObject_DebugFree(void *p) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyObject_DebugDumpAddress(const void *p) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyObject_DebugCheckAddress(const void *p) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyObject_DebugMallocStats(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void *) _PyObject_DebugMallocApi(char api, size_t nbytes) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void *) _PyObject_DebugReallocApi(char api, void *p, size_t nbytes) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyObject_DebugFreeApi(char api, void *p) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyObject_DebugCheckAddressApi(char api, const void *p) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void *) _PyMem_DebugMalloc(size_t nbytes) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void *) _PyMem_DebugRealloc(void *p, size_t nbytes) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyMem_DebugFree(void *p) PYSTON_NOEXCEPT;
-#define PyObject_MALLOC         _PyObject_DebugMalloc
-#define PyObject_Malloc         _PyObject_DebugMalloc
-#define PyObject_REALLOC        _PyObject_DebugRealloc
-#define PyObject_Realloc        _PyObject_DebugRealloc
-#define PyObject_FREE           _PyObject_DebugFree
-#define PyObject_Free           _PyObject_DebugFree
-
-#else   /* WITH_PYMALLOC && ! PYMALLOC_DEBUG */
 #define PyObject_MALLOC         PyObject_Malloc
 #define PyObject_REALLOC        PyObject_Realloc
 #define PyObject_FREE           PyObject_Free
-#endif
-
-#else   /* ! WITH_PYMALLOC */
-#define PyObject_MALLOC         PyMem_MALLOC
-#define PyObject_REALLOC        PyMem_REALLOC
-#define PyObject_FREE           PyMem_FREE
-
-#endif  /* WITH_PYMALLOC */
-
 #define PyObject_Del            PyObject_Free
-#define PyObject_DEL            PyObject_FREE
+#define PyObject_DEL            PyObject_Free
 
-/* for source compatibility with 2.2 */
-#define _PyObject_Del           PyObject_Free
 
 /*
  * Generic object allocator interface
@@ -160,21 +129,47 @@ PyAPI_FUNC(PyVarObject *) _PyObject_NewVar(PyTypeObject *, Py_ssize_t) PYSTON_NO
 #define PyObject_NewVar(type, typeobj, n) \
                 ( (type *) _PyObject_NewVar((typeobj), (n)) )
 
-/* Macros trading binary compatibility for speed. See also pymem.h.
-   Note that these macros expect non-NULL object pointers.*/
-#define PyObject_INIT(op, typeobj) \
-    ( Py_TYPE(op) = (typeobj), _Py_NewReference((PyObject *)(op)), (op) )
-#define PyObject_INIT_VAR(op, typeobj, size) \
-    ( Py_SIZE(op) = (size), PyObject_INIT((op), (typeobj)) )
+/* Inline functions trading binary compatibility for speed:
+   PyObject_INIT() is the fast version of PyObject_Init(), and
+   PyObject_INIT_VAR() is the fast version of PyObject_InitVar.
+   See also pymem.h.
 
-#define _PyObject_SIZE(typeobj) ( (typeobj)->tp_basicsize )
+   These inline functions expect non-NULL object pointers. */
+static inline PyObject*
+_PyObject_INIT(PyObject *op, PyTypeObject *typeobj)
+{
+    assert(op != NULL);
+    Py_TYPE(op) = typeobj;
+    if (PyType_GetFlags(typeobj) & Py_TPFLAGS_HEAPTYPE) {
+        Py_INCREF(_PyObject_CAST(typeobj));
+    }
+    _Py_NewReference(op);
+    return op;
+}
+
+#define PyObject_INIT(op, typeobj) \
+    _PyObject_INIT(_PyObject_CAST(op), (typeobj))
+
+static inline PyVarObject*
+_PyObject_INIT_VAR(PyVarObject *op, PyTypeObject *typeobj, Py_ssize_t size)
+{
+    assert(op != NULL);
+    Py_SIZE(op) = size;
+    PyObject_INIT((PyObject *)op, typeobj);
+    return op;
+}
+
+#define PyObject_INIT_VAR(op, typeobj, size) \
+    _PyObject_INIT_VAR(_PyVarObject_CAST(op), (typeobj), (size))
+
+#define _PyObject_SIZE(typeobj) ( _PyType_CAST(typeobj)->tp_basicsize )
 
 /* _PyObject_VAR_SIZE returns the number of bytes (as size_t) allocated for a
    vrbl-size object with nitems items, exclusive of gc overhead (if any).  The
    value is rounded up to the closest multiple of sizeof(void *), in order to
    ensure that pointer fields at the end of the object are correctly aligned
    for the platform (this is of special importance for subclasses of, e.g.,
-   str or long, so that pointers can be stored after the embedded data).
+   str or int, so that pointers can be stored after the embedded data).
 
    Note that there's no memory wastage in doing this, as malloc has to
    return (at worst) pointer-aligned memory anyway.
@@ -184,12 +179,9 @@ PyAPI_FUNC(PyVarObject *) _PyObject_NewVar(PyTypeObject *, Py_ssize_t) PYSTON_NO
 #endif
 
 #define _PyObject_VAR_SIZE(typeobj, nitems)     \
-    (size_t)                                    \
-    ( ( (typeobj)->tp_basicsize +               \
-        (nitems)*(typeobj)->tp_itemsize +       \
-        (SIZEOF_VOID_P - 1)                     \
-      ) & ~(SIZEOF_VOID_P - 1)                  \
-    )
+    _Py_SIZE_ROUND_UP((typeobj)->tp_basicsize + \
+        (nitems)*(typeobj)->tp_itemsize,        \
+        SIZEOF_VOID_P)
 
 #define PyObject_NEW(type, typeobj) \
 ( (type *) PyObject_Init( \
@@ -228,88 +220,38 @@ PyAPI_FUNC(PyVarObject *) _PyObject_NewVar(PyTypeObject *, Py_ssize_t) PYSTON_NO
    constructor you would start directly with PyObject_Init/InitVar
 */
 
+
+
 /*
  * Garbage Collection Support
  * ==========================
  */
 
-/* C equivalent of gc.collect(). */
+/* C equivalent of gc.collect() which ignores the state of gc.enabled. */
 PyAPI_FUNC(Py_ssize_t) PyGC_Collect(void) PYSTON_NOEXCEPT;
 
 /* Test if a type has a GC head */
 #define PyType_IS_GC(t) PyType_HasFeature((t), Py_TPFLAGS_HAVE_GC)
 
-/* Test if an object has a GC head */
-#define PyObject_IS_GC(o) (PyType_IS_GC(Py_TYPE(o)) && \
-    (Py_TYPE(o)->tp_is_gc == NULL || Py_TYPE(o)->tp_is_gc(o)))
-
 PyAPI_FUNC(PyVarObject *) _PyObject_GC_Resize(PyVarObject *, Py_ssize_t) PYSTON_NOEXCEPT;
 #define PyObject_GC_Resize(type, op, n) \
-                ( (type *) _PyObject_GC_Resize((PyVarObject *)(op), (n)) )
-
-/* for source compatibility with 2.2 */
-#define _PyObject_GC_Del PyObject_GC_Del
-
-/* GC information is stored BEFORE the object structure. */
-typedef union _gc_head {
-    struct {
-        union _gc_head *gc_next;
-        union _gc_head *gc_prev;
-        Py_ssize_t gc_refs;
-    } gc;
-    long double dummy;  /* force worst-case alignment */
-} PyGC_Head;
-
-extern PyGC_Head * const _PyGC_generation0;
-
-#define _Py_AS_GC(o) ((PyGC_Head *)(o)-1)
-
-#define _PyGC_REFS_UNTRACKED                    (-2)
-#define _PyGC_REFS_REACHABLE                    (-3)
-#define _PyGC_REFS_TENTATIVELY_UNREACHABLE      (-4)
-
-/* Tell the GC to track this object.  NB: While the object is tracked the
- * collector it must be safe to call the ob_traverse method. */
-#define _PyObject_GC_TRACK(o) do { \
-    PyGC_Head *g = _Py_AS_GC(o); \
-    if (g->gc.gc_refs != _PyGC_REFS_UNTRACKED) \
-        Py_FatalError("GC object already tracked"); \
-    g->gc.gc_refs = _PyGC_REFS_REACHABLE; \
-    g->gc.gc_next = _PyGC_generation0; \
-    g->gc.gc_prev = _PyGC_generation0->gc.gc_prev; \
-    g->gc.gc_prev->gc.gc_next = g; \
-    _PyGC_generation0->gc.gc_prev = g; \
-    } while (0);
-
-/* Tell the GC to stop tracking this object.
- * gc_next doesn't need to be set to NULL, but doing so is a good
- * way to provoke memory errors if calling code is confused.
- */
-#define _PyObject_GC_UNTRACK(o) do { \
-    PyGC_Head *g = _Py_AS_GC(o); \
-    assert(g->gc.gc_refs != _PyGC_REFS_UNTRACKED); \
-    g->gc.gc_refs = _PyGC_REFS_UNTRACKED; \
-    g->gc.gc_prev->gc.gc_next = g->gc.gc_next; \
-    g->gc.gc_next->gc.gc_prev = g->gc.gc_prev; \
-    g->gc.gc_next = NULL; \
-    } while (0);
-
-/* True if the object is currently tracked by the GC. */
-#define _PyObject_GC_IS_TRACKED(o) \
-    ((_Py_AS_GC(o))->gc.gc_refs != _PyGC_REFS_UNTRACKED)
-
-/* True if the object may be tracked by the GC in the future, or already is.
-   This can be useful to implement some optimizations. */
-#define _PyObject_GC_MAY_BE_TRACKED(obj) \
-    (PyObject_IS_GC(obj) && \
-        (!PyTuple_CheckExact(obj) || _PyObject_GC_IS_TRACKED(obj)))
+                ( (type *) _PyObject_GC_Resize(_PyVarObject_CAST(op), (n)) )
 
 
-PyAPI_FUNC(PyObject *) _PyObject_GC_Malloc(size_t) PYSTON_NOEXCEPT;
+
 PyAPI_FUNC(PyObject *) _PyObject_GC_New(PyTypeObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyVarObject *) _PyObject_GC_NewVar(PyTypeObject *, Py_ssize_t) PYSTON_NOEXCEPT;
+
+/* Tell the GC to track this object.
+ *
+ * See also private _PyObject_GC_TRACK() macro. */
 PyAPI_FUNC(void) PyObject_GC_Track(void *) PYSTON_NOEXCEPT;
+
+/* Tell the GC to stop tracking this object.
+ *
+ * See also private _PyObject_GC_UNTRACK() macro. */
 PyAPI_FUNC(void) PyObject_GC_UnTrack(void *) PYSTON_NOEXCEPT;
+
 PyAPI_FUNC(void) PyObject_GC_Del(void *) PYSTON_NOEXCEPT;
 
 #define PyObject_GC_New(type, typeobj) \
@@ -326,29 +268,17 @@ PyAPI_FUNC(void) PyObject_GC_Del(void *) PYSTON_NOEXCEPT;
 #define Py_VISIT(op)                                                    \
     do {                                                                \
         if (op) {                                                       \
-            int vret = visit((PyObject *)(op), arg);                    \
+            int vret = visit(_PyObject_CAST(op), arg);                  \
             if (vret)                                                   \
                 return vret;                                            \
         }                                                               \
     } while (0)
 
-/* This is here for the sake of backwards compatibility.  Extensions that
- * use the old GC API will still compile but the objects will not be
- * tracked by the GC. */
-#define PyGC_HEAD_SIZE 0
-#define PyObject_GC_Init(op)
-#define PyObject_GC_Fini(op)
-#define PyObject_AS_GC(op) (op)
-#define PyObject_FROM_GC(op) (op)
-
-
-/* Test if a type supports weak references */
-#define PyType_SUPPORTS_WEAKREFS(t) \
-    (PyType_HasFeature((t), Py_TPFLAGS_HAVE_WEAKREFS) \
-     && ((t)->tp_weaklistoffset > 0))
-
-#define PyObject_GET_WEAKREFS_LISTPTR(o) \
-    ((PyObject **) (((char *) (o)) + Py_TYPE(o)->tp_weaklistoffset))
+#ifndef Py_LIMITED_API
+#  define Py_CPYTHON_OBJIMPL_H
+#  include  "cpython/objimpl.h"
+#  undef Py_CPYTHON_OBJIMPL_H
+#endif
 
 #ifdef __cplusplus
 }

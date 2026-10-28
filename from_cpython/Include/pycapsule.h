@@ -1,4 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
 
 /* Capsule objects let you wrap a C "void *" pointer in a Python
    object.  They're a way of passing data through the Python interpreter
@@ -49,7 +48,10 @@ PyAPI_FUNC(int) PyCapsule_SetName(PyObject *capsule, const char *name) PYSTON_NO
 
 PyAPI_FUNC(int) PyCapsule_SetContext(PyObject *capsule, void *context) PYSTON_NOEXCEPT;
 
-PyAPI_FUNC(void *) PyCapsule_Import(const char *name, int no_block) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void *) PyCapsule_Import(
+    const char *name,           /* UTF-8 encoded string */
+    int no_block) PYSTON_NOEXCEPT;
+
 
 #ifdef __cplusplus
 }

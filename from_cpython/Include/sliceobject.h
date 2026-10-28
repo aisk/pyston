@@ -1,4 +1,4 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
 
 #ifndef Py_SLICEOBJECT_H
 #define Py_SLICEOBJECT_H
@@ -8,10 +8,9 @@ extern "C" {
 
 /* The unique ellipsis object "..." */
 
-// Pyston change
-// PyAPI_DATA(PyObject) _Py_EllipsisObject; /* Don't use this directly */
-// #define Py_Ellipsis (&_Py_EllipsisObject)
+// Pyston change: Ellipsis is not a static object
 PyAPI_DATA(PyObject) *Ellipsis; /* Don't use this directly */
+
 #define Py_Ellipsis Ellipsis
 
 /* Slice object interface */
@@ -22,30 +21,46 @@ A slice object containing start, stop, and step data members (the
 names are from range).  After much talk with Guido, it was decided to
 let these be any arbitrary python type.  Py_None stands for omitted values.
 */
-
-// Pyston note: this happens to be the same format we use (not a lot going on here),
-// and we assert so in runtime/types.h
+#ifndef Py_LIMITED_API
 typedef struct {
     PyObject_HEAD
-    PyObject *start, *stop, *step;	/* not NULL */
+    PyObject *start, *stop, *step;      /* not NULL */
 } PySliceObject;
+#endif
 
-// Pyston change: these are no longer static objects
-PyAPI_DATA(PyTypeObject*) slice_cls;
-#define PySlice_Type (*slice_cls)
-PyAPI_DATA(PyTypeObject*) ellipsis_cls;
-#define PyEllipsis_Type (*ellipsis_cls)
+PyAPI_DATA(PyTypeObject) PySlice_Type;
+PyAPI_DATA(PyTypeObject) PyEllipsis_Type;
 
 #define PySlice_Check(op) (Py_TYPE(op) == &PySlice_Type)
 
 PyAPI_FUNC(PyObject *) PySlice_New(PyObject* start, PyObject* stop,
                                   PyObject* step) PYSTON_NOEXCEPT;
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(PyObject *) _PySlice_FromIndices(Py_ssize_t start, Py_ssize_t stop) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PySlice_GetIndices(PySliceObject *r, Py_ssize_t length,
+PyAPI_FUNC(int) _PySlice_GetLongIndices(PySliceObject *self, PyObject *length,
+                                 PyObject **start_ptr, PyObject **stop_ptr,
+                                 PyObject **step_ptr) PYSTON_NOEXCEPT;
+#endif
+PyAPI_FUNC(int) PySlice_GetIndices(PyObject *r, Py_ssize_t length,
                                   Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PySlice_GetIndicesEx(PySliceObject *r, Py_ssize_t length,
-				    Py_ssize_t *start, Py_ssize_t *stop, 
-				    Py_ssize_t *step, Py_ssize_t *slicelength) PYSTON_NOEXCEPT;
+Py_DEPRECATED(3.7)
+PyAPI_FUNC(int) PySlice_GetIndicesEx(PyObject *r, Py_ssize_t length,
+                                     Py_ssize_t *start, Py_ssize_t *stop,
+                                     Py_ssize_t *step,
+                                     Py_ssize_t *slicelength) PYSTON_NOEXCEPT;
+
+#if !defined(Py_LIMITED_API) || (Py_LIMITED_API+0 >= 0x03050400 && Py_LIMITED_API+0 < 0x03060000) || Py_LIMITED_API+0 >= 0x03060100
+#define PySlice_GetIndicesEx(slice, length, start, stop, step, slicelen) (  \
+    PySlice_Unpack((slice), (start), (stop), (step)) < 0 ?                  \
+    ((*(slicelen) = 0), -1) :                                               \
+    ((*(slicelen) = PySlice_AdjustIndices((length), (start), (stop), *(step))), \
+     0))
+PyAPI_FUNC(int) PySlice_Unpack(PyObject *slice,
+                               Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step) PYSTON_NOEXCEPT;
+PyAPI_FUNC(Py_ssize_t) PySlice_AdjustIndices(Py_ssize_t length,
+                                             Py_ssize_t *start, Py_ssize_t *stop,
+                                             Py_ssize_t step) PYSTON_NOEXCEPT;
+#endif
 
 #ifdef __cplusplus
 }

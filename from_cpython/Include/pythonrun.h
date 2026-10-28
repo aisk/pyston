@@ -1,4 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
 
 /* Interfaces to parse and execute pieces of python code */
 
@@ -8,78 +7,157 @@
 extern "C" {
 #endif
 
-#define PyCF_MASK (CO_FUTURE_DIVISION | CO_FUTURE_ABSOLUTE_IMPORT | \
-                   CO_FUTURE_WITH_STATEMENT | CO_FUTURE_PRINT_FUNCTION | \
-                   CO_FUTURE_UNICODE_LITERALS)
-#define PyCF_MASK_OBSOLETE (CO_NESTED)
-#define PyCF_SOURCE_IS_UTF8  0x0100
-#define PyCF_DONT_IMPLY_DEDENT 0x0200
-#define PyCF_ONLY_AST 0x0400
-
-typedef struct {
-    int cf_flags;  /* bitmask of CO_xxx flags relevant to future */
-} PyCompilerFlags;
-
-PyAPI_FUNC(void) Py_SetProgramName(char *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) Py_GetProgramName(void) PYSTON_NOEXCEPT;
-
-PyAPI_FUNC(void) Py_SetPythonHome(char *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(char *) Py_GetPythonHome(void) PYSTON_NOEXCEPT;
-
-PyAPI_FUNC(void) Py_Initialize(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) Py_InitializeEx(int) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) Py_Finalize(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) Py_IsInitialized(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyThreadState *) Py_NewInterpreter(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) Py_EndInterpreter(PyThreadState *) PYSTON_NOEXCEPT;
-
-PyAPI_FUNC(int) PyRun_AnyFileFlags(FILE *, const char *, PyCompilerFlags *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PyRun_AnyFileExFlags(FILE *, const char *, int, PyCompilerFlags *) PYSTON_NOEXCEPT;
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(int) PyRun_SimpleStringFlags(const char *, PyCompilerFlags *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PyRun_SimpleFileExFlags(FILE *, const char *, int, PyCompilerFlags *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PyRun_InteractiveOneFlags(FILE *, const char *, PyCompilerFlags *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PyRun_InteractiveLoopFlags(FILE *, const char *, PyCompilerFlags *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_AnyFileExFlags(
+    FILE *fp,
+    const char *filename,       /* decoded from the filesystem encoding */
+    int closeit,
+    PyCompilerFlags *flags) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_SimpleFileExFlags(
+    FILE *fp,
+    const char *filename,       /* decoded from the filesystem encoding */
+    int closeit,
+    PyCompilerFlags *flags) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_InteractiveOneFlags(
+    FILE *fp,
+    const char *filename,       /* decoded from the filesystem encoding */
+    PyCompilerFlags *flags) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_InteractiveOneObject(
+    FILE *fp,
+    PyObject *filename,
+    PyCompilerFlags *flags) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_InteractiveLoopFlags(
+    FILE *fp,
+    const char *filename,       /* decoded from the filesystem encoding */
+    PyCompilerFlags *flags) PYSTON_NOEXCEPT;
 
-PyAPI_FUNC(struct _mod *) PyParser_ASTFromString(const char *, const char *,
-                                                 int, PyCompilerFlags *flags,
-                                                 PyArena *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(struct _mod *) PyParser_ASTFromFile(FILE *, const char *, int,
-                                               char *, char *,
-                                               PyCompilerFlags *, int *,
-                                               PyArena *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(struct _mod *) PyParser_ASTFromString(
+    const char *s,
+    const char *filename,       /* decoded from the filesystem encoding */
+    int start,
+    PyCompilerFlags *flags,
+    PyArena *arena) PYSTON_NOEXCEPT;
+PyAPI_FUNC(struct _mod *) PyParser_ASTFromStringObject(
+    const char *s,
+    PyObject *filename,
+    int start,
+    PyCompilerFlags *flags,
+    PyArena *arena) PYSTON_NOEXCEPT;
+PyAPI_FUNC(struct _mod *) PyParser_ASTFromFile(
+    FILE *fp,
+    const char *filename,       /* decoded from the filesystem encoding */
+    const char* enc,
+    int start,
+    const char *ps1,
+    const char *ps2,
+    PyCompilerFlags *flags,
+    int *errcode,
+    PyArena *arena) PYSTON_NOEXCEPT;
+PyAPI_FUNC(struct _mod *) PyParser_ASTFromFileObject(
+    FILE *fp,
+    PyObject *filename,
+    const char* enc,
+    int start,
+    const char *ps1,
+    const char *ps2,
+    PyCompilerFlags *flags,
+    int *errcode,
+    PyArena *arena) PYSTON_NOEXCEPT;
+#endif
+
+#ifndef PyParser_SimpleParseString
 #define PyParser_SimpleParseString(S, B) \
     PyParser_SimpleParseStringFlags(S, B, 0)
 #define PyParser_SimpleParseFile(FP, S, B) \
     PyParser_SimpleParseFileFlags(FP, S, B, 0)
+#endif
 PyAPI_FUNC(struct _node *) PyParser_SimpleParseStringFlags(const char *, int,
-                                                          int) PYSTON_NOEXCEPT;
+                                                           int) PYSTON_NOEXCEPT;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03030000
+PyAPI_FUNC(struct _node *) PyParser_SimpleParseStringFlagsFilename(const char *,
+                                                                   const char *,
+                                                                   int, int) PYSTON_NOEXCEPT;
+#endif
 PyAPI_FUNC(struct _node *) PyParser_SimpleParseFileFlags(FILE *, const char *,
-                                                        int, int) PYSTON_NOEXCEPT;
+                                                         int, int) PYSTON_NOEXCEPT;
 
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(PyObject *) PyRun_StringFlags(const char *, int, PyObject *,
                                          PyObject *, PyCompilerFlags *) PYSTON_NOEXCEPT;
 
-PyAPI_FUNC(PyObject *) PyRun_FileExFlags(FILE *, const char *, int,
-                                         PyObject *, PyObject *, int,
-                                         PyCompilerFlags *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyRun_FileExFlags(
+    FILE *fp,
+    const char *filename,       /* decoded from the filesystem encoding */
+    int start,
+    PyObject *globals,
+    PyObject *locals,
+    int closeit,
+    PyCompilerFlags *flags) PYSTON_NOEXCEPT;
+#endif
 
-#define Py_CompileString(str, p, s) Py_CompileStringFlags(str, p, s, NULL)
-PyAPI_FUNC(PyObject *) Py_CompileStringFlags(const char *, const char *, int,
-                                             PyCompilerFlags *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(struct symtable *) Py_SymtableString(const char *, const char *, int) PYSTON_NOEXCEPT;
+#ifdef Py_LIMITED_API
+PyAPI_FUNC(PyObject *) Py_CompileString(const char *, const char *, int) PYSTON_NOEXCEPT;
+#else
+#define Py_CompileString(str, p, s) Py_CompileStringExFlags(str, p, s, NULL, -1)
+#define Py_CompileStringFlags(str, p, s, f) Py_CompileStringExFlags(str, p, s, f, -1)
+PyAPI_FUNC(PyObject *) Py_CompileStringExFlags(
+    const char *str,
+    const char *filename,       /* decoded from the filesystem encoding */
+    int start,
+    PyCompilerFlags *flags,
+    int optimize) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) Py_CompileStringObject(
+    const char *str,
+    PyObject *filename, int start,
+    PyCompilerFlags *flags,
+    int optimize) PYSTON_NOEXCEPT;
+#endif
+PyAPI_FUNC(struct symtable *) Py_SymtableString(
+    const char *str,
+    const char *filename,       /* decoded from the filesystem encoding */
+    int start) PYSTON_NOEXCEPT;
+#ifndef Py_LIMITED_API
+PyAPI_FUNC(const char *) _Py_SourceAsString(
+    PyObject *cmd,
+    const char *funcname,
+    const char *what,
+    PyCompilerFlags *cf,
+    PyObject **cmd_copy) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(struct symtable *) Py_SymtableStringObject(
+    const char *str,
+    PyObject *filename,
+    int start) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(struct symtable *) _Py_SymtableStringObjectFlags(
+    const char *str,
+    PyObject *filename,
+    int start,
+    PyCompilerFlags *flags) PYSTON_NOEXCEPT;
+#endif
 
 PyAPI_FUNC(void) PyErr_Print(void) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyErr_PrintEx(int) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyErr_Display(PyObject *, PyObject *, PyObject *) PYSTON_NOEXCEPT;
 
-PyAPI_FUNC(int) Py_AtExit(void (*func)(void)) PYSTON_NOEXCEPT;
-
-PyAPI_FUNC(void) Py_Exit(int) PYSTON_NOEXCEPT;
-
-PyAPI_FUNC(int) Py_FdIsInteractive(FILE *, const char *) PYSTON_NOEXCEPT;
-
-/* Bootstrap */
-PyAPI_FUNC(int) Py_Main(int argc, char **argv) PYSTON_NOEXCEPT;
+#ifndef Py_LIMITED_API
+/* A function flavor is also exported by libpython. It is required when
+    libpython is accessed directly rather than using header files which defines
+    macros below. On Windows, for example, PyAPI_FUNC() uses dllexport to
+    export functions in pythonXX.dll. */
+PyAPI_FUNC(PyObject *) PyRun_String(const char *str, int s, PyObject *g, PyObject *l) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_AnyFile(FILE *fp, const char *name) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_AnyFileEx(FILE *fp, const char *name, int closeit) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_AnyFileFlags(FILE *, const char *, PyCompilerFlags *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_SimpleString(const char *s) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_SimpleFile(FILE *f, const char *p) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_SimpleFileEx(FILE *f, const char *p, int c) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_InteractiveOne(FILE *f, const char *p) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyRun_InteractiveLoop(FILE *f, const char *p) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyRun_File(FILE *fp, const char *p, int s, PyObject *g, PyObject *l) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyRun_FileEx(FILE *fp, const char *p, int s, PyObject *g, PyObject *l, int c) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyRun_FileFlags(FILE *fp, const char *p, int s, PyObject *g, PyObject *l, PyCompilerFlags *flags) PYSTON_NOEXCEPT;
 
 /* Use macros for a bunch of old variants */
 #define PyRun_String(str, s, g, l) PyRun_StringFlags(str, s, g, l, NULL)
@@ -99,68 +177,24 @@ PyAPI_FUNC(int) Py_Main(int argc, char **argv) PYSTON_NOEXCEPT;
     PyRun_FileExFlags(fp, p, s, g, l, c, NULL)
 #define PyRun_FileFlags(fp, p, s, g, l, flags) \
     PyRun_FileExFlags(fp, p, s, g, l, 0, flags)
-
-/* In getpath.c */
-PyAPI_FUNC(char *) Py_GetProgramFullPath(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(char *) Py_GetPrefix(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(char *) Py_GetExecPrefix(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(char *) Py_GetPath(void) PYSTON_NOEXCEPT;
-
-/* In their own files */
-PyAPI_FUNC(const char *) Py_GetVersion(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) Py_GetPlatform(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) Py_GetCopyright(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) Py_GetCompiler(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) Py_GetBuildInfo(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) _Py_svnversion(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) Py_SubversionRevision(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) Py_SubversionShortBranch(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) _Py_hgidentifier(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(const char *) _Py_hgversion(void) PYSTON_NOEXCEPT;
-
-/* Internal -- various one-time initializations */
-PyAPI_FUNC(PyObject *) _PyBuiltin_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) _PySys_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyImport_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyExc_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyImportHooks_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) _PyFrame_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) _PyInt_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) _PyLong_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyFloat_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PyByteArray_Init(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyRandom_Init(void) PYSTON_NOEXCEPT;
-
-/* Various internal finalizers */
-PyAPI_FUNC(void) _PyExc_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyImport_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyMethod_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyFrame_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyCFunction_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyDict_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyTuple_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyList_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PySet_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyString_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyInt_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyFloat_Fini(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyOS_FiniInterrupts(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyByteArray_Fini(void) PYSTON_NOEXCEPT;
-
-PyAPI_DATA(PyThreadState *) _Py_Finalizing;
+#endif
 
 /* Stuff with no proper home (yet) */
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(char *) PyOS_Readline(FILE *, FILE *, const char *) PYSTON_NOEXCEPT;
+#endif
 PyAPI_DATA(int) (*PyOS_InputHook)(void);
 PyAPI_DATA(char) *(*PyOS_ReadlineFunctionPointer)(FILE *, FILE *, const char *);
+#ifndef Py_LIMITED_API
 PyAPI_DATA(PyThreadState*) _PyOS_ReadlineTState;
+#endif
 
 /* Stack size, in "pointers" (so we get extra safety margins
    on 64-bit platforms).  On a 32-bit platform, this translates
-   to a 8k margin. */
+   to an 8k margin. */
 #define PYOS_STACK_MARGIN 2048
 
-#if defined(WIN32) && !defined(MS_WIN64) && defined(_MSC_VER) && _MSC_VER >= 1300
+#if defined(WIN32) && !defined(MS_WIN64) && !defined(_M_ARM) && defined(_MSC_VER) && _MSC_VER >= 1300
 /* Enable stack checking under Microsoft C */
 #define USE_STACKCHECK
 #endif
@@ -169,14 +203,6 @@ PyAPI_DATA(PyThreadState*) _PyOS_ReadlineTState;
 /* Check that we aren't overflowing our stack */
 PyAPI_FUNC(int) PyOS_CheckStack(void) PYSTON_NOEXCEPT;
 #endif
-
-/* Signals */
-typedef void (*PyOS_sighandler_t)(int);
-PyAPI_FUNC(PyOS_sighandler_t) PyOS_getsig(int) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyOS_sighandler_t) PyOS_setsig(int, PyOS_sighandler_t) PYSTON_NOEXCEPT;
-
-/* Random */
-PyAPI_FUNC(int) _PyOS_URandom (void *buffer, Py_ssize_t size) PYSTON_NOEXCEPT;
 
 #ifdef __cplusplus
 }

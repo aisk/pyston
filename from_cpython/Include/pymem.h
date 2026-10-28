@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 /* The PyMem_ family:  low-level memory allocation interfaces.
    See objimpl.h for the PyObject_ memory family.
 */
@@ -51,21 +49,11 @@ extern "C" {
    performed on failure (no exception is set, no warning is printed, etc).
 */
 
-PyAPI_FUNC(void *) PyMem_Malloc(size_t) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void *) PyMem_Realloc(void *, size_t) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyMem_Free(void *) PYSTON_NOEXCEPT;
-
-/* Starting from Python 1.6, the wrappers Py_{Malloc,Realloc,Free} are
-   no longer supported. They used to call PyErr_NoMemory() on failure. */
+PyAPI_FUNC(void *) PyMem_Malloc(size_t size) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void *) PyMem_Realloc(void *ptr, size_t new_size) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyMem_Free(void *ptr) PYSTON_NOEXCEPT;
 
 /* Macros. */
-#ifdef PYMALLOC_DEBUG
-/* Redirect all memory operations to Python's debugging allocator. */
-#define PyMem_MALLOC		_PyMem_DebugMalloc
-#define PyMem_REALLOC		_PyMem_DebugRealloc
-#define PyMem_FREE		_PyMem_DebugFree
-
-#else	/* ! PYMALLOC_DEBUG */
 
 /* PyMem_MALLOC(0) means malloc(1). Some systems would return NULL
    for malloc(0), which would be treated as an error. Some platforms
@@ -73,13 +61,9 @@ PyAPI_FUNC(void) PyMem_Free(void *) PYSTON_NOEXCEPT;
    pymalloc. To solve these problems, allocate an extra byte. */
 /* Returns NULL to indicate error if a negative size or size larger than
    Py_ssize_t can represent is supplied.  Helps prevents security holes. */
-#define PyMem_MALLOC(n)		((size_t)(n) > (size_t)PY_SSIZE_T_MAX ? NULL \
-				: malloc((n) ? (n) : 1))
-#define PyMem_REALLOC(p, n)	((size_t)(n) > (size_t)PY_SSIZE_T_MAX  ? NULL \
-				: realloc((p), (n) ? (n) : 1))
-#define PyMem_FREE		free
-
-#endif	/* PYMALLOC_DEBUG */
+#define PyMem_MALLOC(n)         PyMem_Malloc(n)
+#define PyMem_REALLOC(p, n)     PyMem_Realloc(p, n)
+#define PyMem_FREE(p)           PyMem_Free(p)
 
 /*
  * Type-oriented memory interface
@@ -92,11 +76,11 @@ PyAPI_FUNC(void) PyMem_Free(void *) PYSTON_NOEXCEPT;
  */
 
 #define PyMem_New(type, n) \
-  ( ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :	\
-	( (type *) PyMem_Malloc((n) * sizeof(type)) ) )
+  ( ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :      \
+        ( (type *) PyMem_Malloc((n) * sizeof(type)) ) )
 #define PyMem_NEW(type, n) \
-  ( ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :	\
-	( (type *) PyMem_MALLOC((n) * sizeof(type)) ) )
+  ( ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :      \
+        ( (type *) PyMem_MALLOC((n) * sizeof(type)) ) )
 
 /*
  * The value of (p) is always clobbered by this macro regardless of success.
@@ -105,17 +89,59 @@ PyAPI_FUNC(void) PyMem_Free(void *) PYSTON_NOEXCEPT;
  * caller's memory error handler to not lose track of it.
  */
 #define PyMem_Resize(p, type, n) \
-  ( (p) = ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :	\
-	(type *) PyMem_Realloc((p), (n) * sizeof(type)) )
+  ( (p) = ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :        \
+        (type *) PyMem_Realloc((p), (n) * sizeof(type)) )
 #define PyMem_RESIZE(p, type, n) \
-  ( (p) = ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :	\
-	(type *) PyMem_REALLOC((p), (n) * sizeof(type)) )
+  ( (p) = ((size_t)(n) > PY_SSIZE_T_MAX / sizeof(type)) ? NULL :        \
+        (type *) PyMem_REALLOC((p), (n) * sizeof(type)) )
 
 /* PyMem{Del,DEL} are left over from ancient days, and shouldn't be used
  * anymore.  They're just confusing aliases for PyMem_{Free,FREE} now.
  */
-#define PyMem_Del		PyMem_Free
-#define PyMem_DEL		PyMem_FREE
+#define PyMem_Del               PyMem_Free
+#define PyMem_DEL               PyMem_FREE
+
+/* bpo-35053: expose _Py_tracemalloc_config for performance:
+   _Py_NewReference() needs an efficient check to test if tracemalloc is
+   tracing.
+
+   It has to be defined in pymem.h, before object.h is included. */
+struct _PyTraceMalloc_Config {
+    /* Module initialized?
+       Variable protected by the GIL */
+    enum {
+        TRACEMALLOC_NOT_INITIALIZED,
+        TRACEMALLOC_INITIALIZED,
+        TRACEMALLOC_FINALIZED
+    } initialized;
+
+    /* Is tracemalloc tracing memory allocations?
+       Variable protected by the GIL */
+    int tracing;
+
+    /* limit of the number of frames in a traceback, 1 by default.
+       Variable protected by the GIL. */
+    int max_nframe;
+
+    /* use domain in trace key?
+       Variable protected by the GIL. */
+    int use_domain;
+};
+
+PyAPI_DATA(struct _PyTraceMalloc_Config) _Py_tracemalloc_config;
+
+#define _PyTraceMalloc_Config_INIT \
+    {.initialized = TRACEMALLOC_NOT_INITIALIZED, \
+     .tracing = 0, \
+     .max_nframe = 1, \
+     .use_domain = 0}
+
+
+#ifndef Py_LIMITED_API
+#  define Py_CPYTHON_PYMEM_H
+#  include  "cpython/pymem.h"
+#  undef Py_CPYTHON_PYMEM_H
+#endif
 
 #ifdef __cplusplus
 }

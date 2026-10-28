@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 #ifndef Py_CODECREGISTRY_H
 #define Py_CODECREGISTRY_H
 #ifdef __cplusplus
@@ -25,9 +23,11 @@ Copyright (c) Corporation for National Research Initiatives.
 
    The search_function's refcount is incremented by this function. */
 
-PyAPI_FUNC(int) PyCodec_Register(PyObject *search_function) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyCodec_Register(
+       PyObject *search_function
+       ) PYSTON_NOEXCEPT;
 
-/* Codec register lookup API.
+/* Codec registry lookup API.
 
    Looks up the given encoding and returns a CodecInfo object with
    function attributes which implement the different aspects of
@@ -45,33 +45,107 @@ PyAPI_FUNC(int) PyCodec_Register(PyObject *search_function) PYSTON_NOEXCEPT;
 
  */
 
-PyAPI_FUNC(PyObject *) _PyCodec_Lookup(const char *encoding) PYSTON_NOEXCEPT;
+#ifndef Py_LIMITED_API
+PyAPI_FUNC(PyObject *) _PyCodec_Lookup(
+       const char *encoding
+       ) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(int) _PyCodec_Forget(
+       const char *encoding
+       ) PYSTON_NOEXCEPT;
+#endif
+
+/* Codec registry encoding check API.
+
+   Returns 1/0 depending on whether there is a registered codec for
+   the given encoding.
+
+*/
+
+PyAPI_FUNC(int) PyCodec_KnownEncoding(
+       const char *encoding
+       ) PYSTON_NOEXCEPT;
 
 /* Generic codec based encoding API.
 
    object is passed through the encoder function found for the given
    encoding using the error handling method defined by errors. errors
    may be NULL to use the default method defined for the codec.
-   
+
    Raises a LookupError in case no encoder can be found.
 
  */
 
-PyAPI_FUNC(PyObject *) PyCodec_Encode(PyObject *object, const char *encoding, const char *errors) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_Encode(
+       PyObject *object,
+       const char *encoding,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
 
 /* Generic codec based decoding API.
 
    object is passed through the decoder function found for the given
    encoding using the error handling method defined by errors. errors
    may be NULL to use the default method defined for the codec.
-   
+
    Raises a LookupError in case no encoder can be found.
 
  */
 
-PyAPI_FUNC(PyObject *) PyCodec_Decode(PyObject *object, const char *encoding, const char *errors) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_Decode(
+       PyObject *object,
+       const char *encoding,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
 
-/* --- Codec Lookup APIs -------------------------------------------------- 
+#ifndef Py_LIMITED_API
+/* Text codec specific encoding and decoding API.
+
+   Checks the encoding against a list of codecs which do not
+   implement a str<->bytes encoding before attempting the
+   operation.
+
+   Please note that these APIs are internal and should not
+   be used in Python C extensions.
+
+   XXX (ncoghlan): should we make these, or something like them, public
+   in Python 3.5+?
+
+ */
+PyAPI_FUNC(PyObject *) _PyCodec_LookupTextEncoding(
+       const char *encoding,
+       const char *alternate_command
+       ) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(PyObject *) _PyCodec_EncodeText(
+       PyObject *object,
+       const char *encoding,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(PyObject *) _PyCodec_DecodeText(
+       PyObject *object,
+       const char *encoding,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
+
+/* These two aren't actually text encoding specific, but _io.TextIOWrapper
+ * is the only current API consumer.
+ */
+PyAPI_FUNC(PyObject *) _PyCodecInfo_GetIncrementalDecoder(
+       PyObject *codec_info,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(PyObject *) _PyCodecInfo_GetIncrementalEncoder(
+       PyObject *codec_info,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
+#endif
+
+
+
+/* --- Codec Lookup APIs --------------------------------------------------
 
    All APIs return a codec object with incremented refcount and are
    based on _PyCodec_Lookup().  The same comments w/r to the encoding
@@ -81,29 +155,45 @@ PyAPI_FUNC(PyObject *) PyCodec_Decode(PyObject *object, const char *encoding, co
 
 /* Get an encoder function for the given encoding. */
 
-PyAPI_FUNC(PyObject *) PyCodec_Encoder(const char *encoding) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_Encoder(
+       const char *encoding
+       ) PYSTON_NOEXCEPT;
 
 /* Get a decoder function for the given encoding. */
 
-PyAPI_FUNC(PyObject *) PyCodec_Decoder(const char *encoding) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_Decoder(
+       const char *encoding
+       ) PYSTON_NOEXCEPT;
 
-/* Get a IncrementalEncoder object for the given encoding. */
+/* Get an IncrementalEncoder object for the given encoding. */
 
-PyAPI_FUNC(PyObject *) PyCodec_IncrementalEncoder(const char *encoding, const char *errors) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_IncrementalEncoder(
+       const char *encoding,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
 
-/* Get a IncrementalDecoder object function for the given encoding. */
+/* Get an IncrementalDecoder object function for the given encoding. */
 
-PyAPI_FUNC(PyObject *) PyCodec_IncrementalDecoder(const char *encoding, const char *errors) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_IncrementalDecoder(
+       const char *encoding,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
 
 /* Get a StreamReader factory function for the given encoding. */
 
-PyAPI_FUNC(PyObject *) PyCodec_StreamReader(const char *encoding, PyObject *stream,
-                                            const char *errors) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_StreamReader(
+       const char *encoding,
+       PyObject *stream,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
 
 /* Get a StreamWriter factory function for the given encoding. */
 
-PyAPI_FUNC(PyObject *) PyCodec_StreamWriter(const char *encoding, PyObject *stream,
-                                            const char *errors) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCodec_StreamWriter(
+       const char *encoding,
+       PyObject *stream,
+       const char *errors
+       ) PYSTON_NOEXCEPT;
 
 /* Unicode encoding error handling callback registry API */
 
@@ -134,6 +224,15 @@ PyAPI_FUNC(PyObject *) PyCodec_XMLCharRefReplaceErrors(PyObject *exc) PYSTON_NOE
 
 /* replace the unicode encode error with backslash escapes (\x, \u and \U) */
 PyAPI_FUNC(PyObject *) PyCodec_BackslashReplaceErrors(PyObject *exc) PYSTON_NOEXCEPT;
+
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03050000
+/* replace the unicode encode error with backslash escapes (\N, \x, \u and \U) */
+PyAPI_FUNC(PyObject *) PyCodec_NameReplaceErrors(PyObject *exc) PYSTON_NOEXCEPT;
+#endif
+
+#ifndef Py_LIMITED_API
+PyAPI_DATA(const char *) Py_hexdigits;
+#endif
 
 #ifdef __cplusplus
 }

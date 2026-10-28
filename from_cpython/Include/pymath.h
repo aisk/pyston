@@ -1,11 +1,5 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 #ifndef Py_PYMATH_H
 #define Py_PYMATH_H
-// Pyston change: most other files include this:
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 #include "pyconfig.h" /* include for defines */
 
@@ -43,13 +37,7 @@ extern double pow(double, double);
 #endif /* __STDC__ */
 #endif /* _MSC_VER */
 
-#ifdef _OSF_SOURCE
-/* OSF1 5.1 doesn't make these available with XOPEN_SOURCE_EXTENDED defined */
-extern int finite(double);
-extern double copysign(double, double);
-#endif
-
-/* High precision defintion of pi and e (Euler)
+/* High precision definition of pi and e (Euler)
  * The values are taken from libc6's math.h.
  */
 #ifndef Py_MATH_PIl
@@ -67,12 +55,19 @@ extern double copysign(double, double);
 #define Py_MATH_E 2.7182818284590452354
 #endif
 
+/* Tau (2pi) to 40 digits, taken from tauday.com/tau-digits. */
+#ifndef Py_MATH_TAU
+#define Py_MATH_TAU 6.2831853071795864769252867665590057683943L
+#endif
+
+
 /* On x86, Py_FORCE_DOUBLE forces a floating-point number out of an x87 FPU
    register and into a 64-bit memory location, rounding from extended
    precision to double precision in the process.  On other platforms it does
    nothing. */
 
 /* we take double rounding as evidence of x87 usage */
+#ifndef Py_LIMITED_API
 #ifndef Py_FORCE_DOUBLE
 #  ifdef X87_DOUBLE_ROUNDING
 PyAPI_FUNC(double) _Py_force_double(double) PYSTON_NOEXCEPT;
@@ -81,10 +76,13 @@ PyAPI_FUNC(double) _Py_force_double(double) PYSTON_NOEXCEPT;
 #    define Py_FORCE_DOUBLE(X) (X)
 #  endif
 #endif
+#endif
 
+#ifndef Py_LIMITED_API
 #ifdef HAVE_GCC_ASM_FOR_X87
 PyAPI_FUNC(unsigned short) _Py_get_387controlword(void) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) _Py_set_387controlword(unsigned short) PYSTON_NOEXCEPT;
+#endif
 #endif
 
 /* Py_IS_NAN(X)
@@ -158,7 +156,29 @@ PyAPI_FUNC(void) _Py_set_387controlword(unsigned short) PYSTON_NOEXCEPT;
  * doesn't support NaNs.
  */
 #if !defined(Py_NAN) && !defined(Py_NO_NAN)
-#define Py_NAN (Py_HUGE_VAL * 0.)
+#if !defined(__INTEL_COMPILER)
+    #define Py_NAN (Py_HUGE_VAL * 0.)
+#else /* __INTEL_COMPILER */
+    #if defined(ICC_NAN_STRICT)
+        #pragma float_control(push)
+        #pragma float_control(precise, on)
+        #pragma float_control(except,  on)
+        #if defined(_MSC_VER)
+            __declspec(noinline)
+        #else /* Linux */
+            __attribute__((noinline))
+        #endif /* _MSC_VER */
+        static double __icc_nan()
+        {
+            return sqrt(-1.0);
+        }
+        #pragma float_control (pop)
+        #define Py_NAN __icc_nan()
+    #else /* ICC_NAN_RELAXED as default for Intel Compiler */
+        static const union { unsigned char buf[8]; double __icc_nan; } __nan_store = {0,0,0,0,0,0,0xf8,0x7f};
+        #define Py_NAN (__nan_store.__icc_nan)
+    #endif /* ICC_NAN_STRICT */
+#endif /* __INTEL_COMPILER */
 #endif
 
 /* Py_OVERFLOWED(X)
@@ -167,14 +187,14 @@ PyAPI_FUNC(void) _Py_set_387controlword(unsigned short) PYSTON_NOEXCEPT;
  * result.
  * Caution:
  *    This isn't reliable.  C99 no longer requires libm to set errno under
- *	  any exceptional condition, but does require +- HUGE_VAL return
- *	  values on overflow.  A 754 box *probably* maps HUGE_VAL to a
- *	  double infinity, and we're cool if that's so, unless the input
- *	  was an infinity and an infinity is the expected result.  A C89
- *	  system sets errno to ERANGE, so we check for that too.  We're
- *	  out of luck if a C99 754 box doesn't map HUGE_VAL to +Inf, or
- *	  if the returned result is a NaN, or if a C89 box returns HUGE_VAL
- *	  in non-overflow cases.
+ *        any exceptional condition, but does require +- HUGE_VAL return
+ *        values on overflow.  A 754 box *probably* maps HUGE_VAL to a
+ *        double infinity, and we're cool if that's so, unless the input
+ *        was an infinity and an infinity is the expected result.  A C89
+ *        system sets errno to ERANGE, so we check for that too.  We're
+ *        out of luck if a C99 754 box doesn't map HUGE_VAL to +Inf, or
+ *        if the returned result is a NaN, or if a C89 box returns HUGE_VAL
+ *        in non-overflow cases.
  *    X is evaluated more than once.
  * Some platforms have better way to spell this, so expect some #ifdef'ery.
  *
@@ -191,13 +211,20 @@ PyAPI_FUNC(void) _Py_set_387controlword(unsigned short) PYSTON_NOEXCEPT;
 #define Py_OVERFLOWED(X) isinf(X)
 #else
 #define Py_OVERFLOWED(X) ((X) != 0.0 && (errno == ERANGE ||    \
-                     (X) == Py_HUGE_VAL || \
-                     (X) == -Py_HUGE_VAL))
+                                         (X) == Py_HUGE_VAL || \
+                                         (X) == -Py_HUGE_VAL))
 #endif
 
-// Pyston change: most other files include this:
-#ifdef __cplusplus
-}
-#endif
+/* Return whether integral type *type* is signed or not. */
+#define _Py_IntegralTypeSigned(type) ((type)(-1) < 0)
+/* Return the maximum value of integral type *type*. */
+#define _Py_IntegralTypeMax(type) ((_Py_IntegralTypeSigned(type)) ? (((((type)1 << (sizeof(type)*CHAR_BIT - 2)) - 1) << 1) + 1) : ~(type)0)
+/* Return the minimum value of integral type *type*. */
+#define _Py_IntegralTypeMin(type) ((_Py_IntegralTypeSigned(type)) ? -_Py_IntegralTypeMax(type) - 1 : 0)
+/* Check whether *v* is in the range of integral type *type*. This is most
+ * useful if *v* is floating-point, since demoting a floating-point *v* to an
+ * integral type that cannot represent *v*'s integral part is undefined
+ * behavior. */
+#define _Py_InIntegralTypeRange(type, v) (_Py_IntegralTypeMin(type) <= v && v <= _Py_IntegralTypeMax(type))
 
 #endif /* Py_PYMATH_H */

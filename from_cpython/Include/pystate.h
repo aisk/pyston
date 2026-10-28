@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 /* Thread and interpreter state structures and their interfaces */
 
 
@@ -9,145 +7,80 @@
 extern "C" {
 #endif
 
-/* State shared between threads */
+#include "pythread.h"
 
-// Pyston change: this is not our format
-struct _ts; /* Forward */
-struct _is; /* Forward */
+/* This limitation is for performance and simplicity. If needed it can be
+removed (with effort). */
+#define MAX_CO_EXTRA_USERS 255
 
-typedef struct _is {
+/* Forward declarations for PyFrameObject, PyThreadState
+   and PyInterpreterState */
+struct _frame;
+struct _ts;
+struct _is;
 
-    struct _is *next;
-    struct _ts *tstate_head;
-
-    PyObject *modules;
-    PyObject *builtins;
-
-    // Pyston change
-    // Note: any changes here need to show up in PyInterpreterState_Clear as well
-#if 0
-    PyObject *sysdict;
-    PyObject *modules_reloading;
-
-    PyObject *codec_search_path;
-    PyObject *codec_search_cache;
-    PyObject *codec_error_registry;
-
-#ifdef HAVE_DLOPEN
-    int dlopenflags;
-#endif
-#ifdef WITH_TSC
-    int tscdump;
-#endif
-
-#endif
-} PyInterpreterState;
-
-
-/* State unique per thread */
-
-struct _frame; /* Avoid including frameobject.h */
-
-/* Py_tracefunc return -1 when raising an exception, or 0 for success. */
-typedef int (*Py_tracefunc)(PyObject *, struct _frame *, int, PyObject *);
-
-/* The following values are used for 'what' for tracefunc functions: */
-#define PyTrace_CALL 0
-#define PyTrace_EXCEPTION 1
-#define PyTrace_LINE 2
-#define PyTrace_RETURN 3
-#define PyTrace_C_CALL 4
-#define PyTrace_C_EXCEPTION 5
-#define PyTrace_C_RETURN 6
-
-typedef struct _ts {
-    /* See Python/ceval.c for comments explaining most fields */
-
-    struct _ts *next;
-    PyInterpreterState *interp;
-
-    // Pyston change:
-    //struct _frame *frame;
-    void* frame_info;
-
-    int recursion_depth;
-
-    int gilstate_counter;
-
-    PyObject *curexc_type;
-    PyObject *curexc_value;
-    PyObject *curexc_traceback;
-
-    PyObject *dict;  /* Stores per-thread state */
-
-    int trash_delete_nesting;
-    PyObject *trash_delete_later;
-
-    PyObject *async_exc; /* Asynchronous exception to raise */
-    long thread_id; /* Thread id where this tstate was created */
-
-    // Pyston change:
-    // Pyston note: additions in here need to be mirrored in PyThreadState_Clear
-#if 0
-    /* 'tracing' keeps track of the execution depth when tracing/profiling.
-       This is to prevent the actual trace/profile code from being recorded in
-       the trace/profile. */
-    int tracing;
-    int use_tracing;
-
-    Py_tracefunc c_profilefunc;
-    Py_tracefunc c_tracefunc;
-    PyObject *c_profileobj;
-    PyObject *c_traceobj;
-
-    PyObject *exc_type;
-    PyObject *exc_value;
-    PyObject *exc_traceback;
-
-    /* tick_counter is incremented whenever the check_interval ticker
-     * reaches zero. The purpose is to give a useful measure of the number
-     * of interpreted bytecode instructions in a given thread.  This
-     * extremely lightweight statistic collector may be of interest to
-     * profilers (like psyco.jit()), although nothing in the core uses it.
-     */
-    int tick_counter;
-
-    /* XXX signal handlers should also be here */
-#endif
-} PyThreadState;
+/* struct _ts is defined in cpython/pystate.h */
+typedef struct _ts PyThreadState;
+/* struct _is is defined in internal/pycore_pystate.h */
+typedef struct _is PyInterpreterState;
 
 PyAPI_FUNC(PyInterpreterState *) PyInterpreterState_New(void) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyInterpreterState_Clear(PyInterpreterState *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyInterpreterState_Delete(PyInterpreterState *) PYSTON_NOEXCEPT;
 
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03080000
+/* New in 3.8 */
+PyAPI_FUNC(PyObject *) PyInterpreterState_GetDict(PyInterpreterState *) PYSTON_NOEXCEPT;
+#endif
+
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03070000
+/* New in 3.7 */
+PyAPI_FUNC(int64_t) PyInterpreterState_GetID(PyInterpreterState *) PYSTON_NOEXCEPT;
+#endif
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03030000
+
+/* State unique per thread */
+
+/* New in 3.3 */
+PyAPI_FUNC(int) PyState_AddModule(PyObject*, struct PyModuleDef*) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyState_RemoveModule(struct PyModuleDef*) PYSTON_NOEXCEPT;
+#endif
+PyAPI_FUNC(PyObject*) PyState_FindModule(struct PyModuleDef*) PYSTON_NOEXCEPT;
+
 PyAPI_FUNC(PyThreadState *) PyThreadState_New(PyInterpreterState *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyThreadState *) _PyThreadState_Prealloc(PyInterpreterState *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyThreadState_Init(PyThreadState *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyThreadState_Clear(PyThreadState *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyThreadState_Delete(PyThreadState *) PYSTON_NOEXCEPT;
-#ifdef WITH_THREAD
 PyAPI_FUNC(void) PyThreadState_DeleteCurrent(void) PYSTON_NOEXCEPT;
-#endif
 
+/* Get the current thread state.
+
+   When the current thread state is NULL, this issues a fatal error (so that
+   the caller needn't check for NULL).
+
+   The caller must hold the GIL.
+
+   See also PyThreadState_GET() and _PyThreadState_GET(). */
 PyAPI_FUNC(PyThreadState *) PyThreadState_Get(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyThreadState *) PyThreadState_Swap(PyThreadState *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(BORROWED(PyObject *)) PyThreadState_GetDict(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PyThreadState_SetAsyncExc(long, PyObject *) PYSTON_NOEXCEPT;
 
+/* Get the current Python thread state.
 
-/* Variable and macro for in-line access to current thread state */
+   Macro using PyThreadState_Get() or _PyThreadState_GET() depending if
+   pycore_pystate.h is included or not (this header redefines the macro).
 
-PyAPI_DATA(PyThreadState *) _PyThreadState_Current;
+   If PyThreadState_Get() is used, issue a fatal error if the current thread
+   state is NULL.
 
-#ifdef Py_DEBUG
+   See also PyThreadState_Get() and _PyThreadState_GET(). */
 #define PyThreadState_GET() PyThreadState_Get()
-#else
-#define PyThreadState_GET() (_PyThreadState_Current)
-#endif
+
+PyAPI_FUNC(PyThreadState *) PyThreadState_Swap(PyThreadState *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyThreadState_GetDict(void) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyThreadState_SetAsyncExc(unsigned long, PyObject *) PYSTON_NOEXCEPT;
 
 typedef
     enum {PyGILState_LOCKED, PyGILState_UNLOCKED}
         PyGILState_STATE;
+
 
 /* Ensure that the current thread is ready to call the Python
    C API, regardless of the current state of Python, or of its
@@ -190,22 +123,12 @@ PyAPI_FUNC(void) PyGILState_Release(PyGILState_STATE) PYSTON_NOEXCEPT;
 */
 PyAPI_FUNC(PyThreadState *) PyGILState_GetThisThreadState(void) PYSTON_NOEXCEPT;
 
-/* The implementation of sys._current_frames()  Returns a dict mapping
-   thread id to that thread's current frame.
-*/
-PyAPI_FUNC(PyObject *) _PyThread_CurrentFrames(void) PYSTON_NOEXCEPT;
 
-/* Routines for advanced debuggers, requested by David Beazley.
-   Don't use unless you know what you are doing! */
-PyAPI_FUNC(PyInterpreterState *) PyInterpreterState_Head(void) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyInterpreterState *) PyInterpreterState_Next(PyInterpreterState *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyThreadState *) PyInterpreterState_ThreadHead(PyInterpreterState *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyThreadState *) PyThreadState_Next(PyThreadState *) PYSTON_NOEXCEPT;
-
-typedef struct _frame *(*PyThreadFrameGetter)(PyThreadState *self_);
-
-/* hook for PyEval_GetFrame(), requested for Psyco */
-PyAPI_DATA(PyThreadFrameGetter) _PyThreadState_GetFrame;
+#ifndef Py_LIMITED_API
+#  define Py_CPYTHON_PYSTATE_H
+#  include  "cpython/pystate.h"
+#  undef Py_CPYTHON_PYSTATE_H
+#endif
 
 #ifdef __cplusplus
 }

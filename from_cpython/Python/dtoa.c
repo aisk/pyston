@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 /****************************************************************
  *
  * The author of this software is David M. Gay.
@@ -153,18 +151,9 @@
 #endif
 
 
-#if defined(HAVE_UINT32_T) && defined(HAVE_INT32_T)
-typedef PY_UINT32_T ULong;
-typedef PY_INT32_T Long;
-#else
-#error "Failed to find an exact-width 32-bit integer type"
-#endif
-
-#if defined(HAVE_UINT64_T)
-#define ULLong PY_UINT64_T
-#else
-#undef ULLong
-#endif
+typedef uint32_t ULong;
+typedef int32_t Long;
+typedef uint64_t ULLong;
 
 #undef DEBUG
 #ifdef Py_DEBUG
@@ -284,6 +273,16 @@ typedef union { double d; ULong L[2]; } U;
 #define Big0 (Frac_mask1 | Exp_msk1*(DBL_MAX_EXP+Bias-1))
 #define Big1 0xffffffff
 
+/* Standard NaN used by _Py_dg_stdnan. */
+
+#define NAN_WORD0 0x7ff80000
+#define NAN_WORD1 0
+
+/* Bits of the representation of positive infinity. */
+
+#define POSINF_WORD0 0x7ff00000
+#define POSINF_WORD1 0
+
 /* struct BCinfo is used to pass information from _Py_dg_strtod to bigcomp */
 
 typedef struct BCinfo BCinfo;
@@ -365,7 +364,7 @@ Balloc(int k)
         x = 1 << k;
         len = (sizeof(Bigint) + (x-1)*sizeof(ULong) + sizeof(double) - 1)
             /sizeof(double);
-        if (k <= Kmax && pmem_next - private_mem + len <= PRIVATE_mem) {
+        if (k <= Kmax && pmem_next - private_mem + len <= (Py_ssize_t)PRIVATE_mem) {
             rv = (Bigint*)pmem_next;
             pmem_next += len;
         }
@@ -449,13 +448,8 @@ static Bigint *
 multadd(Bigint *b, int m, int a)       /* multiply by m and add a */
 {
     int i, wds;
-#ifdef ULLong
     ULong *x;
     ULLong carry, y;
-#else
-    ULong carry, *x, y;
-    ULong xi, z;
-#endif
     Bigint *b1;
 
     wds = b->wds;
@@ -463,17 +457,9 @@ multadd(Bigint *b, int m, int a)       /* multiply by m and add a */
     i = 0;
     carry = a;
     do {
-#ifdef ULLong
         y = *x * (ULLong)m + carry;
         carry = y >> 32;
         *x++ = (ULong)(y & FFFFFFFF);
-#else
-        xi = *x;
-        y = (xi & 0xffff) * m + carry;
-        z = (xi >> 16) * m + (y >> 16);
-        carry = z >> 16;
-        *x++ = (z << 16) + (y & 0xffff);
-#endif
     }
     while(++i < wds);
     if (carry) {
@@ -634,12 +620,7 @@ mult(Bigint *a, Bigint *b)
     int k, wa, wb, wc;
     ULong *x, *xa, *xae, *xb, *xbe, *xc, *xc0;
     ULong y;
-#ifdef ULLong
     ULLong carry, z;
-#else
-    ULong carry, z;
-    ULong z2;
-#endif
 
     if ((!a->x[0] && a->wds == 1) || (!b->x[0] && b->wds == 1)) {
         c = Balloc(0);
@@ -671,7 +652,6 @@ mult(Bigint *a, Bigint *b)
     xb = b->x;
     xbe = xb + wb;
     xc0 = c->x;
-#ifdef ULLong
     for(; xb < xbe; xc0++) {
         if ((y = *xb++)) {
             x = xa;
@@ -686,39 +666,6 @@ mult(Bigint *a, Bigint *b)
             *xc = (ULong)carry;
         }
     }
-#else
-    for(; xb < xbe; xb++, xc0++) {
-        if (y = *xb & 0xffff) {
-            x = xa;
-            xc = xc0;
-            carry = 0;
-            do {
-                z = (*x & 0xffff) * y + (*xc & 0xffff) + carry;
-                carry = z >> 16;
-                z2 = (*x++ >> 16) * y + (*xc >> 16) + carry;
-                carry = z2 >> 16;
-                Storeinc(xc, z2, z);
-            }
-            while(x < xae);
-            *xc = carry;
-        }
-        if (y = *xb >> 16) {
-            x = xa;
-            xc = xc0;
-            carry = 0;
-            z2 = *xc;
-            do {
-                z = (*x & 0xffff) * y + (*xc >> 16) + carry;
-                carry = z >> 16;
-                Storeinc(xc, z, z2);
-                z2 = (*x++ >> 16) * y + (*xc & 0xffff) + carry;
-                carry = z2 >> 16;
-            }
-            while(x < xae);
-            *xc = z2;
-        }
-    }
-#endif
     for(xc0 = c->x, xc = xc0 + wc; wc > 0 && !*--xc; --wc) ;
     c->wds = wc;
     return c;
@@ -739,7 +686,7 @@ pow5mult(Bigint *b, int k)
 {
     Bigint *b1, *p5, *p51;
     int i;
-    static int p05[3] = { 5, 25, 125 };
+    static const int p05[3] = { 5, 25, 125 };
 
     if ((i = k & 3)) {
         b = multadd(b, p05[i-1], 0);
@@ -795,7 +742,7 @@ pow5mult(Bigint *b, int k)
 {
     Bigint *b1, *p5, *p51;
     int i;
-    static int p05[3] = { 5, 25, 125 };
+    static const int p05[3] = { 5, 25, 125 };
 
     if ((i = k & 3)) {
         b = multadd(b, p05[i-1], 0);
@@ -927,12 +874,7 @@ diff(Bigint *a, Bigint *b)
     Bigint *c;
     int i, wa, wb;
     ULong *xa, *xae, *xb, *xbe, *xc;
-#ifdef ULLong
     ULLong borrow, y;
-#else
-    ULong borrow, y;
-    ULong z;
-#endif
 
     i = cmp(a,b);
     if (!i) {
@@ -963,7 +905,6 @@ diff(Bigint *a, Bigint *b)
     xbe = xb + wb;
     xc = c->x;
     borrow = 0;
-#ifdef ULLong
     do {
         y = (ULLong)*xa++ - *xb++ - borrow;
         borrow = y >> 32 & (ULong)1;
@@ -975,23 +916,6 @@ diff(Bigint *a, Bigint *b)
         borrow = y >> 32 & (ULong)1;
         *xc++ = (ULong)(y & FFFFFFFF);
     }
-#else
-    do {
-        y = (*xa & 0xffff) - (*xb & 0xffff) - borrow;
-        borrow = (y & 0x10000) >> 16;
-        z = (*xa++ >> 16) - (*xb++ >> 16) - borrow;
-        borrow = (z & 0x10000) >> 16;
-        Storeinc(xc, z, y);
-    }
-    while(xb < xbe);
-    while(xa < xae) {
-        y = (*xa & 0xffff) - borrow;
-        borrow = (y & 0x10000) >> 16;
-        z = (*xa++ >> 16) - borrow;
-        borrow = (z & 0x10000) >> 16;
-        Storeinc(xc, z, y);
-    }
-#endif
     while(!*--xc)
         wa--;
     c->wds = wa;
@@ -1079,7 +1003,7 @@ sd2b(U *d, int scale, int *e)
     b = Balloc(1);
     if (b == NULL)
         return NULL;
-    
+
     /* First construct b and e assuming that scale == 0. */
     b->wds = 2;
     b->x[0] = word1(d);
@@ -1236,12 +1160,7 @@ quorem(Bigint *b, Bigint *S)
 {
     int n;
     ULong *bx, *bxe, q, *sx, *sxe;
-#ifdef ULLong
     ULLong borrow, carry, y, ys;
-#else
-    ULong borrow, carry, y, ys;
-    ULong si, z, zs;
-#endif
 
     n = S->wds;
 #ifdef DEBUG
@@ -1263,23 +1182,11 @@ quorem(Bigint *b, Bigint *S)
         borrow = 0;
         carry = 0;
         do {
-#ifdef ULLong
             ys = *sx++ * (ULLong)q + carry;
             carry = ys >> 32;
             y = *bx - (ys & FFFFFFFF) - borrow;
             borrow = y >> 32 & (ULong)1;
             *bx++ = (ULong)(y & FFFFFFFF);
-#else
-            si = *sx++;
-            ys = (si & 0xffff) * q + carry;
-            zs = (si >> 16) * q + (ys >> 16);
-            carry = zs >> 16;
-            y = (*bx & 0xffff) - (ys & 0xffff) - borrow;
-            borrow = (y & 0x10000) >> 16;
-            z = (*bx >> 16) - (zs & 0xffff) - borrow;
-            borrow = (z & 0x10000) >> 16;
-            Storeinc(bx, z, y);
-#endif
         }
         while(sx <= sxe);
         if (!*bxe) {
@@ -1296,23 +1203,11 @@ quorem(Bigint *b, Bigint *S)
         bx = b->x;
         sx = S->x;
         do {
-#ifdef ULLong
             ys = *sx++ + carry;
             carry = ys >> 32;
             y = *bx - (ys & FFFFFFFF) - borrow;
             borrow = y >> 32 & (ULong)1;
             *bx++ = (ULong)(y & FFFFFFFF);
-#else
-            si = *sx++;
-            ys = (si & 0xffff) + carry;
-            zs = (si >> 16) + (ys >> 16);
-            carry = zs >> 16;
-            y = (*bx & 0xffff) - (ys & 0xffff) - borrow;
-            borrow = (y & 0x10000) >> 16;
-            z = (*bx >> 16) - (zs & 0xffff) - borrow;
-            borrow = (z & 0x10000) >> 16;
-            Storeinc(bx, z, y);
-#endif
         }
         while(sx <= sxe);
         bx = b->x;
@@ -1505,6 +1400,36 @@ bigcomp(U *rv, const char *s0, BCinfo *bc)
     return 0;
 }
 
+/* Return a 'standard' NaN value.
+
+   There are exactly two quiet NaNs that don't arise by 'quieting' signaling
+   NaNs (see IEEE 754-2008, section 6.2.1).  If sign == 0, return the one whose
+   sign bit is cleared.  Otherwise, return the one whose sign bit is set.
+*/
+
+double
+_Py_dg_stdnan(int sign)
+{
+    U rv;
+    word0(&rv) = NAN_WORD0;
+    word1(&rv) = NAN_WORD1;
+    if (sign)
+        word0(&rv) |= Sign_bit;
+    return dval(&rv);
+}
+
+/* Return positive or negative infinity, according to the given sign (0 for
+ * positive infinity, 1 for negative infinity). */
+
+double
+_Py_dg_infinity(int sign)
+{
+    U rv;
+    word0(&rv) = POSINF_WORD0;
+    word1(&rv) = POSINF_WORD1;
+    return sign ? -dval(&rv) : dval(&rv);
+}
+
 double
 _Py_dg_strtod(const char *s00, char **se)
 {
@@ -1516,8 +1441,9 @@ _Py_dg_strtod(const char *s00, char **se)
     ULong y, z, abs_exp;
     Long L;
     BCinfo bc;
-    Bigint *bb, *bb1, *bd, *bd0, *bs, *delta;
+    Bigint *bb = NULL, *bd = NULL, *bd0 = NULL, *bs = NULL, *delta = NULL;
     size_t ndigits, fraclen;
+    double result;
 
     dval(&rv) = 0.;
 
@@ -1529,7 +1455,7 @@ _Py_dg_strtod(const char *s00, char **se)
     switch (c) {
     case '-':
         sign = 1;
-        /* no break */
+        /* fall through */
     case '+':
         c = *++s;
     }
@@ -1598,7 +1524,7 @@ _Py_dg_strtod(const char *s00, char **se)
         switch (c) {
         case '-':
             esign = 1;
-            /* no break */
+            /* fall through */
         case '+':
             c = *++s;
         }
@@ -1709,7 +1635,6 @@ _Py_dg_strtod(const char *s00, char **se)
     if (k > 9) {
         dval(&rv) = tens[k - 9] * dval(&rv) + z;
     }
-    bd0 = 0;
     if (nd <= DBL_DIG
         && Flt_Rounds == 1
         ) {
@@ -1879,14 +1804,11 @@ _Py_dg_strtod(const char *s00, char **se)
 
         bd = Balloc(bd0->k);
         if (bd == NULL) {
-            Bfree(bd0);
             goto failed_malloc;
         }
         Bcopy(bd, bd0);
         bb = sd2b(&rv, bc.scale, &bbe);   /* srv = bb * 2^bbe */
         if (bb == NULL) {
-            Bfree(bd);
-            Bfree(bd0);
             goto failed_malloc;
         }
         /* Record whether lsb of bb is odd, in case we need this
@@ -1896,9 +1818,6 @@ _Py_dg_strtod(const char *s00, char **se)
         /* tdv = bd * 10**e;  srv = bb * 2**bbe */
         bs = i2b(1);
         if (bs == NULL) {
-            Bfree(bb);
-            Bfree(bd);
-            Bfree(bd0);
             goto failed_malloc;
         }
 
@@ -1949,54 +1868,36 @@ _Py_dg_strtod(const char *s00, char **se)
         if (bb5 > 0) {
             bs = pow5mult(bs, bb5);
             if (bs == NULL) {
-                Bfree(bb);
-                Bfree(bd);
-                Bfree(bd0);
                 goto failed_malloc;
             }
-            bb1 = mult(bs, bb);
+            Bigint *bb1 = mult(bs, bb);
             Bfree(bb);
             bb = bb1;
             if (bb == NULL) {
-                Bfree(bs);
-                Bfree(bd);
-                Bfree(bd0);
                 goto failed_malloc;
             }
         }
         if (bb2 > 0) {
             bb = lshift(bb, bb2);
             if (bb == NULL) {
-                Bfree(bs);
-                Bfree(bd);
-                Bfree(bd0);
                 goto failed_malloc;
             }
         }
         if (bd5 > 0) {
             bd = pow5mult(bd, bd5);
             if (bd == NULL) {
-                Bfree(bb);
-                Bfree(bs);
-                Bfree(bd0);
                 goto failed_malloc;
             }
         }
         if (bd2 > 0) {
             bd = lshift(bd, bd2);
             if (bd == NULL) {
-                Bfree(bb);
-                Bfree(bs);
-                Bfree(bd0);
                 goto failed_malloc;
             }
         }
         if (bs2 > 0) {
             bs = lshift(bs, bs2);
             if (bs == NULL) {
-                Bfree(bb);
-                Bfree(bd);
-                Bfree(bd0);
                 goto failed_malloc;
             }
         }
@@ -2007,10 +1908,6 @@ _Py_dg_strtod(const char *s00, char **se)
 
         delta = diff(bb, bd);
         if (delta == NULL) {
-            Bfree(bb);
-            Bfree(bs);
-            Bfree(bd);
-            Bfree(bd0);
             goto failed_malloc;
         }
         dsign = delta->sign;
@@ -2064,10 +1961,6 @@ _Py_dg_strtod(const char *s00, char **se)
             }
             delta = lshift(delta,Log2P);
             if (delta == NULL) {
-                Bfree(bb);
-                Bfree(bs);
-                Bfree(bd);
-                Bfree(bd0);
                 goto failed_malloc;
             }
             if (cmp(delta, bs) > 0)
@@ -2088,7 +1981,7 @@ _Py_dg_strtod(const char *s00, char **se)
                         + Exp_msk1
                         ;
                     word1(&rv) = 0;
-                    dsign = 0;
+                    /* dsign = 0; */
                     break;
                 }
             }
@@ -2125,7 +2018,7 @@ _Py_dg_strtod(const char *s00, char **se)
                     goto undfl;
                 }
             }
-            dsign = 1 - dsign;
+            /* dsign = 1 - dsign; */
             break;
         }
         if ((aadj = ratio(delta, bs)) <= 2.) {
@@ -2169,11 +2062,6 @@ _Py_dg_strtod(const char *s00, char **se)
             if ((word0(&rv) & Exp_mask) >=
                 Exp_msk1*(DBL_MAX_EXP+Bias-P)) {
                 if (word0(&rv0) == Big0 && word1(&rv0) == Big1) {
-                    Bfree(bb);
-                    Bfree(bd);
-                    Bfree(bs);
-                    Bfree(bd0);
-                    Bfree(delta);
                     goto ovfl;
                 }
                 word0(&rv) = Big0;
@@ -2215,16 +2103,11 @@ _Py_dg_strtod(const char *s00, char **se)
                 }
         }
       cont:
-        Bfree(bb);
-        Bfree(bd);
-        Bfree(bs);
-        Bfree(delta);
+        Bfree(bb); bb = NULL;
+        Bfree(bd); bd = NULL;
+        Bfree(bs); bs = NULL;
+        Bfree(delta); delta = NULL;
     }
-    Bfree(bb);
-    Bfree(bd);
-    Bfree(bs);
-    Bfree(bd0);
-    Bfree(delta);
     if (bc.nd > nd) {
         error = bigcomp(&rv, s0, &bc);
         if (error)
@@ -2238,24 +2121,37 @@ _Py_dg_strtod(const char *s00, char **se)
     }
 
   ret:
-    return sign ? -dval(&rv) : dval(&rv);
+    result = sign ? -dval(&rv) : dval(&rv);
+    goto done;
 
   parse_error:
-    return 0.0;
+    result = 0.0;
+    goto done;
 
   failed_malloc:
     errno = ENOMEM;
-    return -1.0;
+    result = -1.0;
+    goto done;
 
   undfl:
-    return sign ? -0.0 : 0.0;
+    result = sign ? -0.0 : 0.0;
+    goto done;
 
   ovfl:
     errno = ERANGE;
     /* Can't trust HUGE_VAL */
     word0(&rv) = Exp_mask;
     word1(&rv) = 0;
-    return sign ? -dval(&rv) : dval(&rv);
+    result = sign ? -dval(&rv) : dval(&rv);
+    goto done;
+
+  done:
+    Bfree(bb);
+    Bfree(bd);
+    Bfree(bs);
+    Bfree(bd0);
+    Bfree(delta);
+    return result;
 
 }
 
@@ -2277,7 +2173,7 @@ rv_alloc(int i)
 }
 
 static char *
-nrv_alloc(char *s, char **rve, int n)
+nrv_alloc(const char *s, char **rve, int n)
 {
     char *rv, *t;
 
@@ -2516,7 +2412,7 @@ _Py_dg_dtoa(double dd, int mode, int ndigits,
         break;
     case 2:
         leftright = 0;
-        /* no break */
+        /* fall through */
     case 4:
         if (ndigits <= 0)
             ndigits = 1;
@@ -2524,7 +2420,7 @@ _Py_dg_dtoa(double dd, int mode, int ndigits,
         break;
     case 3:
         leftright = 0;
-        /* no break */
+        /* fall through */
     case 5:
         i = ndigits + k + 1;
         ilim = i;

@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 /* Tuple object interface */
 
 #ifndef Py_TUPLEOBJECT_H
@@ -11,7 +9,7 @@ extern "C" {
 /*
 Another generally useful object type is a tuple of object pointers.
 For Python, this is an immutable type.  C code can change the tuple items
-(but not their number), and even use tuples are general-purpose arrays of
+(but not their number), and even use tuples as general-purpose arrays of
 object references, but in general only brand new tuples should be mutated,
 not ones that might already have been exposed to Python code.
 
@@ -22,19 +20,8 @@ inserted in the tuple.  Similarly, PyTuple_GetItem does not increment the
 returned item's reference count.
 */
 
-typedef struct {
-    PyObject_VAR_HEAD
-    PyObject *ob_item[1];
-
-    /* ob_item contains space for 'ob_size' elements.
-     * Items must normally not be NULL, except during construction when
-     * the tuple is not yet visible outside the function that builds it.
-     */
-} PyTupleObject;
-
-// Pyston change: this is no longer a static object
-PyAPI_DATA(PyTypeObject*) tuple_cls;
-#define PyTuple_Type (*tuple_cls)
+PyAPI_DATA(PyTypeObject) PyTuple_Type;
+PyAPI_DATA(PyTypeObject) PyTupleIter_Type;
 
 #define PyTuple_Check(op) \
                  PyType_FastSubclass(Py_TYPE(op), Py_TPFLAGS_TUPLE_SUBCLASS)
@@ -42,20 +29,18 @@ PyAPI_DATA(PyTypeObject*) tuple_cls;
 
 PyAPI_FUNC(PyObject *) PyTuple_New(Py_ssize_t size) PYSTON_NOEXCEPT;
 PyAPI_FUNC(Py_ssize_t) PyTuple_Size(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(BORROWED(PyObject *)) PyTuple_GetItem(PyObject *, Py_ssize_t) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) PyTuple_SetItem(PyObject *, Py_ssize_t, STOLEN(PyObject *)) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyTuple_GetItem(PyObject *, Py_ssize_t) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) PyTuple_SetItem(PyObject *, Py_ssize_t, PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyTuple_GetSlice(PyObject *, Py_ssize_t, Py_ssize_t) PYSTON_NOEXCEPT;
-PyAPI_FUNC(int) _PyTuple_Resize(PyObject **, Py_ssize_t) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyTuple_Pack(Py_ssize_t, ...) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) _PyTuple_MaybeUntrack(PyObject *) PYSTON_NOEXCEPT;
-
-/* Macro, trading safety for speed */
-#define PyTuple_GET_ITEM(op, i) (((PyTupleObject *)(op))->ob_item[i])
-#define PyTuple_GET_SIZE(op)    Py_SIZE(op)
-/* Macro, *only* to be used to fill in brand new tuples */
-#define PyTuple_SET_ITEM(op, i, v) (((PyTupleObject *)(op))->ob_item[i] = v)
 
 PyAPI_FUNC(int) PyTuple_ClearFreeList(void) PYSTON_NOEXCEPT;
+
+#ifndef Py_LIMITED_API
+#  define Py_CPYTHON_TUPLEOBJECT_H
+#  include  "cpython/tupleobject.h"
+#  undef Py_CPYTHON_TUPLEOBJECT_H
+#endif
 
 #ifdef __cplusplus
 }

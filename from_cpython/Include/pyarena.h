@@ -1,8 +1,7 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 /* An arena-like memory interface for the compiler.
  */
 
+#ifndef Py_LIMITED_API
 #ifndef Py_PYARENA_H
 #define Py_PYARENA_H
 
@@ -62,3 +61,4 @@ extern "C" {
 #endif
 
 #endif /* !Py_PYARENA_H */
+#endif /* Py_LIMITED_API */

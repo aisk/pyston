@@ -1,4 +1,5 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
+
 
 /* Method object interface */
 
@@ -12,55 +13,58 @@ extern "C" {
    not Python methods in user-defined classes.  See classobject.h
    for the latter. */
 
-// Pyston change: this is no longer a static object
-//PyAPI_DATA(PyTypeObject) PyCFunction_Type;
-PyAPI_DATA(PyTypeObject*) capifunc_cls;
-#define PyCFunction_Type (*capifunc_cls)
+PyAPI_DATA(PyTypeObject) PyCFunction_Type;
 
 #define PyCFunction_Check(op) (Py_TYPE(op) == &PyCFunction_Type)
 
-// Pyston change: expose our builtin_function_or_method type
-PyAPI_DATA(PyTypeObject*) builtin_function_or_method_cls;
-#define PyBuiltinFunction_Type (*builtin_function_or_method_cls)
-
 typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+typedef PyObject *(*_PyCFunctionFast) (PyObject *, PyObject *const *, Py_ssize_t);
 typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *, PyObject *,
-					     PyObject *);
+                                             PyObject *);
+typedef PyObject *(*_PyCFunctionFastWithKeywords) (PyObject *,
+                                                   PyObject *const *, Py_ssize_t,
+                                                   PyObject *);
 typedef PyObject *(*PyNoArgsFunction)(PyObject *);
 
 PyAPI_FUNC(PyCFunction) PyCFunction_GetFunction(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(BORROWED(PyObject *)) PyCFunction_GetSelf(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCFunction_GetSelf(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(int) PyCFunction_GetFlags(PyObject *) PYSTON_NOEXCEPT;
-
 
 /* Macros for direct access to these values. Type checks are *not*
    done, so use with care. */
+#ifndef Py_LIMITED_API
 #define PyCFunction_GET_FUNCTION(func) \
         (((PyCFunctionObject *)func) -> m_ml -> ml_meth)
 #define PyCFunction_GET_SELF(func) \
-	(((PyCFunctionObject *)func) -> m_self)
+        (((PyCFunctionObject *)func) -> m_ml -> ml_flags & METH_STATIC ? \
+         NULL : ((PyCFunctionObject *)func) -> m_self)
 #define PyCFunction_GET_FLAGS(func) \
-	(((PyCFunctionObject *)func) -> m_ml -> ml_flags)
-
+        (((PyCFunctionObject *)func) -> m_ml -> ml_flags)
+#endif
 PyAPI_FUNC(PyObject *) PyCFunction_Call(PyObject *, PyObject *, PyObject *) PYSTON_NOEXCEPT;
 
+#ifndef Py_LIMITED_API
+PyAPI_FUNC(PyObject *) _PyCFunction_FastCallDict(PyObject *func,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    PyObject *kwargs) PYSTON_NOEXCEPT;
+#endif
+
 struct PyMethodDef {
-    const char	*ml_name;	/* The name of the built-in function/method */
-    PyCFunction  ml_meth;	/* The C function that implements it */
-    int		 ml_flags;	/* Combination of METH_xxx flags, which mostly
-				   describe the args expected by the C func */
-    const char	*ml_doc;	/* The __doc__ attribute, or NULL */
+    const char  *ml_name;   /* The name of the built-in function/method */
+    PyCFunction ml_meth;    /* The C function that implements it */
+    int         ml_flags;   /* Combination of METH_xxx flags, which mostly
+                               describe the args expected by the C func */
+    const char  *ml_doc;    /* The __doc__ attribute, or NULL */
 };
 typedef struct PyMethodDef PyMethodDef;
 
-PyAPI_FUNC(PyObject *) Py_FindMethod(PyMethodDef[], PyObject *, const char *) PYSTON_NOEXCEPT;
-
 #define PyCFunction_New(ML, SELF) PyCFunction_NewEx((ML), (SELF), NULL)
-PyAPI_FUNC(PyObject *) PyCFunction_NewEx(PyMethodDef *, PyObject *, 
-					 PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyCFunction_NewEx(PyMethodDef *, PyObject *,
+                                         PyObject *) PYSTON_NOEXCEPT;
 
 /* Flag passed to newmethodobject */
-#define METH_OLDARGS  0x0000
+/* #define METH_OLDARGS  0x0000   -- unsupported now */
 #define METH_VARARGS  0x0001
 #define METH_KEYWORDS 0x0002
 /* METH_NOARGS and METH_O must not be combined with the flags above. */
@@ -73,37 +77,63 @@ PyAPI_FUNC(PyObject *) PyCFunction_NewEx(PyMethodDef *, PyObject *,
 #define METH_CLASS    0x0010
 #define METH_STATIC   0x0020
 
-/* METH_COEXIST allows a method to be entered eventhough a slot has
+/* METH_COEXIST allows a method to be entered even though a slot has
    already filled the entry.  When defined, the flag allows a separate
-   method, "__contains__" for example, to coexist with a defined 
+   method, "__contains__" for example, to coexist with a defined
    slot like sq_contains. */
 
 #define METH_COEXIST   0x0040
 
+#ifndef Py_LIMITED_API
+#define METH_FASTCALL  0x0080
+#endif
+
 /* Pyston additions: */
-#define METH_O2        0x0080
+#define METH_O2        0x10000
 #define METH_O3        (METH_O | METH_O2)
 // The number of defaults:
-#define METH_D1        0x0200
-#define METH_D2        0x0400
+#define METH_D1        0x20000
+#define METH_D2        0x40000
 #define METH_D3        (METH_D1 | METH_D2)
 
-typedef struct PyMethodChain {
-    PyMethodDef *methods;		/* Methods of this type */
-    struct PyMethodChain *link;	/* NULL or base type */
-} PyMethodChain;
+/* This bit is preserved for Stackless Python */
+#ifdef STACKLESS
+#define METH_STACKLESS 0x0100
+#else
+#define METH_STACKLESS 0x0000
+#endif
 
-PyAPI_FUNC(PyObject *) Py_FindMethodInChain(PyMethodChain *, PyObject *,
-                                            const char *) PYSTON_NOEXCEPT;
-
+#ifndef Py_LIMITED_API
 typedef struct {
     PyObject_HEAD
     PyMethodDef *m_ml; /* Description of the C function to call */
     PyObject    *m_self; /* Passed as 'self' arg to the C func, can be NULL */
     PyObject    *m_module; /* The __module__ attribute, can be anything */
+    PyObject    *m_weakreflist; /* List of weak references */
+    vectorcallfunc vectorcall;
 } PyCFunctionObject;
 
+PyAPI_FUNC(PyObject *) _PyMethodDef_RawFastCallDict(
+    PyMethodDef *method,
+    PyObject *self,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    PyObject *kwargs) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(PyObject *) _PyMethodDef_RawFastCallKeywords(
+    PyMethodDef *method,
+    PyObject *self,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    PyObject *kwnames) PYSTON_NOEXCEPT;
+#endif
+
 PyAPI_FUNC(int) PyCFunction_ClearFreeList(void) PYSTON_NOEXCEPT;
+
+#ifndef Py_LIMITED_API
+PyAPI_FUNC(void) _PyCFunction_DebugMallocStats(FILE *out) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) _PyMethod_DebugMallocStats(FILE *out) PYSTON_NOEXCEPT;
+#endif
 
 #ifdef __cplusplus
 }

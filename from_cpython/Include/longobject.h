@@ -1,4 +1,4 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
 
 #ifndef Py_LONGOBJECT_H
 #define Py_LONGOBJECT_H
@@ -9,39 +9,90 @@ extern "C" {
 
 /* Long (arbitrary precision) integer object interface */
 
-// Pyston change: this is not the format we're using
-#if 0
-typedef struct _longobject PyLongObject; /* Revealed in longintrepr.h */
-#endif
-struct _PyLongObject;
-typedef struct _PyLongObject PyLongObject;
+// Pyston change: this struct is never revealed, since ints use Pyston's own formats
+typedef struct _longobject PyLongObject;
 
-// Pyston change: this is no longer a static object
-PyAPI_DATA(PyTypeObject*) long_cls;
-#define PyLong_Type (*long_cls)
+// Pyston change: Pyston specific API
+#define Py_HAVE_LONG_MPZ_API 1
+/* _PyLongMPZ: alias for mpz_src, used to not have to pull in the GMP header. */
+typedef void* _PyLongMPZ;
+/* _PyLong_AsMPZ: Sets the supplied initialized GMP mpz to the value of the supplied long object. */
+PyAPI_FUNC(void) _PyLong_AsMPZ(PyObject *, _PyLongMPZ) PYSTON_NOEXCEPT;
+/* _PyLong_FromMPZ: Creates a python long object from the supplied GMP mpz value. */
+PyAPI_FUNC(PyObject *) _PyLong_FromMPZ(const _PyLongMPZ) PYSTON_NOEXCEPT;
+
+PyAPI_DATA(PyTypeObject) PyLong_Type;
 
 #define PyLong_Check(op) \
-		PyType_FastSubclass(Py_TYPE(op), Py_TPFLAGS_LONG_SUBCLASS)
-#define PyLong_CheckExact(op) (Py_TYPE(op) == &PyLong_Type)
+        PyType_FastSubclass(Py_TYPE(op), Py_TPFLAGS_LONG_SUBCLASS)
+// Pyston change: ints that don't fit in 64 bits are instances of a hidden subclass of int,
+// which counts as an exact int too.
+PyAPI_DATA(PyTypeObject *) _PyLong_BigType;
+#define PyLong_CheckExact(op) (Py_TYPE(op) == &PyLong_Type || Py_TYPE(op) == _PyLong_BigType)
 
 PyAPI_FUNC(PyObject *) PyLong_FromLong(long) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyLong_FromUnsignedLong(unsigned long) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PyLong_FromDouble(double) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyLong_FromSize_t(size_t) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyLong_FromSsize_t(Py_ssize_t) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyLong_FromDouble(double) PYSTON_NOEXCEPT;
 PyAPI_FUNC(long) PyLong_AsLong(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(long) PyLong_AsLongAndOverflow(PyObject *, int *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(Py_ssize_t) PyLong_AsSsize_t(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(size_t) PyLong_AsSize_t(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(unsigned long) PyLong_AsUnsignedLong(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(unsigned long) PyLong_AsUnsignedLongMask(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(Py_ssize_t) PyLong_AsSsize_t(PyObject *) PYSTON_NOEXCEPT;
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(int) _PyLong_AsInt(PyObject *) PYSTON_NOEXCEPT;
+#endif
 PyAPI_FUNC(PyObject *) PyLong_GetInfo(void) PYSTON_NOEXCEPT;
 
-/* For use by intobject.c only */
-#define _PyLong_AsSsize_t PyLong_AsSsize_t
-#define _PyLong_FromSize_t PyLong_FromSize_t
-#define _PyLong_FromSsize_t PyLong_FromSsize_t
-PyAPI_DATA(int) _PyLong_DigitValue[256];
+/* It may be useful in the future. I've added it in the PyInt -> PyLong
+   cleanup to keep the extra information. [CH] */
+#define PyLong_AS_LONG(op) PyLong_AsLong(op)
+
+/* Issue #1983: pid_t can be longer than a C long on some systems */
+#if !defined(SIZEOF_PID_T) || SIZEOF_PID_T == SIZEOF_INT
+#define _Py_PARSE_PID "i"
+#define PyLong_FromPid PyLong_FromLong
+#define PyLong_AsPid PyLong_AsLong
+#elif SIZEOF_PID_T == SIZEOF_LONG
+#define _Py_PARSE_PID "l"
+#define PyLong_FromPid PyLong_FromLong
+#define PyLong_AsPid PyLong_AsLong
+#elif defined(SIZEOF_LONG_LONG) && SIZEOF_PID_T == SIZEOF_LONG_LONG
+#define _Py_PARSE_PID "L"
+#define PyLong_FromPid PyLong_FromLongLong
+#define PyLong_AsPid PyLong_AsLongLong
+#else
+#error "sizeof(pid_t) is neither sizeof(int), sizeof(long) or sizeof(long long)"
+#endif /* SIZEOF_PID_T */
+
+#if SIZEOF_VOID_P == SIZEOF_INT
+#  define _Py_PARSE_INTPTR "i"
+#  define _Py_PARSE_UINTPTR "I"
+#elif SIZEOF_VOID_P == SIZEOF_LONG
+#  define _Py_PARSE_INTPTR "l"
+#  define _Py_PARSE_UINTPTR "k"
+#elif defined(SIZEOF_LONG_LONG) && SIZEOF_VOID_P == SIZEOF_LONG_LONG
+#  define _Py_PARSE_INTPTR "L"
+#  define _Py_PARSE_UINTPTR "K"
+#else
+#  error "void* different in size from int, long and long long"
+#endif /* SIZEOF_VOID_P */
+
+#ifndef Py_LIMITED_API
+PyAPI_FUNC(int) _PyLong_UnsignedShort_Converter(PyObject *, void *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) _PyLong_UnsignedInt_Converter(PyObject *, void *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) _PyLong_UnsignedLong_Converter(PyObject *, void *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) _PyLong_UnsignedLongLong_Converter(PyObject *, void *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) _PyLong_Size_t_Converter(PyObject *, void *) PYSTON_NOEXCEPT;
+#endif
+
+/* Used by Python/mystrtoul.c, _PyBytes_FromHex(),
+   _PyBytes_DecodeEscapeRecode(), etc. */
+#ifndef Py_LIMITED_API
+PyAPI_DATA(unsigned char) _PyLong_DigitValue[256];
+#endif
 
 /* _PyLong_Frexp returns a double x and an exponent e such that the
    true value is approximately equal to x * 2**e.  e is >= 0.  x is
@@ -49,35 +100,36 @@ PyAPI_DATA(int) _PyLong_DigitValue[256];
    zeroes); otherwise, 0.5 <= abs(x) < 1.0.  On overflow, which is
    possible if the number of bits doesn't fit into a Py_ssize_t, sets
    OverflowError and returns -1.0 for x, 0 for e. */
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(double) _PyLong_Frexp(PyLongObject *a, Py_ssize_t *e) PYSTON_NOEXCEPT;
+#endif
 
 PyAPI_FUNC(double) PyLong_AsDouble(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyLong_FromVoidPtr(void *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void *) PyLong_AsVoidPtr(PyObject *) PYSTON_NOEXCEPT;
 
-#ifdef HAVE_LONG_LONG
-PyAPI_FUNC(PyObject *) PyLong_FromLongLong(PY_LONG_LONG) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PyLong_FromUnsignedLongLong(unsigned PY_LONG_LONG) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PY_LONG_LONG) PyLong_AsLongLong(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(unsigned PY_LONG_LONG) PyLong_AsUnsignedLongLong(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(unsigned PY_LONG_LONG) PyLong_AsUnsignedLongLongMask(PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PY_LONG_LONG) PyLong_AsLongLongAndOverflow(PyObject *, int *) PYSTON_NOEXCEPT;
-#endif /* HAVE_LONG_LONG */
+PyAPI_FUNC(PyObject *) PyLong_FromLongLong(long long) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyLong_FromUnsignedLongLong(unsigned long long) PYSTON_NOEXCEPT;
+PyAPI_FUNC(long long) PyLong_AsLongLong(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(unsigned long long) PyLong_AsUnsignedLongLong(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(unsigned long long) PyLong_AsUnsignedLongLongMask(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(long long) PyLong_AsLongLongAndOverflow(PyObject *, int *) PYSTON_NOEXCEPT;
 
 PyAPI_FUNC(PyObject *) PyLong_FromString(const char *, char **, int) PYSTON_NOEXCEPT;
-#ifdef Py_USING_UNICODE
+#ifndef Py_LIMITED_API
+Py_DEPRECATED(3.3)
 PyAPI_FUNC(PyObject *) PyLong_FromUnicode(Py_UNICODE*, Py_ssize_t, int) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyLong_FromUnicodeObject(PyObject *u, int base) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) _PyLong_FromBytes(const char *, Py_ssize_t, int) PYSTON_NOEXCEPT;
 #endif
 
+#ifndef Py_LIMITED_API
 /* _PyLong_Sign.  Return 0 if v is 0, -1 if v < 0, +1 if v > 0.
    v must not be NULL, and must be a normalized long.
    There are no error cases.
 */
 PyAPI_FUNC(int) _PyLong_Sign(PyObject *v) PYSTON_NOEXCEPT;
 
-// Pyston change: copied from CPython/Include/longintrepr.h
-/* Return a copy of src. */
-PyAPI_FUNC(PyObject *) _PyLong_Copy(PyLongObject *src) PYSTON_NOEXCEPT;
 
 /* _PyLong_NumBits.  Return the number of bits needed to represent the
    absolute value of a long.  For example, this returns 1 for 1 and -1, 2
@@ -88,8 +140,16 @@ PyAPI_FUNC(PyObject *) _PyLong_Copy(PyLongObject *src) PYSTON_NOEXCEPT;
 */
 PyAPI_FUNC(size_t) _PyLong_NumBits(PyObject *v) PYSTON_NOEXCEPT;
 
+/* _PyLong_DivmodNear.  Given integers a and b, compute the nearest
+   integer q to the exact quotient a / b, rounding to the nearest even integer
+   in the case of a tie.  Return (q, r), where r = a - q*b.  The remainder r
+   will satisfy abs(r) <= abs(b)/2, with equality possible only if q is
+   even.
+*/
+PyAPI_FUNC(PyObject *) _PyLong_DivmodNear(PyObject *, PyObject *) PYSTON_NOEXCEPT;
+
 /* _PyLong_FromByteArray:  View the n unsigned bytes as a binary integer in
-   base 256, and return a Python long with the same numeric value.
+   base 256, and return a Python int with the same numeric value.
    If n is 0, the integer is 0.  Else:
    If little_endian is 1/true, bytes[n-1] is the MSB and bytes[0] the LSB;
    else (little_endian is 0/false) bytes[0] is the MSB and bytes[n-1] the
@@ -99,11 +159,11 @@ PyAPI_FUNC(size_t) _PyLong_NumBits(PyObject *v) PYSTON_NOEXCEPT;
    non-negative if bit 0x80 of the MSB is clear, negative if set.
    Error returns:
    + Return NULL with the appropriate exception set if there's not
-     enough memory to create the Python long.
+     enough memory to create the Python int.
 */
 PyAPI_FUNC(PyObject *) _PyLong_FromByteArray(
-	const unsigned char* bytes, size_t n,
-	int little_endian, int is_signed) PYSTON_NOEXCEPT;
+    const unsigned char* bytes, size_t n,
+    int little_endian, int is_signed) PYSTON_NOEXCEPT;
 
 /* _PyLong_AsByteArray: Convert the least-significant 8*n bits of long
    v to a base-256 integer, stored in array bytes.  Normally return 0,
@@ -122,36 +182,76 @@ PyAPI_FUNC(PyObject *) _PyLong_FromByteArray(
      example, if is_signed is 0 and there are more digits in the v than
      fit in n; or if is_signed is 1, v < 0, and n is just 1 bit shy of
      being large enough to hold a sign bit.  OverflowError is set in this
-     case, but bytes holds the least-signficant n bytes of the true value.
+     case, but bytes holds the least-significant n bytes of the true value.
 */
 PyAPI_FUNC(int) _PyLong_AsByteArray(PyLongObject* v,
-	unsigned char* bytes, size_t n,
-	int little_endian, int is_signed) PYSTON_NOEXCEPT;
+    unsigned char* bytes, size_t n,
+    int little_endian, int is_signed) PYSTON_NOEXCEPT;
+
+/* _PyLong_FromNbInt: Convert the given object to a PyLongObject
+   using the nb_int slot, if available.  Raise TypeError if either the
+   nb_int slot is not available or the result of the call to nb_int
+   returns something not of type int.
+*/
+PyAPI_FUNC(PyObject *) _PyLong_FromNbInt(PyObject *) PYSTON_NOEXCEPT;
+
+/* Convert the given object to a PyLongObject using the nb_index or
+   nb_int slots, if available (the latter is deprecated).
+   Raise TypeError if either nb_index and nb_int slots are not
+   available or the result of the call to nb_index or nb_int
+   returns something not of type int.
+   Should be replaced with PyNumber_Index after the end of the
+   deprecation period.
+*/
+PyAPI_FUNC(PyObject *) _PyLong_FromNbIndexOrNbInt(PyObject *) PYSTON_NOEXCEPT;
 
 /* _PyLong_Format: Convert the long to a string object with given base,
-   appending a base prefix of 0[box] if base is 2, 8 or 16.
-   Add a trailing "L" if addL is non-zero.
-   If newstyle is zero, then use the pre-2.6 behavior of octal having
-   a leading "0", instead of the prefix "0o" */
-PyAPI_FUNC(PyObject *) _PyLong_Format(PyObject *aa, int base, int addL, int newstyle) PYSTON_NOEXCEPT;
+   appending a base prefix of 0[box] if base is 2, 8 or 16. */
+PyAPI_FUNC(PyObject *) _PyLong_Format(PyObject *obj, int base) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(int) _PyLong_FormatWriter(
+    _PyUnicodeWriter *writer,
+    PyObject *obj,
+    int base,
+    int alternate) PYSTON_NOEXCEPT;
+
+PyAPI_FUNC(char*) _PyLong_FormatBytesWriter(
+    _PyBytesWriter *writer,
+    char *str,
+    PyObject *obj,
+    int base,
+    int alternate) PYSTON_NOEXCEPT;
 
 /* Format the object based on the format_spec, as defined in PEP 3101
    (Advanced String Formatting). */
-PyAPI_FUNC(PyObject *) _PyLong_FormatAdvanced(PyObject *obj,
-					      char *format_spec,
-					      Py_ssize_t format_spec_len) PYSTON_NOEXCEPT;
+PyAPI_FUNC(int) _PyLong_FormatAdvancedWriter(
+    _PyUnicodeWriter *writer,
+    PyObject *obj,
+    PyObject *format_spec,
+    Py_ssize_t start,
+    Py_ssize_t end) PYSTON_NOEXCEPT;
+#endif /* Py_LIMITED_API */
 
-// Pyston change: Pyston specific API
-#define Py_HAVE_LONG_MPZ_API 1
-/* _PyLongMPZ: alias for mpz_src, used to not have to pull in the GMP header. */
-typedef void* _PyLongMPZ;
-/* _PyLong_AsMPZ: Sets the supplied initialized GMP mpz to the value of the supplied long object. */
-PyAPI_FUNC(void) _PyLong_AsMPZ(PyObject *, _PyLongMPZ) PYSTON_NOEXCEPT;
-/* _PyLong_FromMPZ: Creates a python long object from the supplied GMP mpz value. */
-PyAPI_FUNC(PyObject *) _PyLong_FromMPZ(const _PyLongMPZ) PYSTON_NOEXCEPT;
+/* These aren't really part of the int object, but they're handy. The
+   functions are in Python/mystrtoul.c.
+ */
+PyAPI_FUNC(unsigned long) PyOS_strtoul(const char *, char **, int) PYSTON_NOEXCEPT;
+PyAPI_FUNC(long) PyOS_strtol(const char *, char **, int) PYSTON_NOEXCEPT;
+
+#ifndef Py_LIMITED_API
+/* For use by the gcd function in mathmodule.c */
+PyAPI_FUNC(PyObject *) _PyLong_GCD(PyObject *, PyObject *) PYSTON_NOEXCEPT;
+#endif /* !Py_LIMITED_API */
+
+#ifndef Py_LIMITED_API
+PyAPI_DATA(PyObject *) _PyLong_Zero;
+PyAPI_DATA(PyObject *) _PyLong_One;
+
+PyAPI_FUNC(PyObject *) _PyLong_Rshift(PyObject *, size_t) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) _PyLong_Lshift(PyObject *, size_t) PYSTON_NOEXCEPT;
+#endif
 
 #ifdef __cplusplus
 }
 #endif
 #endif /* !Py_LONGOBJECT_H */
-

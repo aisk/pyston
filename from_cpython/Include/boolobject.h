@@ -1,4 +1,4 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
 
 /* Boolean object interface */
 
@@ -9,21 +9,17 @@ extern "C" {
 #endif
 
 
-typedef PyIntObject PyBoolObject;
-
-// Pyston change: this is no longer a static object
-PyAPI_DATA(PyTypeObject*) bool_cls;
-#define PyBool_Type (*bool_cls)
+PyAPI_DATA(PyTypeObject) PyBool_Type;
 
 #define PyBool_Check(x) (Py_TYPE(x) == &PyBool_Type)
 
 /* Py_False and Py_True are the only two bools in existence.
 Don't forget to apply Py_INCREF() when returning either!!! */
 
-// Pyston change: these are currently stored as pointers, not as static globals
 /* Don't use these directly */
-//PyAPI_DATA(PyIntObject) _Py_ZeroStruct, _Py_TrueStruct;
+// Pyston change: these are stored as pointers, not as static globals
 PyAPI_DATA(PyObject) *pyston_True, *pyston_False;
+
 /* Use these macros */
 #define Py_False ((PyObject *) pyston_False)
 #define Py_True ((PyObject *) pyston_True)

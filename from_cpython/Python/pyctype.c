@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 #include "Python.h"
 
 /* Our own locale-independent ctype.h-like macros */

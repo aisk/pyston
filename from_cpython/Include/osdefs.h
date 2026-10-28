@@ -1,5 +1,3 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
-
 #ifndef Py_OSDEFS_H
 #define Py_OSDEFS_H
 #ifdef __cplusplus
@@ -9,32 +7,20 @@ extern "C" {
 
 /* Operating system dependencies */
 
-/* Mod by chrish: QNX has WATCOM, but isn't DOS */
-#if !defined(__QNX__)
-#if defined(MS_WINDOWS) || defined(__BORLANDC__) || defined(__WATCOMC__) || defined(__DJGPP__) || defined(PYOS_OS2)
-#if defined(PYOS_OS2) && defined(PYCC_GCC)
-#define MAXPATHLEN 260
-#define SEP '/'
-#define ALTSEP '\\'
-#else
-#define SEP '\\'
-#define ALTSEP '/'
+#ifdef MS_WINDOWS
+#define SEP L'\\'
+#define ALTSEP L'/'
 #define MAXPATHLEN 256
-#endif
-#define DELIM ';'
-#endif
+#define DELIM L';'
 #endif
 
-#ifdef RISCOS
-#define SEP '.'
-#define MAXPATHLEN 256
-#define DELIM ','
+#ifdef __VXWORKS__
+#define DELIM L';'
 #endif
-
 
 /* Filename separator */
 #ifndef SEP
-#define SEP '/'
+#define SEP L'/'
 #endif
 
 /* Max pathname length */
@@ -56,7 +42,7 @@ extern "C" {
 
 /* Search path entry delimiter */
 #ifndef DELIM
-#define DELIM ':'
+#define DELIM L':'
 #endif
 
 #ifdef __cplusplus

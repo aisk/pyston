@@ -1,4 +1,4 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
 
 #ifndef Py_ERRORS_H
 #define Py_ERRORS_H
@@ -6,103 +6,30 @@
 extern "C" {
 #endif
 
-/* Error objects */
-
-typedef struct {
-    PyObject_HEAD
-    // Pyston change: changed from dict to hcattrs
-    // PyObject *dict;
-    struct _hcattrs hcattrs;
-    PyObject *args;
-    PyObject *message;
-} PyBaseExceptionObject;
-
-typedef struct {
-    PyObject_HEAD
-    // Pyston change: changed from dict to hcattrs
-    // PyObject *dict;
-    struct _hcattrs hcattrs;
-    PyObject *args;
-    PyObject *message;
-    PyObject *msg;
-    PyObject *filename;
-    PyObject *lineno;
-    PyObject *offset;
-    PyObject *text;
-    PyObject *print_file_and_line;
-} PySyntaxErrorObject;
-
-#ifdef Py_USING_UNICODE
-typedef struct {
-    PyObject_HEAD
-    // Pyston change: changed from dict to hcattrs
-    // PyObject *dict;
-    struct _hcattrs hcattrs;
-    PyObject *args;
-    PyObject *message;
-    PyObject *encoding;
-    PyObject *object;
-    Py_ssize_t start;
-    Py_ssize_t end;
-    PyObject *reason;
-} PyUnicodeErrorObject;
-#endif
-
-typedef struct {
-    PyObject_HEAD
-    // Pyston change: changed from dict to hcattrs
-    // PyObject *dict;
-    struct _hcattrs hcattrs;
-    PyObject *args;
-    PyObject *message;
-    PyObject *code;
-} PySystemExitObject;
-
-typedef struct {
-    PyObject_HEAD
-    // Pyston change: changed from dict to hcattrs
-    // PyObject *dict;
-    struct _hcattrs hcattrs;
-    PyObject *args;
-    PyObject *message;
-    PyObject *myerrno;
-    PyObject *strerror;
-    PyObject *filename;
-} PyEnvironmentErrorObject;
-
-#ifdef MS_WINDOWS
-typedef struct {
-    PyObject_HEAD
-    // Pyston change: changed from dict to hcattrs
-    // PyObject *dict;
-    struct _hcattrs hcattrs;
-    PyObject *args;
-    PyObject *message;
-    PyObject *myerrno;
-    PyObject *strerror;
-    PyObject *filename;
-    PyObject *winerror;
-} PyWindowsErrorObject;
-#endif
-
 /* Error handling definitions */
 
 PyAPI_FUNC(void) PyErr_SetNone(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyErr_SetObject(PyObject *, PyObject *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyErr_SetString(PyObject *, const char *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(BORROWED(PyObject *)) PyErr_Occurred(void) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyErr_SetString(
+    PyObject *exception,
+    const char *string   /* decoded from utf-8 */
+    ) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyErr_Occurred(void) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyErr_Clear(void) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyErr_Fetch(PyObject **, PyObject **, PyObject **) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyErr_Restore(STOLEN(PyObject *), STOLEN(PyObject *), STOLEN(PyObject *)) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyErr_Restore(PyObject *, PyObject *, PyObject *) PYSTON_NOEXCEPT;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03030000
+PyAPI_FUNC(void) PyErr_GetExcInfo(PyObject **, PyObject **, PyObject **) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyErr_SetExcInfo(PyObject *, PyObject *, PyObject *) PYSTON_NOEXCEPT;
+#endif
 
-// Pyton change: This functions are normally only available in CPython >= 3.3 and PyPy but Cython can use them.
-PyAPI_FUNC(void) PyErr_GetExcInfo(PyObject **ptype, PyObject **pvalue, PyObject **ptraceback) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyErr_SetExcInfo(PyObject *type, PyObject *value, PyObject *traceback) PYSTON_NOEXCEPT;
+/* Defined in Python/pylifecycle.c */
+PyAPI_FUNC(void) _Py_NO_RETURN Py_FatalError(const char *message) PYSTON_NOEXCEPT;
 
-#ifdef Py_DEBUG
+#if defined(Py_DEBUG) || defined(Py_LIMITED_API)
 #define _PyErr_OCCURRED() PyErr_Occurred()
 #else
-#define _PyErr_OCCURRED() (_PyThreadState_Current->curexc_type)
+#define _PyErr_OCCURRED() (PyThreadState_GET()->curexc_type)
 #endif
 
 /* Error testing and normalization */
@@ -110,54 +37,54 @@ PyAPI_FUNC(int) PyErr_GivenExceptionMatches(PyObject *, PyObject *) PYSTON_NOEXC
 PyAPI_FUNC(int) PyErr_ExceptionMatches(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyErr_NormalizeException(PyObject**, PyObject**, PyObject**) PYSTON_NOEXCEPT;
 
+/* Traceback manipulation (PEP 3134) */
+PyAPI_FUNC(int) PyException_SetTraceback(PyObject *, PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyException_GetTraceback(PyObject *) PYSTON_NOEXCEPT;
+
+/* Cause manipulation (PEP 3134) */
+PyAPI_FUNC(PyObject *) PyException_GetCause(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyException_SetCause(PyObject *, PyObject *) PYSTON_NOEXCEPT;
+
+/* Context manipulation (PEP 3134) */
+PyAPI_FUNC(PyObject *) PyException_GetContext(PyObject *) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyException_SetContext(PyObject *, PyObject *) PYSTON_NOEXCEPT;
+
 /* */
 
 #define PyExceptionClass_Check(x)                                       \
-    (PyClass_Check((x)) || (PyType_Check((x)) &&                        \
-      PyType_FastSubclass((PyTypeObject*)(x), Py_TPFLAGS_BASE_EXC_SUBCLASS)))
+    (PyType_Check((x)) &&                                               \
+     PyType_FastSubclass((PyTypeObject*)(x), Py_TPFLAGS_BASE_EXC_SUBCLASS))
 
 #define PyExceptionInstance_Check(x)                    \
-    (PyInstance_Check((x)) ||                           \
-     PyType_FastSubclass(Py_TYPE(x), Py_TPFLAGS_BASE_EXC_SUBCLASS))
+    PyType_FastSubclass(Py_TYPE(x), Py_TPFLAGS_BASE_EXC_SUBCLASS)
 
-// Pyston change: made these function calls for now
-#if 0
-#define PyExceptionClass_Name(x)                                   \
-    (PyClass_Check((x))                                            \
-     ? PyString_AS_STRING(((PyClassObject*)(x))->cl_name)          \
-     : (char *)(((PyTypeObject*)(x))->tp_name))
+PyAPI_FUNC(const char *) PyExceptionClass_Name(PyObject *) PYSTON_NOEXCEPT;
 
-#define PyExceptionInstance_Class(x)                                    \
-    ((PyInstance_Check((x))                                             \
-      ? (PyObject*)((PyInstanceObject*)(x))->in_class                   \
-      : (PyObject*)((x)->ob_type)))
-#endif
-// (We might have to make these wrapper macros that do appropriate casting to PyObject)
-PyAPI_FUNC(const char*) PyExceptionClass_Name(PyObject*) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject*) PyExceptionInstance_Class(PyObject*) PYSTON_NOEXCEPT;
+#define PyExceptionInstance_Class(x) ((PyObject*)Py_TYPE(x))
+
 
 /* Predefined exceptions */
 
-// Pyston change: make these just expand to casts around our internal types, which are declared
-// as PyTypeObject's.
-// TODO not sure if this is worth it -- a fair amount of confusion (duplicating these names) for fairly
-// little gain (getting to treat them as PyTypeObject's and using our own names)
 PyAPI_DATA(PyObject *) PyExc_BaseException;
 PyAPI_DATA(PyObject *) PyExc_Exception;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03050000
+PyAPI_DATA(PyObject *) PyExc_StopAsyncIteration;
+#endif
 PyAPI_DATA(PyObject *) PyExc_StopIteration;
 PyAPI_DATA(PyObject *) PyExc_GeneratorExit;
-PyAPI_DATA(PyObject *) PyExc_StandardError;
 PyAPI_DATA(PyObject *) PyExc_ArithmeticError;
 PyAPI_DATA(PyObject *) PyExc_LookupError;
 
 PyAPI_DATA(PyObject *) PyExc_AssertionError;
 PyAPI_DATA(PyObject *) PyExc_AttributeError;
+PyAPI_DATA(PyObject *) PyExc_BufferError;
 PyAPI_DATA(PyObject *) PyExc_EOFError;
 PyAPI_DATA(PyObject *) PyExc_FloatingPointError;
-PyAPI_DATA(PyObject *) PyExc_EnvironmentError;
-PyAPI_DATA(PyObject *) PyExc_IOError;
 PyAPI_DATA(PyObject *) PyExc_OSError;
 PyAPI_DATA(PyObject *) PyExc_ImportError;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03060000
+PyAPI_DATA(PyObject *) PyExc_ModuleNotFoundError;
+#endif
 PyAPI_DATA(PyObject *) PyExc_IndexError;
 PyAPI_DATA(PyObject *) PyExc_KeyError;
 PyAPI_DATA(PyObject *) PyExc_KeyboardInterrupt;
@@ -165,6 +92,9 @@ PyAPI_DATA(PyObject *) PyExc_MemoryError;
 PyAPI_DATA(PyObject *) PyExc_NameError;
 PyAPI_DATA(PyObject *) PyExc_OverflowError;
 PyAPI_DATA(PyObject *) PyExc_RuntimeError;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03050000
+PyAPI_DATA(PyObject *) PyExc_RecursionError;
+#endif
 PyAPI_DATA(PyObject *) PyExc_NotImplementedError;
 PyAPI_DATA(PyObject *) PyExc_SyntaxError;
 PyAPI_DATA(PyObject *) PyExc_IndentationError;
@@ -180,18 +110,32 @@ PyAPI_DATA(PyObject *) PyExc_UnicodeDecodeError;
 PyAPI_DATA(PyObject *) PyExc_UnicodeTranslateError;
 PyAPI_DATA(PyObject *) PyExc_ValueError;
 PyAPI_DATA(PyObject *) PyExc_ZeroDivisionError;
+
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03030000
+PyAPI_DATA(PyObject *) PyExc_BlockingIOError;
+PyAPI_DATA(PyObject *) PyExc_BrokenPipeError;
+PyAPI_DATA(PyObject *) PyExc_ChildProcessError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionAbortedError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionRefusedError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionResetError;
+PyAPI_DATA(PyObject *) PyExc_FileExistsError;
+PyAPI_DATA(PyObject *) PyExc_FileNotFoundError;
+PyAPI_DATA(PyObject *) PyExc_InterruptedError;
+PyAPI_DATA(PyObject *) PyExc_IsADirectoryError;
+PyAPI_DATA(PyObject *) PyExc_NotADirectoryError;
+PyAPI_DATA(PyObject *) PyExc_PermissionError;
+PyAPI_DATA(PyObject *) PyExc_ProcessLookupError;
+PyAPI_DATA(PyObject *) PyExc_TimeoutError;
+#endif
+
+
+/* Compatibility aliases */
+PyAPI_DATA(PyObject *) PyExc_EnvironmentError;
+PyAPI_DATA(PyObject *) PyExc_IOError;
 #ifdef MS_WINDOWS
 PyAPI_DATA(PyObject *) PyExc_WindowsError;
 #endif
-#ifdef __VMS
-PyAPI_DATA(PyObject *) PyExc_VMSError;
-#endif
-
-PyAPI_DATA(PyObject *) PyExc_BufferError;
-
-PyAPI_DATA(PyObject *) PyExc_MemoryErrorInst;
-PyAPI_DATA(PyObject *) PyExc_RecursionErrorInst;
-
 
 /* Predefined warning categories */
 PyAPI_DATA(PyObject *) PyExc_Warning;
@@ -204,6 +148,8 @@ PyAPI_DATA(PyObject *) PyExc_FutureWarning;
 PyAPI_DATA(PyObject *) PyExc_ImportWarning;
 PyAPI_DATA(PyObject *) PyExc_UnicodeWarning;
 PyAPI_DATA(PyObject *) PyExc_BytesWarning;
+PyAPI_DATA(PyObject *) PyExc_ResourceWarning;
+
 
 /* Convenience functions */
 
@@ -212,48 +158,62 @@ PyAPI_FUNC(PyObject *) PyErr_NoMemory(void) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyErr_SetFromErrno(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilenameObject(
     PyObject *, PyObject *) PYSTON_NOEXCEPT;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03040000
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilenameObjects(
+    PyObject *, PyObject *, PyObject *) PYSTON_NOEXCEPT;
+#endif
 PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilename(
-    PyObject *, const char *) PYSTON_NOEXCEPT;
-#ifdef MS_WINDOWS
-PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithUnicodeFilename(
-    PyObject *, const Py_UNICODE *) PYSTON_NOEXCEPT;
-#endif /* MS_WINDOWS */
+    PyObject *exc,
+    const char *filename   /* decoded from the filesystem encoding */
+    ) PYSTON_NOEXCEPT;
 
-// This actually always returns NULL:
-PyAPI_FUNC(BORROWED(PyObject *)) PyErr_Format(PyObject *, const char *, ...)
-                        PYSTON_NOEXCEPT Py_GCC_ATTRIBUTE((format(printf, 2, 3)));
+PyAPI_FUNC(PyObject *) PyErr_Format(
+    PyObject *exception,
+    const char *format,   /* ASCII-encoded string  */
+    ...
+    ) PYSTON_NOEXCEPT;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03050000
+PyAPI_FUNC(PyObject *) PyErr_FormatV(
+    PyObject *exception,
+    const char *format,
+    va_list vargs) PYSTON_NOEXCEPT;
+#endif
 
 #ifdef MS_WINDOWS
-PyAPI_FUNC(PyObject *) PyErr_SetFromWindowsErrWithFilenameObject(
-    int, const char *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyErr_SetFromWindowsErrWithFilename(
-    int, const char *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PyErr_SetFromWindowsErrWithUnicodeFilename(
-    int, const Py_UNICODE *) PYSTON_NOEXCEPT;
+    int ierr,
+    const char *filename        /* decoded from the filesystem encoding */
+    ) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyErr_SetFromWindowsErr(int) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyErr_SetExcFromWindowsErrWithFilenameObject(
     PyObject *,int, PyObject *) PYSTON_NOEXCEPT;
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03040000
+PyAPI_FUNC(PyObject *) PyErr_SetExcFromWindowsErrWithFilenameObjects(
+    PyObject *,int, PyObject *, PyObject *) PYSTON_NOEXCEPT;
+#endif
 PyAPI_FUNC(PyObject *) PyErr_SetExcFromWindowsErrWithFilename(
-    PyObject *,int, const char *) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PyErr_SetExcFromWindowsErrWithUnicodeFilename(
-    PyObject *,int, const Py_UNICODE *) PYSTON_NOEXCEPT;
+    PyObject *exc,
+    int ierr,
+    const char *filename        /* decoded from the filesystem encoding */
+    ) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyErr_SetExcFromWindowsErr(PyObject *, int) PYSTON_NOEXCEPT;
 #endif /* MS_WINDOWS */
 
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03060000
+PyAPI_FUNC(PyObject *) PyErr_SetImportErrorSubclass(PyObject *, PyObject *,
+    PyObject *, PyObject *) PYSTON_NOEXCEPT;
+#endif
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API+0 >= 0x03030000
+PyAPI_FUNC(PyObject *) PyErr_SetImportError(PyObject *, PyObject *,
+    PyObject *) PYSTON_NOEXCEPT;
+#endif
+
 /* Export the old function so that the existing API remains available: */
 PyAPI_FUNC(void) PyErr_BadInternalCall(void) PYSTON_NOEXCEPT;
-// Pyston change: changed this from char* to const char*
 PyAPI_FUNC(void) _PyErr_BadInternalCall(const char *filename, int lineno) PYSTON_NOEXCEPT;
 /* Mask the old API with a call to the new API for code compiled under
    Python 2.0: */
 #define PyErr_BadInternalCall() _PyErr_BadInternalCall(__FILE__, __LINE__)
-
-/* Function to create a new exception */
-PyAPI_FUNC(PyObject *) PyErr_NewException(
-    const char *name, PyObject *base, PyObject *dict) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PyErr_NewExceptionWithDoc(
-    char *name, char *doc, PyObject *base, PyObject *dict) PYSTON_NOEXCEPT;
-PyAPI_FUNC(void) PyErr_WriteUnraisable(PyObject *) PYSTON_NOEXCEPT;
 
 // Pyston addition: allocate + initialize an instance of type `type`.
 // arg represents the single value that will be passed to the constructor;
@@ -263,32 +223,42 @@ PyAPI_FUNC(void) PyErr_WriteUnraisable(PyObject *) PYSTON_NOEXCEPT;
 // PyObject_Call(type, PyTuple_Pack(1, arg), NULL)
 PyAPI_FUNC(PyObject *) PyErr_CreateExceptionInstance(PyObject* type, PyObject* arg) PYSTON_NOEXCEPT;
 
-/* In sigcheck.c or signalmodule.c */
+/* Function to create a new exception */
+PyAPI_FUNC(PyObject *) PyErr_NewException(
+    const char *name, PyObject *base, PyObject *dict) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyErr_NewExceptionWithDoc(
+    const char *name, const char *doc, PyObject *base, PyObject *dict) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyErr_WriteUnraisable(PyObject *) PYSTON_NOEXCEPT;
+
+
+/* In signalmodule.c */
 PyAPI_FUNC(int) PyErr_CheckSignals(void) PYSTON_NOEXCEPT;
 PyAPI_FUNC(void) PyErr_SetInterrupt(void) PYSTON_NOEXCEPT;
 
-/* In signalmodule.c */
-int PySignal_SetWakeupFd(int fd);
-
 /* Support for adding program text to SyntaxErrors */
-PyAPI_FUNC(void) PyErr_SyntaxLocation(const char *, int) PYSTON_NOEXCEPT;
-PyAPI_FUNC(PyObject *) PyErr_ProgramText(const char *, int) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyErr_SyntaxLocation(
+    const char *filename,       /* decoded from the filesystem encoding */
+    int lineno) PYSTON_NOEXCEPT;
+PyAPI_FUNC(void) PyErr_SyntaxLocationEx(
+    const char *filename,       /* decoded from the filesystem encoding */
+    int lineno,
+    int col_offset) PYSTON_NOEXCEPT;
+PyAPI_FUNC(PyObject *) PyErr_ProgramText(
+    const char *filename,       /* decoded from the filesystem encoding */
+    int lineno) PYSTON_NOEXCEPT;
 
-#ifdef Py_USING_UNICODE
 /* The following functions are used to create and modify unicode
    exceptions from C */
 
 /* create a UnicodeDecodeError object */
 PyAPI_FUNC(PyObject *) PyUnicodeDecodeError_Create(
-    const char *, const char *, Py_ssize_t, Py_ssize_t, Py_ssize_t, const char *) PYSTON_NOEXCEPT;
-
-/* create a UnicodeEncodeError object */
-PyAPI_FUNC(PyObject *) PyUnicodeEncodeError_Create(
-    const char *, const Py_UNICODE *, Py_ssize_t, Py_ssize_t, Py_ssize_t, const char *) PYSTON_NOEXCEPT;
-
-/* create a UnicodeTranslateError object */
-PyAPI_FUNC(PyObject *) PyUnicodeTranslateError_Create(
-    const Py_UNICODE *, Py_ssize_t, Py_ssize_t, Py_ssize_t, const char *) PYSTON_NOEXCEPT;
+    const char *encoding,       /* UTF-8 encoded string */
+    const char *object,
+    Py_ssize_t length,
+    Py_ssize_t start,
+    Py_ssize_t end,
+    const char *reason          /* UTF-8 encoded string */
+    ) PYSTON_NOEXCEPT;
 
 /* get the encoding attribute */
 PyAPI_FUNC(PyObject *) PyUnicodeEncodeError_GetEncoding(PyObject *) PYSTON_NOEXCEPT;
@@ -331,13 +301,17 @@ PyAPI_FUNC(PyObject *) PyUnicodeTranslateError_GetReason(PyObject *) PYSTON_NOEX
 /* assign a new value to the reason attribute
    return 0 on success, -1 on failure */
 PyAPI_FUNC(int) PyUnicodeEncodeError_SetReason(
-    PyObject *, const char *) PYSTON_NOEXCEPT;
+    PyObject *exc,
+    const char *reason          /* UTF-8 encoded string */
+    ) PYSTON_NOEXCEPT;
 PyAPI_FUNC(int) PyUnicodeDecodeError_SetReason(
-    PyObject *, const char *) PYSTON_NOEXCEPT;
+    PyObject *exc,
+    const char *reason          /* UTF-8 encoded string */
+    ) PYSTON_NOEXCEPT;
 PyAPI_FUNC(int) PyUnicodeTranslateError_SetReason(
-    PyObject *, const char *) PYSTON_NOEXCEPT;
-#endif
-
+    PyObject *exc,
+    const char *reason          /* UTF-8 encoded string */
+    ) PYSTON_NOEXCEPT;
 
 /* These APIs aren't really part of the error implementation, but
    often needed to format error messages; the native C lib APIs are
@@ -354,10 +328,16 @@ PyAPI_FUNC(int) PyUnicodeTranslateError_SetReason(
 #endif
 
 #include <stdarg.h>
-PyAPI_FUNC(int) PyOS_snprintf(char *str, size_t size, const char  *format, ...)
-                        PYSTON_NOEXCEPT Py_GCC_ATTRIBUTE((format(printf, 3, 4)));
-PyAPI_FUNC(int) PyOS_vsnprintf(char *str, size_t size, const char  *format, va_list va)
-                        PYSTON_NOEXCEPT Py_GCC_ATTRIBUTE((format(printf, 3, 0)));
+PyAPI_FUNC(int) PyOS_snprintf(char *str, size_t size, const char  *format, ...) PYSTON_NOEXCEPT
+                        Py_GCC_ATTRIBUTE((format(printf, 3, 4)));
+PyAPI_FUNC(int) PyOS_vsnprintf(char *str, size_t size, const char  *format, va_list va) PYSTON_NOEXCEPT
+                        Py_GCC_ATTRIBUTE((format(printf, 3, 0)));
+
+#ifndef Py_LIMITED_API
+#  define Py_CPYTHON_ERRORS_H
+#  include  "cpython/pyerrors.h"
+#  undef Py_CPYTHON_ERRORS_H
+#endif
 
 #ifdef __cplusplus
 }

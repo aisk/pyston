@@ -1,4 +1,4 @@
-// This file is originally from CPython 2.7, with modifications for Pyston
+// This file is originally from CPython 3.8, with modifications for Pyston
 
 /* Descriptors */
 #ifndef Py_DESCROBJECT_H
@@ -18,6 +18,7 @@ typedef struct PyGetSetDef {
     void *closure;
 } PyGetSetDef;
 
+#ifndef Py_LIMITED_API
 typedef PyObject *(*wrapperfunc)(PyObject *self, PyObject *args,
                                  void *wrapped);
 
@@ -40,6 +41,7 @@ struct wrapperbase {
 
 /* Flags for above struct */
 #define PyWrapperFlag_KEYWORDS 1 /* wrapper function takes keyword args */
+// Pyston additions:
 #define PyWrapperFlag_PYSTON   2 /* wrapper function is a Pyston function */
 #define PyWrapperFlag_BOOL     4 /* not really a wrapper, just set a bool field */
 #define PyWrapperFlag_1ARG     8 /* wrapper function takes 1 argument */
@@ -47,18 +49,22 @@ struct wrapperbase {
 
 /* Various kinds of descriptor objects */
 
-#define PyDescr_COMMON \
-    PyObject_HEAD \
-    PyTypeObject *d_type; \
-    PyObject *d_name
-
 typedef struct {
-    PyDescr_COMMON;
+    PyObject_HEAD
+    PyTypeObject *d_type;
+    PyObject *d_name;
+    PyObject *d_qualname;
 } PyDescrObject;
+
+#define PyDescr_COMMON PyDescrObject d_common
+
+#define PyDescr_TYPE(x) (((PyDescrObject *)(x))->d_type)
+#define PyDescr_NAME(x) (((PyDescrObject *)(x))->d_name)
 
 typedef struct {
     PyDescr_COMMON;
     PyMethodDef *d_method;
+    vectorcallfunc vectorcall;
 } PyMethodDescrObject;
 
 typedef struct {
@@ -76,21 +82,30 @@ typedef struct {
     struct wrapperbase *d_base;
     void *d_wrapped; /* This can be any function pointer */
 } PyWrapperDescrObject;
+#endif /* Py_LIMITED_API */
 
-PyAPI_DATA(PyTypeObject) PyWrapperDescr_Type;
-PyAPI_DATA(PyTypeObject) PyDictProxy_Type;
+PyAPI_DATA(PyTypeObject) PyClassMethodDescr_Type;
 PyAPI_DATA(PyTypeObject) PyGetSetDescr_Type;
 PyAPI_DATA(PyTypeObject) PyMemberDescr_Type;
+PyAPI_DATA(PyTypeObject) PyMethodDescr_Type;
+PyAPI_DATA(PyTypeObject) PyWrapperDescr_Type;
+PyAPI_DATA(PyTypeObject) PyDictProxy_Type;
+#ifndef Py_LIMITED_API
+PyAPI_DATA(PyTypeObject) _PyMethodWrapper_Type;
+#endif /* Py_LIMITED_API */
 
 PyAPI_FUNC(PyObject *) PyDescr_NewMethod(PyTypeObject *, PyMethodDef *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyDescr_NewClassMethod(PyTypeObject *, PyMethodDef *) PYSTON_NOEXCEPT;
+struct PyMemberDef; /* forward declaration for following prototype */
 PyAPI_FUNC(PyObject *) PyDescr_NewMember(PyTypeObject *,
                                                struct PyMemberDef *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyDescr_NewGetSet(PyTypeObject *,
                                                struct PyGetSetDef *) PYSTON_NOEXCEPT;
+#ifndef Py_LIMITED_API
 PyAPI_FUNC(PyObject *) PyDescr_NewWrapper(PyTypeObject *,
                                                 struct wrapperbase *, void *) PYSTON_NOEXCEPT;
 #define PyDescr_IsData(d) (Py_TYPE(d)->tp_descr_set != NULL)
+#endif
 
 PyAPI_FUNC(PyObject *) PyDictProxy_New(PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(PyObject *) PyWrapper_New(PyObject *, PyObject *) PYSTON_NOEXCEPT;
@@ -98,16 +113,14 @@ PyAPI_FUNC(PyObject *) PyWrapper_New(PyObject *, PyObject *) PYSTON_NOEXCEPT;
 
 PyAPI_DATA(PyTypeObject) PyProperty_Type;
 
-// Pyston change: exposed these
+#ifndef Py_LIMITED_API
+// Pyston change: exposed this
 typedef struct {
     PyObject_HEAD
     PyWrapperDescrObject *descr;
     PyObject *self;
 } wrapperobject;
-PyAPI_DATA(PyTypeObject) wrappertype;
-PyAPI_DATA(PyTypeObject) PyMethodDescr_Type;
-PyAPI_DATA(PyTypeObject) PyClassMethodDescr_Type;
-
+#endif
 #ifdef __cplusplus
 }
 #endif
