@@ -136,9 +136,9 @@ template <class V> class ValuedCompilerType;
 typedef ValuedCompilerType<llvm::Value*> ConcreteCompilerType;
 ConcreteCompilerType* typeFromClass(BoxedClass*);
 
-extern ConcreteCompilerType* UNBOXED_INT, *BOXED_INT, *LONG, *UNBOXED_FLOAT, *BOXED_FLOAT, *UNKNOWN, *BOOL, *STR, *NONE,
-    *LIST, *SLICE, *MODULE, *DICT, *BOOL, *BOXED_BOOL, *BOXED_TUPLE, *SET, *FROZENSET, *CLOSURE, *GENERATOR,
-    *BOXED_COMPLEX, *FRAME_INFO;
+extern ConcreteCompilerType *UNBOXED_INT, *UNBOXED_INT_PHI, *UNBOXED_FLOAT_PHI, *BOXED_INT, *LONG, *UNBOXED_FLOAT,
+    *BOXED_FLOAT, *UNKNOWN, *BOOL, *STR, *NONE, *LIST, *SLICE, *MODULE, *DICT, *BOOL, *BOXED_BOOL, *BOXED_TUPLE, *SET,
+    *FROZENSET, *CLOSURE, *GENERATOR, *BOXED_COMPLEX, *FRAME_INFO;
 extern CompilerType* UNDEF, *INT, *FLOAT, *UNBOXED_SLICE;
 
 // CompilerVariables are the way that the LLVM JIT tracks variables, which are a CompilerType combined with some sort

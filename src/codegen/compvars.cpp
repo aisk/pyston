@@ -1020,10 +1020,14 @@ public:
         return rtn;
     }
 
-    ConcreteCompilerType* getConcreteType() override final { return this->getBoxType(); }
+    // The type used to carry the value across blocks. Defaults to the boxed form.
+    ConcreteCompilerType* _phiType() { return this->getBoxType(); }
+
+    ConcreteCompilerType* getConcreteType() override final { return static_cast<D*>(this)->_phiType(); }
 
     bool canConvertTo(CompilerType* other_type) override final {
-        return (other_type == this || other_type == UNKNOWN || other_type == this->getBoxType());
+        return (other_type == this || other_type == UNKNOWN || other_type == this->getBoxType()
+                || other_type == static_cast<D*>(this)->_phiType());
     }
 
     ConcreteCompilerVariable* makeConverted(IREmitter& emitter, VAR* var,
@@ -1031,6 +1035,10 @@ public:
         assert(canConvertTo(other_type));
 
         auto val = var->getValue();
+        if constexpr (std::is_same<T, llvm::Value*>::value) {
+            if (other_type != this->getBoxType() && other_type == static_cast<D*>(this)->_phiType())
+                return new ConcreteCompilerVariable(other_type, val->val);
+        }
         ConcreteCompilerVariable* boxed = val->boxed;
 
         if (!boxed) {
@@ -1143,7 +1151,7 @@ public:
         }
 
         // we can handle those operations when the rhs is a float
-        if (attr->s() == "__add__" || attr->s() == "__sub__" || attr->s() == "__mul__" || attr->s() == "__div__"
+        if (attr->s() == "__add__" || attr->s() == "__sub__" || attr->s() == "__mul__" || attr->s() == "__truediv__"
             || attr->s() == "__pow__" || attr->s() == "__floordiv__" || attr->s() == "__mod__"
             || attr->s() == "__pow__") {
             return AbstractFunctionType::get(sigs);
@@ -1233,6 +1241,11 @@ public:
 
     CompilerVariable* binexp(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* rhs,
                              AST_TYPE::AST_TYPE op_type, BinExpType exp_type) override {
+        if (rhs->getType() == INT && (exp_type == BinOp || exp_type == AugBinOp)) {
+            if (CompilerVariable* r = lowerArith(emitter, info, var, static_cast<VAR*>(rhs), op_type, exp_type))
+                return r;
+        }
+
         bool can_lower = (rhs->getType() == INT && exp_type == Compare);
         if (!can_lower) {
             // if the rhs is a float convert the lhs to a float and do the operation on it.
@@ -1331,6 +1344,62 @@ public:
         return boolFromI1(emitter, v);
     }
 
+    // Emits the operation on the i64 values. On overflow the boxed operation computes the (long)
+    // result and we deopt with it, so the INT result stays exact.
+    static CompilerVariable* lowerArith(IREmitter& emitter, const OpInfo& info, VAR* var, VAR* rhs,
+                                        AST_TYPE::AST_TYPE op_type, BinExpType exp_type) {
+        auto* b = emitter.getBuilder();
+        llvm::Value* l = var->getValue()->val;
+        llvm::Value* r = rhs->getValue()->val;
+
+        llvm::Intrinsic::ID ovf_id;
+        switch (op_type) {
+            case AST_TYPE::BitAnd:
+                return makeInt(b->CreateAnd(l, r));
+            case AST_TYPE::BitOr:
+                return makeInt(b->CreateOr(l, r));
+            case AST_TYPE::BitXor:
+                return makeInt(b->CreateXor(l, r));
+            case AST_TYPE::Add:
+                ovf_id = llvm::Intrinsic::sadd_with_overflow;
+                break;
+            case AST_TYPE::Sub:
+                ovf_id = llvm::Intrinsic::ssub_with_overflow;
+                break;
+            case AST_TYPE::Mult:
+                ovf_id = llvm::Intrinsic::smul_with_overflow;
+                break;
+            default:
+                return NULL;
+        }
+
+        llvm::Value* res = b->CreateBinaryIntrinsic(ovf_id, l, r);
+        llvm::Value* val = b->CreateExtractValue(res, 0);
+        llvm::Value* ovf = b->CreateExtractValue(res, 1);
+
+        llvm::BasicBlock* ok_bb = emitter.createBasicBlock("int_ok");
+        llvm::BasicBlock* ovf_bb = emitter.createBasicBlock("int_overflow");
+        llvm::Metadata* md_vals[]
+            = { llvm::MDString::get(g.context, "branch_weights"), llvm::ConstantAsMetadata::get(getConstantInt(1)),
+                llvm::ConstantAsMetadata::get(getConstantInt(1000)) };
+        b->CreateCondBr(ovf, ovf_bb, ok_bb, llvm::MDNode::get(g.context, md_vals));
+
+        emitter.setCurrentBasicBlock(ovf_bb);
+        // Box fresh copies here: the cached boxed values of the operands must not be defined in this block.
+        ConcreteCompilerVariable* bl = new ConcreteCompilerVariable(
+            BOXED_INT, emitter.setType(b->CreateCall(g.funcs.boxInt, l), RefType::OWNED));
+        ConcreteCompilerVariable* br = new ConcreteCompilerVariable(
+            BOXED_INT, emitter.setType(b->CreateCall(g.funcs.boxInt, r), RefType::OWNED));
+        CompilerVariable* slow = bl->binexp(emitter, info, br, op_type, exp_type);
+        ConcreteCompilerVariable* slow_boxed = slow->makeConverted(emitter, UNKNOWN);
+        llvm::Value* deopt_val = emitter.createDeopt(info.unw_info.current_stmt, slow_boxed->getValue());
+        llvm::Instruction* ret = emitter.getBuilder()->CreateRet(deopt_val);
+        emitter.refConsumed(deopt_val, ret);
+
+        emitter.setCurrentBasicBlock(ok_bb);
+        return makeInt(val);
+    }
+
     CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
         llvm::CallBase* call
             = emitter.createCall(info.unw_info, g.funcs.raiseNotIterableError, embedConstantPtr("int", g.i8_ptr));
@@ -1339,6 +1408,7 @@ public:
     }
 
     ConcreteCompilerType* getBoxType() override { return BOXED_INT; }
+    ConcreteCompilerType* _phiType() { return UNBOXED_INT_PHI; }
 
     int _numFrameArgs() { return 1; }
 
@@ -1418,13 +1488,13 @@ public:
             sigs.push_back(unknown_sig);
         }
 
-        if (attr->s() == "__add__" || attr->s() == "__sub__" || attr->s() == "__mul__" || attr->s() == "__div__"
+        if (attr->s() == "__add__" || attr->s() == "__sub__" || attr->s() == "__mul__" || attr->s() == "__truediv__"
             || attr->s() == "__pow__" || attr->s() == "__floordiv__" || attr->s() == "__mod__"
             || attr->s() == "__pow__") {
             return AbstractFunctionType::get(sigs);
         }
 
-        if (attr->s() == "__iadd__" || attr->s() == "__isub__" || attr->s() == "__imul__" || attr->s() == "__idiv__"
+        if (attr->s() == "__iadd__" || attr->s() == "__isub__" || attr->s() == "__imul__" || attr->s() == "__itruediv__"
             || attr->s() == "__ipow__" || attr->s() == "__ifloordiv__" || attr->s() == "__imod__"
             || attr->s() == "__ipow__") {
             return AbstractFunctionType::get(sigs);
@@ -1612,6 +1682,7 @@ public:
     }
 
     ConcreteCompilerType* getBoxType() override { return BOXED_FLOAT; }
+    ConcreteCompilerType* _phiType() { return UNBOXED_FLOAT_PHI; }
 
     int _numFrameArgs() { return 1; }
 
@@ -1643,6 +1714,55 @@ public:
 
     Box* deserializeFromFrame(const FrameVals& vals) override { RELEASE_ASSERT(0, "unavailable for phony types"); }
 };
+
+// The raw value of an INT or FLOAT variable carried across blocks. Values of these types only live
+// in phis: the irgenerator turns them back into INT or FLOAT variables when it receives them.
+class UnboxedPhiType : public ConcreteCompilerType {
+private:
+    bool is_float;
+
+public:
+    UnboxedPhiType(bool is_float) : is_float(is_float) {}
+
+    std::string debugName() override { return is_float ? "unboxed_float_phi" : "unboxed_int_phi"; }
+    llvm::Type* llvmType() override { return is_float ? g.double_ : g.i64; }
+    ConcreteCompilerType* getBoxType() override { return is_float ? BOXED_FLOAT : BOXED_INT; }
+    bool isFitBy(BoxedClass* c) override { return false; }
+
+    CompilerVariable* makeUnboxed(llvm::Value* v) { return is_float ? makeFloat(v) : makeInt(v); }
+
+    bool canConvertTo(CompilerType* other_type) override {
+        return other_type == this || other_type == (is_float ? FLOAT : INT) || other_type == getBoxType()
+               || other_type == UNKNOWN;
+    }
+
+    ConcreteCompilerVariable* makeConverted(IREmitter& emitter, ConcreteCompilerVariable* var,
+                                            ConcreteCompilerType* other_type) override {
+        if (other_type == this)
+            return new ConcreteCompilerVariable(this, var->getValue());
+        return makeUnboxed(var->getValue())->makeConverted(emitter, other_type);
+    }
+
+    int numFrameArgs() override { return 1; }
+    void serializeToFrame(ConcreteCompilerVariable* var, std::vector<llvm::Value*>& stackmap_args) override {
+        stackmap_args.push_back(var->getValue());
+    }
+    Box* deserializeFromFrame(const FrameVals& vals) override {
+        if (is_float) {
+            double d;
+            static_assert(sizeof(d) == sizeof(vals[0]), "");
+            memcpy(&d, &vals[0], sizeof(d));
+            return boxFloat(d);
+        }
+        return boxInt(vals[0]);
+    }
+};
+ConcreteCompilerType* UNBOXED_INT_PHI = new UnboxedPhiType(false);
+ConcreteCompilerType* UNBOXED_FLOAT_PHI = new UnboxedPhiType(true);
+
+CompilerVariable* makeUnboxedFromPhi(ConcreteCompilerVariable* v) {
+    return static_cast<UnboxedPhiType*>(v->getType())->makeUnboxed(v->getValue());
+}
 
 ConcreteCompilerType* UNBOXED_INT = new PhonyUnboxedType(llvm::Type::getInt64Ty(getGlobalLLVMContext()), INT);
 ConcreteCompilerType* UNBOXED_FLOAT = new PhonyUnboxedType(llvm::Type::getDoubleTy(getGlobalLLVMContext()), FLOAT);

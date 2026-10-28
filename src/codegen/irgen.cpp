@@ -385,6 +385,10 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
             if (p.second == phi_type) {
                 // good to go
                 v = from_arg;
+            } else if (p.second == BOXED_INT && phi_type == UNBOXED_INT_PHI) {
+                v = unbox_emitter->getBuilder()->CreateCall(g.funcs.unboxInt, from_arg);
+            } else if (p.second == BOXED_FLOAT && phi_type == UNBOXED_FLOAT_PHI) {
+                v = unbox_emitter->getBuilder()->CreateCall(g.funcs.unboxFloat, from_arg);
             } else if (p.second->canConvertTo(phi_type)) {
                 // not sure if/when this happens, but if there's a type mismatch but one we know
                 // can be handled (such as casting from a subclass to a superclass), handle it:
