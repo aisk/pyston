@@ -3022,7 +3022,25 @@ public:
         // We need to setup frame introspection by updating the current stmt because we can run can run arbitrary code
         // like finalizers inside allowGLReadPreemption.
         emitter.emitSetCurrentStmt(next_statement);
-        emitter.getBuilder()->CreateCall(g.funcs.allowGLReadPreemption);
+
+        // Inline allowGLReadPreemption's fast path: only call it when some thread waits on the GIL.
+        auto* b = emitter.getBuilder();
+        llvm::Value* waiting_ptr
+            = b->CreateIntToPtr(getConstantInt((intptr_t)&threading::threads_waiting_on_gil, g.i64), g.i8_ptr);
+        llvm::LoadInst* waiting = b->CreateLoad(g.i32, waiting_ptr);
+        waiting->setAtomic(llvm::AtomicOrdering::Monotonic);
+        waiting->setAlignment(llvm::Align(4));
+        llvm::BasicBlock* call_bb = emitter.createBasicBlock("gil_waiting");
+        llvm::BasicBlock* cont_bb = emitter.createBasicBlock("gil_continue");
+        llvm::Metadata* md_vals[]
+            = { llvm::MDString::get(g.context, "branch_weights"), llvm::ConstantAsMetadata::get(getConstantInt(1)),
+                llvm::ConstantAsMetadata::get(getConstantInt(1000)) };
+        b->CreateCondBr(b->CreateICmpNE(waiting, getConstantInt(0, g.i32)), call_bb, cont_bb,
+                        llvm::MDNode::get(g.context, md_vals));
+        emitter.setCurrentBasicBlock(call_bb);
+        b->CreateCall(g.funcs.allowGLReadPreemption);
+        b->CreateBr(cont_bb);
+        emitter.setCurrentBasicBlock(cont_bb);
     }
 
     // Create a (or reuse an existing) block that will catch a CAPI exception, and then forward
