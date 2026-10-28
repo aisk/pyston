@@ -5873,22 +5873,6 @@ Box* compareInternal(Box* lhs, Box* rhs, int op_type, CompareRewriteArgs* rewrit
     }
 
     bool any_user_defined = lhs->cls->is_user_defined || rhs->cls->is_user_defined;
-    if (any_user_defined) {
-        rewrite_args = NULL;
-        REWRITE_ABORTED("");
-    }
-
-    // Can do the guard checks after the Is/IsNot handling, since that is
-    // irrespective of the object classes
-    if (rewrite_args) {
-        // TODO probably don't need to guard on the lhs_cls since it
-        // will get checked no matter what, but the check that should be
-        // removed is probably the later one.
-        // ie we should have some way of specifying what we know about the values
-        // of objects and their attributes, and the attributes' attributes.
-        rewrite_args->lhs->addAttrGuard(offsetof(Box, cls), (intptr_t)lhs->cls);
-        rewrite_args->rhs->addAttrGuard(offsetof(Box, cls), (intptr_t)rhs->cls);
-    }
 
     // TODO: switch from our op types to cpythons
     int cpython_op_type;
@@ -5915,13 +5899,40 @@ Box* compareInternal(Box* lhs, Box* rhs, int op_type, CompareRewriteArgs* rewrit
             RELEASE_ASSERT(0, "%d", op_type);
     }
 
-    if (!any_user_defined && lhs->cls == rhs->cls && lhs->cls->tp_richcompare != NULL
+    if (any_user_defined) {
+        // Go through the type slots like CPython does. PyObject_RichCompare handles any argument
+        // types, so the rewrite doesn't need to guard on them.
+        if (rewrite_args) {
+            rewrite_args->out_rtn
+                = rewrite_args->rewriter->call(true, (void*)PyObject_RichCompare, rewrite_args->lhs, rewrite_args->rhs,
+                                               rewrite_args->rewriter->loadConst(cpython_op_type))
+                      ->setType(RefType::OWNED);
+            rewrite_args->rewriter->checkAndThrowCAPIException(rewrite_args->out_rtn);
+            rewrite_args->out_success = true;
+        }
+        Box* r = PyObject_RichCompare(lhs, rhs, cpython_op_type);
+        if (!r)
+            throwCAPIException();
+        return r;
+    }
+
+    // Can do the guard checks after the Is/IsNot handling, since that is
+    // irrespective of the object classes
+    if (rewrite_args) {
+        // TODO probably don't need to guard on the lhs_cls since it
+        // will get checked no matter what, but the check that should be
+        // removed is probably the later one.
+        // ie we should have some way of specifying what we know about the values
+        // of objects and their attributes, and the attributes' attributes.
+        rewrite_args->lhs->addAttrGuard(offsetof(Box, cls), (intptr_t)lhs->cls);
+        rewrite_args->rhs->addAttrGuard(offsetof(Box, cls), (intptr_t)rhs->cls);
+    }
+
+    if (lhs->cls == rhs->cls && lhs->cls->tp_richcompare != NULL
         && lhs->cls->tp_richcompare != slot_tp_richcompare) {
         // This branch is the `v->ob_type == w->ob_type` branch of PyObject_RichCompare, but
         // simplified by using the assumption that tp_richcompare exists and never returns NotImplemented
         // for builtin types when both arguments are the right type.
-
-        assert(!lhs->cls->is_user_defined);
 
         Box* r = lhs->cls->tp_richcompare(lhs, rhs, cpython_op_type);
         if (!r)
