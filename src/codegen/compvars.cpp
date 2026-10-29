@@ -1236,7 +1236,8 @@ public:
         bool can_lower = (rhs->getType() == INT && exp_type == Compare);
         if (!can_lower) {
             // if the rhs is a float convert the lhs to a float and do the operation on it.
-            if (rhs->getType() == FLOAT) {
+            // Comparisons can't do that: int to double conversion loses precision past 2**53.
+            if (rhs->getType() == FLOAT && exp_type != Compare) {
                 if (op_type == AST_TYPE::IsNot || op_type == AST_TYPE::Is)
                     return makeBool(op_type == AST_TYPE::IsNot);
 
@@ -1499,7 +1500,8 @@ public:
                              AST_TYPE::AST_TYPE op_type, BinExpType exp_type) override {
         assert(rhs->getType() != UNBOXED_FLOAT); // we could handle this here but it shouldn't happen
 
-        if (rhs->getType() != INT && rhs->getType() != FLOAT) {
+        if ((rhs->getType() != INT && rhs->getType() != FLOAT) || (rhs->getType() == INT && exp_type == Compare)) {
+            // (An int compared to a float can't be converted to a double: that loses precision past 2**53.)
             ConcreteCompilerVariable* converted = var->makeConverted(emitter, BOXED_FLOAT);
             CompilerVariable* rtn = converted->binexp(emitter, info, rhs, op_type, exp_type);
             return rtn;

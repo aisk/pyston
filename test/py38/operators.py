@@ -89,3 +89,10 @@ for i in range(3000):
         seen.append((explicit(P()), implicit(P()), P().m(), P.__sub__(P(), None)))
         P.__sub__, P.m = old_sub, old_m
 print(len(seen), sum(1 for s in seen if s[0] == 2), sum(1 for s in seen if s[1] == 2), sum(1 for s in seen if s[2] == 2))
+
+# int/float comparisons must be exact past 2**53, also when the JIT knows both types.
+def int_float_compare():
+    x = 9007199254740993
+    y = 9007199254740992.0
+    return x == y, x > y, y == x, y < x, x != y, x >= y, x + 0 == y + 0.0
+print(set(int_float_compare() for i in range(3000)))
