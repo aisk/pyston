@@ -155,7 +155,9 @@ extern "C" Box* deopt(Box* value) {
         deopt_state.frame_state.frame_info->exc.value = NULL;
     }
 
-    return astInterpretDeopt(deopt_state.cf->code_obj, deopt_state.current_stmt, value, deopt_state.frame_state);
+    // The frame can belong to a function that was inlined into deopt_state.cf.
+    return astInterpretDeopt(deopt_state.frame_state.frame_info->code, deopt_state.current_stmt, value,
+                             deopt_state.frame_state);
 }
 
 extern "C" void my_assert(bool b) {

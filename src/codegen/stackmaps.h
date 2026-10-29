@@ -105,6 +105,8 @@ public:
     llvm::DenseMap<int, LocationTable> vars;
     LocationTable generator, passed_closure, created_closure;
     llvm::DenseMap<int, LocationTable> definedness_vars;
+    // The lazy locals of the caller of an inlined function, at the calls of the inlined function.
+    llvm::DenseMap<int, LocationTable> outer_vars, outer_definedness_vars;
 };
 
 std::unique_ptr<StackMap> parseStackMap();

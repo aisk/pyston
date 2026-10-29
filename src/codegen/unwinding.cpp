@@ -310,9 +310,9 @@ public:
     }
 
     BoxedCode* getCode() {
+        // (An LLVM tier frame can be running the code of a function inlined into cf.)
         BoxedCode* code = getFrameInfo()->code;
         assert(code);
-        assert(!cf || cf->code_obj == code);
         return code;
     }
 
@@ -521,15 +521,14 @@ void removeDecrefInfoEntry(uint64_t ip) {
 template <typename Func> void unwindPythonStack(Func func);
 
 // Writes the current values of the lazy locals of an LLVM tier frame (see keepLocalLazy() in irgenerator.cpp) into
-// its vregs, using the locations that the stackmap of the current call records for them.
-static void materializeLazyLocals(PythonFrameIteratorImpl* frame_iter) {
-    if (!ENABLE_LAZY_LOCALS || frame_iter->getId().type != PythonFrameId::COMPILED)
-        return;
-
+// the vregs of frame_info, using the locations that the stackmap of the current call records for them.  These are the
+// locals of the frame itself (vars), or of the caller of the inlined function that the frame runs (outer_vars).
+// Returns whether the stackmap had any.
+static bool writeLazyLocals(PythonFrameIteratorImpl* frame_iter,
+                            const llvm::DenseMap<int, LocationMap::LocationTable>& vars,
+                            const llvm::DenseMap<int, LocationMap::LocationTable>& definedness_vars,
+                            FrameInfo* frame_info) {
     CompiledFunction* cf = frame_iter->getCF();
-    auto&& location_map = cf->location_map;
-    if (!location_map || location_map->vars.empty())
-        return;
     unsigned offset = frame_iter->getId().ip - cf->code_start;
 
     auto read_entry = [&](const LocationMap::LocationTable::LocationEntry* e) {
@@ -539,18 +538,20 @@ static void materializeLazyLocals(PythonFrameIteratorImpl* frame_iter) {
         return e->type->deserializeFromFrame(vals);
     };
 
-    int num_user_visible = cf->code_obj->source->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
-    Box** vregs = frame_iter->getFrameInfo()->vregs;
-    for (const auto& p : location_map->vars) {
+    int num_user_visible = frame_info->code->source->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
+    Box** vregs = frame_info->vregs;
+    bool found = false;
+    for (const auto& p : vars) {
         int vreg = p.first;
         if (vreg >= num_user_visible)
             continue;
         auto e = p.second.findEntry(offset);
         if (!e)
             continue;
+        found = true;
 
-        auto it = location_map->definedness_vars.find(vreg);
-        if (it != location_map->definedness_vars.end()) {
+        auto it = definedness_vars.find(vreg);
+        if (it != definedness_vars.end()) {
             if (auto d = it->second.findEntry(offset)) {
                 Box* is_defined = read_entry(d);
                 AUTO_DECREF(is_defined);
@@ -563,16 +564,44 @@ static void materializeLazyLocals(PythonFrameIteratorImpl* frame_iter) {
         vregs[vreg] = read_entry(e);
         Py_XDECREF(old);
     }
+    return found;
+}
+
+static void materializeLazyLocals(PythonFrameIteratorImpl* frame_iter) {
+    if (!ENABLE_LAZY_LOCALS || frame_iter->getId().type != PythonFrameId::COMPILED)
+        return;
+
+    auto&& location_map = frame_iter->getCF()->location_map;
+    if (!location_map || location_map->vars.empty())
+        return;
+    writeLazyLocals(frame_iter, location_map->vars, location_map->definedness_vars, frame_iter->getFrameInfo());
+}
+
+// The frame of the caller of an inlined function doesn't show up while the inlined function runs, so this writes the
+// caller's lazy locals into frame_info if frame_iter is running a function inlined into it.  Returns whether it was.
+static bool materializeOuterLazyLocals(PythonFrameIteratorImpl* frame_iter, FrameInfo* frame_info) {
+    if (!ENABLE_LAZY_LOCALS || frame_iter->getId().type != PythonFrameId::COMPILED)
+        return false;
+
+    auto&& location_map = frame_iter->getCF()->location_map;
+    if (!location_map || location_map->outer_vars.empty())
+        return false;
+    return writeLazyLocals(frame_iter, location_map->outer_vars, location_map->outer_definedness_vars, frame_info);
 }
 
 void materializeLazyLocals(FrameInfo* frame_info) {
     if (!ENABLE_LAZY_LOCALS)
         return;
     unwindPythonStack([&](PythonFrameIteratorImpl* frame_iter) {
-        if (frame_iter->getFrameInfo() != frame_info)
-            return false;
-        materializeLazyLocals(frame_iter);
-        return true;
+        FrameInfo* iter_frame_info = frame_iter->getFrameInfo();
+        if (iter_frame_info == frame_info) {
+            materializeLazyLocals(frame_iter);
+            return true;
+        }
+        // (Without an inlined function, this can be a call of the same code.)
+        return iter_frame_info->back == frame_info && frame_iter->getId().type == PythonFrameId::COMPILED
+               && frame_iter->getCF()->code_obj == frame_info->code
+               && materializeOuterLazyLocals(frame_iter, frame_info);
     });
 }
 
@@ -972,7 +1001,7 @@ DeoptState getDeoptState() {
             // and assigning them to the new vregs array...
             // But deopts are so rare it's not really worth it.
             Box** vregs = frame_iter->getFrameInfo()->vregs;
-            int num_vregs_user_visible = cf->code_obj->source->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
+            int num_vregs_user_visible = frame_iter->getCode()->source->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
             for (int vreg = 0; vreg < num_vregs_user_visible; ++vreg) {
                 // (A lazy local that isn't defined.)
                 if (is_undefined.count(vreg))
@@ -996,6 +1025,11 @@ DeoptState getDeoptState() {
         } else {
             abort();
         }
+
+        // The interpreter takes over the frame of an inlined function, so its caller's frame won't show up until the
+        // interpreter is done.
+        if (FrameInfo* back = frame_iter->getFrameInfo()->back)
+            materializeOuterLazyLocals(frame_iter, back);
 
         rtn.frame_state = FrameStackState(d, frame_iter->getFrameInfo());
         rtn.cf = cf;

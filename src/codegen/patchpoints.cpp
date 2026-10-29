@@ -74,7 +74,7 @@ bool StackMap::Record::Location::operator==(const StackMap::Record::Location& rh
 }
 
 void PatchpointInfo::parseLocationMap(StackMap::Record* r, LocationMap* map) {
-    if (!this->isDeopt() && frame_info_desc.vars.empty())
+    if (!this->isDeopt() && frame_info_desc.vars.empty() && frame_info_desc.outer_vars.empty())
         return;
 
     assert(r->locations.size() == totalStackmapArgs());
@@ -98,7 +98,7 @@ void PatchpointInfo::parseLocationMap(StackMap::Record* r, LocationMap* map) {
     };
 
     // Other patchpoints only record the lazy locals.
-    auto&& source = parentFunction()->code_obj->source;
+    SourceInfo* source = frame_info_desc.source ? frame_info_desc.source : parentFunction()->code_obj->source.get();
     if (isDeopt() && source->is_generator)
         map->generator.locations.push_back(parse_type(GENERATOR));
     if (isDeopt() && source->scoping.takesClosure())
@@ -111,6 +111,12 @@ void PatchpointInfo::parseLocationMap(StackMap::Record* r, LocationMap* map) {
     }
     for (int vreg : frame_info_desc.potentially_undefined) {
         map->definedness_vars[vreg].locations.push_back(parse_type(BOOL));
+    }
+    for (FrameVarInfo& frame_var : frame_info_desc.outer_vars) {
+        map->outer_vars[frame_var.vreg].locations.push_back(parse_type(frame_var.type));
+    }
+    for (int vreg : frame_info_desc.outer_potentially_undefined) {
+        map->outer_definedness_vars[vreg].locations.push_back(parse_type(BOOL));
     }
 
     ASSERT(cur_arg - frameStackmapArgsStart() == numFrameStackmapArgs(), "%d %d %d", cur_arg, frameStackmapArgsStart(),

@@ -29,6 +29,7 @@ namespace pyston {
 
 struct CompiledFunction;
 class CompilerType;
+class SourceInfo;
 struct StackMap;
 class TypeRecorder;
 
@@ -110,6 +111,11 @@ public:
     struct FrameInfoDesc {
         std::vector<FrameVarInfo> vars;
         llvm::SmallVector<int, 2> potentially_undefined;
+        // The function whose frame the vars belong to, if it isn't the parent one (because it got inlined).
+        SourceInfo* source = NULL;
+        // For an inlined function: the lazy locals of the caller.
+        std::vector<FrameVarInfo> outer_vars;
+        llvm::SmallVector<int, 2> outer_potentially_undefined;
     };
 
 private:
@@ -155,6 +161,10 @@ public:
         frame_info_desc.vars.push_back(FrameVarInfo({.vreg = vreg, .type = type }));
     }
     void addPotentiallyUndefined(int vreg) { frame_info_desc.potentially_undefined.push_back(vreg); }
+    void addOuterFrameVar(int vreg, CompilerType* type) {
+        frame_info_desc.outer_vars.push_back(FrameVarInfo({ .vreg = vreg, .type = type }));
+    }
+    void addOuterPotentiallyUndefined(int vreg) { frame_info_desc.outer_potentially_undefined.push_back(vreg); }
 
     void setNumFrameArgs(int num_frame_args) {
         assert(num_frame_stackmap_args == -1);
