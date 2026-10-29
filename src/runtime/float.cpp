@@ -163,14 +163,14 @@ extern "C" double PyFloat_AsDouble(PyObject* o) noexcept {
     return val;
 }
 
-template <typename T> static inline void raiseDivZeroExcIfZero(T var) {
+template <typename T> static inline void raiseDivZeroExcIfZero(T var, const char* msg = "float division by zero") {
     if (var == 0) {
-        raiseExcHelper(ZeroDivisionError, "float division by zero");
+        raiseExcHelper(ZeroDivisionError, "%s", msg);
     }
 }
 
 extern "C" double mod_float_float(double lhs, double rhs) {
-    raiseDivZeroExcIfZero(rhs);
+    raiseDivZeroExcIfZero(rhs, "float modulo");
     double r = fmod(lhs, rhs);
     // Have to be careful here with signed zeroes:
     if (std::signbit(r) != std::signbit(rhs)) {
@@ -188,7 +188,7 @@ extern "C" double div_float_float(double lhs, double rhs) {
 }
 
 extern "C" double floordiv_float_float(double lhs, double rhs) {
-    raiseDivZeroExcIfZero(rhs);
+    raiseDivZeroExcIfZero(rhs, "float divmod()");
     return floor(lhs / rhs);
 }
 
@@ -325,14 +325,14 @@ Box* floatRTruediv(BoxedFloat* lhs, Box* rhs) {
 extern "C" Box* floatFloorDivFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
     assert(PyFloat_Check(lhs));
     assert(PyFloat_Check(rhs));
-    raiseDivZeroExcIfZero(rhs->d);
+    raiseDivZeroExcIfZero(rhs->d, "float divmod()");
     return boxFloat(floor(lhs->d / rhs->d));
 }
 
 extern "C" Box* floatFloorDivInt(BoxedFloat* lhs, BoxedInt* rhs) {
     assert(PyFloat_Check(lhs));
     assert(PyInt_Check(rhs));
-    raiseDivZeroExcIfZero(rhs->n);
+    raiseDivZeroExcIfZero(rhs->n, "float divmod()");
     return boxFloat(floor(lhs->d / rhs->n));
 }
 
@@ -357,11 +357,11 @@ extern "C" Box* floatRFloorDiv(BoxedFloat* lhs, Box* _rhs) {
     assert(PyFloat_Check(lhs));
     if (PyInt_Check(_rhs)) {
         BoxedInt* rhs = (BoxedInt*)_rhs;
-        raiseDivZeroExcIfZero(lhs->d);
+        raiseDivZeroExcIfZero(lhs->d, "float divmod()");
         return boxFloat(floor(rhs->n / lhs->d));
     } else if (PyFloat_Check(_rhs)) {
         BoxedFloat* rhs = (BoxedFloat*)_rhs;
-        raiseDivZeroExcIfZero(lhs->d);
+        raiseDivZeroExcIfZero(lhs->d, "float divmod()");
         return boxFloat(floor(rhs->d / lhs->d));
     } else if (PyLong_Check(_rhs)) {
         double rhs_f = PyLong_AsDouble(_rhs);

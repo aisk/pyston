@@ -1556,7 +1556,7 @@ Box* longDiv(BoxedLong* v1, Box* _v2) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         if (mpz_sgn(v2->n) == 0)
-            raiseExcHelper(ZeroDivisionError, "long division or modulo by zero");
+            raiseExcHelper(ZeroDivisionError, "integer division or modulo by zero");
 
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
@@ -1566,7 +1566,7 @@ Box* longDiv(BoxedLong* v1, Box* _v2) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
         if (v2->n == 0)
-            raiseExcHelper(ZeroDivisionError, "long division or modulo by zero");
+            raiseExcHelper(ZeroDivisionError, "integer division or modulo by zero");
 
         BoxedLong* r = new BoxedLong();
         mpz_init_set_si(r->n, v2->n);
@@ -1592,7 +1592,7 @@ Box* longMod(BoxedLong* v1, Box* _v2) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);
 
         if (mpz_sgn(v2->n) == 0)
-            raiseExcHelper(ZeroDivisionError, "long division or modulo by zero");
+            raiseExcHelper(ZeroDivisionError, "integer division or modulo by zero");
 
         BoxedLong* r = new BoxedLong();
         mpz_init(r->n);
@@ -1602,7 +1602,7 @@ Box* longMod(BoxedLong* v1, Box* _v2) {
         BoxedInt* v2 = static_cast<BoxedInt*>(_v2);
 
         if (v2->n == 0)
-            raiseExcHelper(ZeroDivisionError, "long division or modulo by zero");
+            raiseExcHelper(ZeroDivisionError, "integer division or modulo by zero");
 
         BoxedLong* r = new BoxedLong();
         mpz_init_set_si(r->n, v2->n);
@@ -1643,7 +1643,7 @@ Box* longDivmodLong(BoxedLong* lhs, Box* _rhs) {
     BoxedLong* rhs_long = static_cast<BoxedLong*>(rhs);
 
     if (mpz_sgn(rhs_long->n) == 0)
-        raiseExcHelper(ZeroDivisionError, "long division or modulo by zero");
+        raiseExcHelper(ZeroDivisionError, "integer division or modulo by zero");
 
     BoxedLong* q = new BoxedLong();
     BoxedLong* r = new BoxedLong();
@@ -1685,7 +1685,7 @@ Box* longRdiv(BoxedLong* v1, Box* _v2) {
                        getTypeName(v1));
 
     if (mpz_sgn(v1->n) == 0)
-        raiseExcHelper(ZeroDivisionError, "long division or modulo by zero");
+        raiseExcHelper(ZeroDivisionError, "integer division or modulo by zero");
 
     if (PyLongObject_Check(_v2)) {
         BoxedLong* v2 = static_cast<BoxedLong*>(_v2);

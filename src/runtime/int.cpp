@@ -568,7 +568,7 @@ extern "C" Box* intDivFloat(BoxedInt* lhs, BoxedFloat* rhs) {
     assert(PyFloat_Check(rhs));
 
     if (rhs->d == 0) {
-        raiseExcHelper(ZeroDivisionError, "float divide by zero");
+        raiseExcHelper(ZeroDivisionError, "float division by zero");
     }
     return boxFloat(lhs->n / rhs->d);
 }
@@ -617,7 +617,7 @@ extern "C" Box* intFloordivFloat(BoxedInt* lhs, BoxedFloat* rhs) {
     assert(PyFloat_Check(rhs));
 
     if (rhs->d == 0) {
-        raiseExcHelper(ZeroDivisionError, "float divide by zero");
+        raiseExcHelper(ZeroDivisionError, "float divmod()");
     }
     return boxFloat(floor(lhs->n / rhs->d));
 }
@@ -671,7 +671,7 @@ extern "C" Box* intTruedivFloat(BoxedInt* lhs, BoxedFloat* rhs) {
     assert(PyFloat_Check(rhs));
 
     if (rhs->d == 0) {
-        raiseExcHelper(ZeroDivisionError, "division by zero");
+        raiseExcHelper(ZeroDivisionError, "float division by zero");
     }
     return boxFloat(lhs->n / rhs->d);
 }
@@ -807,6 +807,9 @@ extern "C" Box* intDivmod(BoxedInt* lhs, Box* rhs) {
                        getTypeName(lhs));
     if (unlikely(PyLongObject_Check(rhs)))
         return forwardToLong("__divmod__", autoDecref(boxLong(lhs->n)), rhs);
+    // Like CPython, leave floats to float.__rdivmod__.
+    if (!PyInt_Check(rhs))
+        return incref(NotImplemented);
 
     Box* divResult = intDiv(lhs, rhs);
 
