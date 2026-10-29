@@ -70,6 +70,8 @@ extern "C" Box* callattr(Box*, BoxedString*, CallattrFlags, Box*, Box*, Box*, Bo
     __attribute__((noinline));
 extern "C" Box* callattrCapi(Box*, BoxedString*, CallattrFlags, Box*, Box*, Box*, Box**,
                              const std::vector<BoxedString*>*) noexcept __attribute__((noinline));
+int assign_version_tag(PyTypeObject* type) noexcept;
+extern "C" bool hclsLacksAttr(Box* obj, BoxedString* attr, HiddenClass** cache) noexcept;
 extern "C" BoxedString* str(Box* obj) __attribute__((noinline));
 extern "C" BoxedString* repr(Box* obj) __attribute__((noinline));
 extern "C" bool exceptionMatches(Box* obj, Box* cls) __attribute__((noinline));

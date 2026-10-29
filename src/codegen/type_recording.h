@@ -47,20 +47,23 @@ public:
     friend Box* recordType(TypeRecorder*, Box*);
 };
 
-// A type recorder for a node without an IC. It is what predictClassFor() uses for the node while it lives.
+// A type recorder for a node without an IC. It is what predictClassFor() uses for the node while it lives.  A receiver
+// recorder instead records the object that a CallAttr node calls the method of, for predictReceiverClassFor().
 class NodeTypeRecorder : public TypeRecorder {
 private:
     BST_stmt* node;
+    bool receiver;
 
 public:
-    NodeTypeRecorder(BST_stmt* node);
+    NodeTypeRecorder(BST_stmt* node, bool receiver = false);
     ~NodeTypeRecorder();
 };
 
 BoxedClass* predictClassFor(BST_stmt* node, int64_t monomorphic_threshold = MONOMORPHIC_SPECULATION_THRESHOLD);
+BoxedClass* predictReceiverClassFor(BST_stmt* node);
 // Keeps what the recorder of node saw after it goes away with the baseline JIT code of its function, for when the
 // function gets compiled again, or inlined.
-void retireTypeRecorder(BST_stmt* node, const TypeRecorder& recorder);
+void retireTypeRecorder(BST_stmt* node, const TypeRecorder& recorder, bool receiver = false);
 }
 
 #endif

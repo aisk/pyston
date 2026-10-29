@@ -3924,6 +3924,24 @@ Box* _callattrEntry(Box* obj, BoxedString* attr, CallattrFlags flags, Box* arg1,
     return rtn;
 }
 
+// For the methods that the LLVM tier inlines: whether obj (with hidden class attributes) lacks the attribute, so that it
+// doesn't shadow the method of its class.  A normal hidden class never changes, so it gets cached in *cache, which the
+// inlined code checks first.
+extern "C" bool hclsLacksAttr(Box* obj, BoxedString* attr, HiddenClass** cache) noexcept {
+    HCAttrs* attrs = obj->getHCAttrsPtr();
+    HiddenClass* hcls = attrs->hcls;
+    if (!hcls)
+        return true;
+    // (Looking in the dict could run Python code.)
+    if (hcls->type == HiddenClass::DICT_BACKED)
+        return false;
+
+    bool lacks = hcls->getAsSingletonOrNormal()->getOffset(attr) == -1;
+    if (lacks && hcls->type == HiddenClass::NORMAL)
+        *cache = hcls;
+    return lacks;
+}
+
 extern "C" Box* callattr(Box* obj, BoxedString* attr, CallattrFlags flags, Box* arg1, Box* arg2, Box* arg3, Box** args,
                          const std::vector<BoxedString*>* keyword_names) {
     return _callattrEntry<CXX>(obj, attr, flags, arg1, arg2, arg3, args, keyword_names,

@@ -72,8 +72,11 @@ struct InlineInfo {
     // The caller block that jumps to the start of the callee.
     llvm::BasicBlock* entry_from;
 
-    // The callee has set a CAPI exception (and exited its frame, if it still had it).
+    // The callee has set a CAPI exception.  This flushes the lazy locals of the caller and exits the frame of the
+    // callee (if it still has it), which the exception paths of the callee leave to it.
     llvm::BasicBlock* exc_exit = NULL;
+    // The FrameInfo of the callee.
+    llvm::Value* frame_info = NULL;
     // The callee deopted.  The interpreter finished running it, and deopt_value is the value it returned.
     llvm::BasicBlock* deopt_exit = NULL;
     llvm::PHINode* deopt_value = NULL;
@@ -238,6 +241,7 @@ public:
     virtual void flushLazyLocals() = 0;
     // For the caller of an inlined function: adds its lazy locals to a stackmap of the inlined function, or flushes
     // them at the end of a block of the inlined function (returning the block that the code continues in).
+    virtual void flushLazyLocalsForException(bool caught) = 0;
     virtual void addOuterLazyLocals(PatchpointInfo* pp, std::vector<llvm::Value*>& stackmap_args) = 0;
     virtual llvm::BasicBlock* flushLazyLocalsAt(llvm::BasicBlock* bb) = 0;
     virtual void addOutgoingExceptionState(ExceptionState exception_state) = 0;

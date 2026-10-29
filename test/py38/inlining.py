@@ -220,3 +220,108 @@ def peeked(n, big):
     return r, peek_caller(big)
 
 print(peeked(3000, 2 ** 40))
+
+# Method calls get inlined too, guarded on the class of the object, the class not changing, the code of the method
+# and the object not having an attribute with the name.
+class P:
+    def __init__(self, x):
+        self.x = x
+
+    def get(self):
+        return self.x
+
+    def add(self, y):
+        return self.x + y
+
+class Q(P):
+    def get(self):
+        return -self.x
+
+def methods(objs, n):
+    s = 0
+    for i in range(n):
+        p = objs[i * len(objs) // n]
+        s += p.add(i) + p.get()
+    return s
+
+p = P(3)
+print(methods([p], 3000), methods([p, Q(4)], 3000), methods([p, P(2.5)], 3000))
+shadowed = P(5)
+shadowed.get = lambda: 100
+print(methods([p, shadowed], 3000))
+
+def replace_method(n):
+    s = 0
+    p = P(1)
+    for i in range(n):
+        s += p.get()
+        if i == 2990:
+            P.get = lambda self: 10
+        if i == 2995:
+            P.get = Q.get
+    return s
+
+print(replace_method(3000))
+
+def change_code(n):
+    s = 0
+    p = P(1)
+    for i in range(n):
+        s += p.add(i)
+        if i == 2990:
+            P.add.__code__ = (lambda self, y: 1000).__code__
+    return s
+
+print(change_code(3000))
+
+class R:
+    def __init__(self):
+        self.v = 1
+
+    def value(self):
+        return self.v
+
+def getattribute_added(n):
+    s = 0
+    r = R()
+    for i in range(n):
+        s += r.value()
+        if i == 2990:
+            R.__getattribute__ = lambda self, name: (lambda: 7) if name == "value" else object.__getattribute__(self, name)
+    return s
+
+print(getattribute_added(3000))
+
+# The result of the call that isn't inlined has another type than the inlined result.
+class Num:
+    def __init__(self, v):
+        self.v = v
+
+    def twice(self):
+        return self.v * 2
+
+def result_types(objs, n):
+    out = []
+    for i in range(n):
+        out.append(objs[i * len(objs) // n].twice())
+    return out[-3:], len(set(map(type, out)))
+
+print(result_types([Num(2)], 3000), result_types([Num(2), Num("ab"), Num(1.5)], 3000))
+
+class Boom:
+    def check(self, x):
+        if x > 2995:
+            raise ValueError("method %d" % x)
+        return x
+
+def method_raise(n):
+    b = Boom()
+    s = 0
+    for i in range(n):
+        s += b.check(i)
+    return s
+
+try:
+    method_raise(3000)
+except ValueError as e:
+    print(e, [(f.name, f.line) for f in traceback.extract_tb(e.__traceback__)])

@@ -45,22 +45,23 @@ Box* recordType(TypeRecorder* self, Box* obj) {
     return obj;
 }
 
-static llvm::DenseMap<BST_stmt*, NodeTypeRecorder*> recorders_by_node;
-static llvm::DenseMap<BST_stmt*, TypeRecorder> retired_recorders;
+static llvm::DenseMap<BST_stmt*, NodeTypeRecorder*> recorders_by_node, receiver_recorders_by_node;
+static llvm::DenseMap<BST_stmt*, TypeRecorder> retired_recorders, retired_receiver_recorders;
 
-void retireTypeRecorder(BST_stmt* node, const TypeRecorder& recorder) {
-    retired_recorders[node] = recorder;
+void retireTypeRecorder(BST_stmt* node, const TypeRecorder& recorder, bool receiver) {
+    (receiver ? retired_receiver_recorders : retired_recorders)[node] = recorder;
 }
 
-NodeTypeRecorder::NodeTypeRecorder(BST_stmt* node) : node(node) {
-    recorders_by_node[node] = this;
+NodeTypeRecorder::NodeTypeRecorder(BST_stmt* node, bool receiver) : node(node), receiver(receiver) {
+    (receiver ? receiver_recorders_by_node : recorders_by_node)[node] = this;
 }
 
 NodeTypeRecorder::~NodeTypeRecorder() {
-    auto it = recorders_by_node.find(node);
-    if (it != recorders_by_node.end() && it->second == this) {
-        recorders_by_node.erase(it);
-        retireTypeRecorder(node, *this);
+    auto&& map = receiver ? receiver_recorders_by_node : recorders_by_node;
+    auto it = map.find(node);
+    if (it != map.end() && it->second == this) {
+        map.erase(it);
+        retireTypeRecorder(node, *this, receiver);
     }
 }
 
@@ -77,6 +78,22 @@ BoxedClass* predictClassFor(BST_stmt* node, int64_t monomorphic_threshold) {
     if (retired != retired_recorders.end())
         return retired->second.predict(monomorphic_threshold);
     return NULL;
+}
+
+// Only for a node that always saw the same class, since a wrong prediction deopts.
+BoxedClass* predictReceiverClassFor(BST_stmt* node) {
+    TypeRecorder* recorder = NULL;
+    auto it = receiver_recorders_by_node.find(node);
+    if (it != receiver_recorders_by_node.end()) {
+        recorder = it->second;
+    } else {
+        auto retired = retired_receiver_recorders.find(node);
+        if (retired != retired_receiver_recorders.end())
+            recorder = &retired->second;
+    }
+    if (!recorder || recorder->num_changes != 1)
+        return NULL;
+    return recorder->predict();
 }
 
 BoxedClass* TypeRecorder::predict(int64_t monomorphic_threshold) {

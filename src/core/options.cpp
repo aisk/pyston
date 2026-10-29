@@ -58,7 +58,7 @@ int MONOMORPHIC_SPECULATION_THRESHOLD = 10;
 
 int MAX_OBJECT_CACHE_ENTRIES = 500;
 // The size limit (in bytecode statements) of Python functions that the LLVM tier inlines into their callers.
-int INLINING_MAX_STMTS = 60;
+int INLINING_MAX_STMTS = 20;
 
 static bool _GLOBAL_ENABLE = 1;
 bool ENABLE_ICS = 1 && _GLOBAL_ENABLE;
