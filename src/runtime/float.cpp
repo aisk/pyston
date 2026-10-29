@@ -535,6 +535,9 @@ Box* floatRDivmod(BoxedFloat* lhs, Box* rhs) {
 }
 
 extern "C" Box* floatPow(BoxedFloat* lhs, Box* rhs, Box* mod) {
+    if (!PyFloat_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__pow__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
     Box* res = float_pow(lhs, rhs, mod);
     if (!res) {
         throwCAPIException();
@@ -854,12 +857,13 @@ static void _addFuncPow(const char* name, ConcreteCompilerType* rtn_type, void* 
                         void* boxed_func) {
     std::vector<ConcreteCompilerType*> v_ffu{ BOXED_FLOAT, BOXED_FLOAT, UNKNOWN };
     std::vector<ConcreteCompilerType*> v_fiu{ BOXED_FLOAT, BOXED_INT, UNKNOWN };
-    std::vector<ConcreteCompilerType*> v_fuu{ BOXED_FLOAT, UNKNOWN, UNKNOWN };
+    // Float subclasses only fit the last version.
+    std::vector<ConcreteCompilerType*> v_uuu{ UNKNOWN, UNKNOWN, UNKNOWN };
 
     BoxedCode* code = new BoxedCode(3, false, false, name);
     code->addVersion(float_func, rtn_type, v_ffu);
     code->addVersion(int_func, rtn_type, v_fiu);
-    code->addVersion(boxed_func, UNKNOWN, v_fuu);
+    code->addVersion(boxed_func, UNKNOWN, v_uuu);
     float_cls->giveAttr(name, new BoxedFunction(code, { Py_None }));
 }
 
