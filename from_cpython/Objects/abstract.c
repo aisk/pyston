@@ -809,7 +809,8 @@ binary_op1(PyObject *v, PyObject *w, const int op_slot)
             slotw = NULL;
     }
     if (slotv) {
-        if (slotw && PyType_IsSubtype(w->ob_type, v->ob_type)) {
+        // Pyston change: big ints count as plain ints
+        if (slotw && _PyPyston_ReflectedFirst(w->ob_type, v->ob_type)) {
             x = slotw(v, w);
             if (x != Py_NotImplemented)
                 return x;
@@ -900,7 +901,8 @@ ternary_op(PyObject *v,
             slotw = NULL;
     }
     if (slotv) {
-        if (slotw && PyType_IsSubtype(w->ob_type, v->ob_type)) {
+        // Pyston change: big ints count as plain ints
+        if (slotw && _PyPyston_ReflectedFirst(w->ob_type, v->ob_type)) {
             x = slotw(v, w, z);
             if (x != Py_NotImplemented)
                 return x;

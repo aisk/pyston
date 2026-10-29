@@ -648,7 +648,7 @@ static PyObject* do_richcompare(PyObject* v, PyObject* w, int op) noexcept {
     PyObject* res;
     int checked_reverse_op = 0;
 
-    if (v->cls != w->cls && PyType_IsSubtype(w->cls, v->cls) && (f = w->cls->tp_richcompare) != NULL) {
+    if (_PyPyston_ReflectedFirst(w->cls, v->cls) && (f = w->cls->tp_richcompare) != NULL) {
         checked_reverse_op = 1;
         res = (*f)(w, v, _Py_SwappedOp[op]);
         if (res != Py_NotImplemented)

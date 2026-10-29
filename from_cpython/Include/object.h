@@ -238,6 +238,10 @@ PyAPI_FUNC(void*) PyType_GetSlot(PyTypeObject*, int) PYSTON_NOEXCEPT;
 
 /* Generic type check */
 PyAPI_FUNC(int) PyType_IsSubtype(PyTypeObject *, PyTypeObject *) PYSTON_NOEXCEPT;
+// Pyston addition: whether an operator should try the reflected method of w first, which is when type(w)
+// is a proper subclass of type(v). Ints that don't fit in 64 bits have the hidden subclass long_cls, but
+// count as plain ints here.
+PyAPI_FUNC(int) _PyPyston_ReflectedFirst(PyTypeObject *w, PyTypeObject *v) PYSTON_NOEXCEPT;
 #define PyObject_TypeCheck(ob, tp) \
     (Py_TYPE(ob) == (tp) || PyType_IsSubtype(Py_TYPE(ob), (tp)))
 

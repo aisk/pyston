@@ -1215,12 +1215,12 @@ static int method_is_overloaded(PyObject* left, PyObject* right, const char* nam
 
 #define SLOT1BINFULL(FUNCNAME, TESTFUNC, SLOTNAME, OPSTR, ROPSTR)                                                      \
     static PyObject* FUNCNAME(PyObject* self, PyObject* other) noexcept {                                              \
-        static PyObject* cache_str, *rcache_str;                                                                       \
+        static PyObject *cache_str, *rcache_str;                                                                       \
         int do_other = Py_TYPE(self) != Py_TYPE(other) && Py_TYPE(other)->tp_as_number != NULL                         \
                        && Py_TYPE(other)->tp_as_number->SLOTNAME == TESTFUNC;                                          \
         if (Py_TYPE(self)->tp_as_number != NULL && Py_TYPE(self)->tp_as_number->SLOTNAME == TESTFUNC) {                \
             PyObject* r;                                                                                               \
-            if (do_other && PyType_IsSubtype(Py_TYPE(other), Py_TYPE(self))                                            \
+            if (do_other && _PyPyston_ReflectedFirst(Py_TYPE(other), Py_TYPE(self))                                    \
                 && method_is_overloaded(self, other, ROPSTR)) {                                                        \
                 r = call_maybe(other, ROPSTR, &rcache_str, "(O)", self);                                               \
                 if (r != Py_NotImplemented)                                                                            \

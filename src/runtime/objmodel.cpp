@@ -5460,6 +5460,14 @@ extern "C" Box* binopAfterUserOp(STOLEN(Box*) rtn, Box* lhs, Box* rhs, int op_ty
                    getTypeName(lhs), getTypeName(rhs));
 }
 
+extern "C" int _PyPyston_ReflectedFirst(BoxedClass* w, BoxedClass* v) noexcept {
+    if (w == long_cls)
+        w = int_cls;
+    if (v == long_cls)
+        v = int_cls;
+    return w != v && PyType_IsSubtype(w, v);
+}
+
 template <Rewritable rewritable, bool inplace>
 Box* binopInternal(Box* lhs, Box* rhs, int op_type, BinopRewriteArgs* rewrite_args) {
     if (rewritable == NOT_REWRITABLE) {
@@ -5469,8 +5477,7 @@ Box* binopInternal(Box* lhs, Box* rhs, int op_type, BinopRewriteArgs* rewrite_ar
 
     // A user-defined lhs whose operator method gets the first try: call it through a callattr rewrite
     // (so the method call is fast) and let binopAfterUserOp handle a NotImplemented result.
-    if (!inplace && rewrite_args && lhs->cls->is_user_defined
-        && (lhs->cls == rhs->cls || !isSubclass(rhs->cls, lhs->cls))) {
+    if (!inplace && rewrite_args && lhs->cls->is_user_defined && !_PyPyston_ReflectedFirst(rhs->cls, lhs->cls)) {
         Rewriter* rewriter = rewrite_args->rewriter;
         rewrite_args->lhs->addAttrGuard(offsetof(Box, cls), (intptr_t)lhs->cls);
         rewrite_args->rhs->addAttrGuard(offsetof(Box, cls), (intptr_t)rhs->cls);
@@ -5602,7 +5609,7 @@ Box* binopInternal(Box* lhs, Box* rhs, int op_type, BinopRewriteArgs* rewrite_ar
     }
 
     bool should_try_reverse = true;
-    if (lhs->cls != rhs->cls && isSubclass(rhs->cls, lhs->cls)) {
+    if (_PyPyston_ReflectedFirst(rhs->cls, lhs->cls)) {
         should_try_reverse = false;
         DecrefHandle<BoxedString> rop_name = getReverseOpName(op_type);
         Box* rrtn = binopInternalHelper<rewritable>(rewrite_args, rop_name, rhs, lhs, r_rhs, r_lhs);
