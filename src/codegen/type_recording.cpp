@@ -46,6 +46,11 @@ Box* recordType(TypeRecorder* self, Box* obj) {
 }
 
 static llvm::DenseMap<BST_stmt*, NodeTypeRecorder*> recorders_by_node;
+static llvm::DenseMap<BST_stmt*, TypeRecorder> retired_recorders;
+
+void retireTypeRecorder(BST_stmt* node, const TypeRecorder& recorder) {
+    retired_recorders[node] = recorder;
+}
 
 NodeTypeRecorder::NodeTypeRecorder(BST_stmt* node) : node(node) {
     recorders_by_node[node] = this;
@@ -53,8 +58,10 @@ NodeTypeRecorder::NodeTypeRecorder(BST_stmt* node) : node(node) {
 
 NodeTypeRecorder::~NodeTypeRecorder() {
     auto it = recorders_by_node.find(node);
-    if (it != recorders_by_node.end() && it->second == this)
+    if (it != recorders_by_node.end() && it->second == this) {
         recorders_by_node.erase(it);
+        retireTypeRecorder(node, *this);
+    }
 }
 
 BoxedClass* predictClassFor(BST_stmt* node, int64_t monomorphic_threshold) {
@@ -65,6 +72,10 @@ BoxedClass* predictClassFor(BST_stmt* node, int64_t monomorphic_threshold) {
     auto it = recorders_by_node.find(node);
     if (it != recorders_by_node.end())
         return it->second->predict(monomorphic_threshold);
+
+    auto retired = retired_recorders.find(node);
+    if (retired != retired_recorders.end())
+        return retired->second.predict(monomorphic_threshold);
     return NULL;
 }
 

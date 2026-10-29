@@ -58,6 +58,9 @@ public:
 };
 
 BoxedClass* predictClassFor(BST_stmt* node, int64_t monomorphic_threshold = MONOMORPHIC_SPECULATION_THRESHOLD);
+// Keeps what the recorder of node saw after it goes away with the baseline JIT code of its function, for when the
+// function gets compiled again, or inlined.
+void retireTypeRecorder(BST_stmt* node, const TypeRecorder& recorder);
 }
 
 #endif

@@ -372,8 +372,11 @@ ICInfo::ICInfo(void* start_addr, void* slowpath_rtn_addr, void* continue_addr, S
 ICInfo::~ICInfo() {
     // if this ICInfo got created with registerCompiledPatchpoint we have to unregister this
     ics_by_return_addr.erase(slowpath_rtn_addr);
-    if (node)
+    if (node) {
         ics_by_ast_node.erase(node);
+        if (type_recorder)
+            retireTypeRecorder(node, *type_recorder);
+    }
 
     for (auto& slot : slots) {
         // Calling a full clear() might be overkill here, but probably better safe than sorry:
