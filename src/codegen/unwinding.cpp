@@ -515,6 +515,64 @@ void removeDecrefInfoEntry(uint64_t ip) {
 }
 
 
+template <typename Func> void unwindPythonStack(Func func);
+
+// Writes the current values of the lazy locals of an LLVM tier frame (see keepLocalLazy() in irgenerator.cpp) into
+// its vregs, using the locations that the stackmap of the current call records for them.
+static void materializeLazyLocals(PythonFrameIteratorImpl* frame_iter) {
+    if (!ENABLE_LAZY_LOCALS || frame_iter->getId().type != PythonFrameId::COMPILED)
+        return;
+
+    CompiledFunction* cf = frame_iter->getCF();
+    auto&& location_map = cf->location_map;
+    if (!location_map || location_map->vars.empty())
+        return;
+    unsigned offset = frame_iter->getId().ip - cf->code_start;
+
+    auto read_entry = [&](const LocationMap::LocationTable::LocationEntry* e) {
+        llvm::SmallVector<uint64_t, 1> vals;
+        for (auto& loc : e->locations)
+            vals.push_back(frame_iter->readLocation(loc));
+        return e->type->deserializeFromFrame(vals);
+    };
+
+    int num_user_visible = cf->code_obj->source->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
+    Box** vregs = frame_iter->getFrameInfo()->vregs;
+    for (const auto& p : location_map->vars) {
+        int vreg = p.first;
+        if (vreg >= num_user_visible)
+            continue;
+        auto e = p.second.findEntry(offset);
+        if (!e)
+            continue;
+
+        auto it = location_map->definedness_vars.find(vreg);
+        if (it != location_map->definedness_vars.end()) {
+            if (auto d = it->second.findEntry(offset)) {
+                Box* is_defined = read_entry(d);
+                AUTO_DECREF(is_defined);
+                if (is_defined == Py_False)
+                    continue;
+            }
+        }
+
+        Box* old = vregs[vreg];
+        vregs[vreg] = read_entry(e);
+        Py_XDECREF(old);
+    }
+}
+
+void materializeLazyLocals(FrameInfo* frame_info) {
+    if (!ENABLE_LAZY_LOCALS)
+        return;
+    unwindPythonStack([&](PythonFrameIteratorImpl* frame_iter) {
+        if (frame_iter->getFrameInfo() != frame_info)
+            return false;
+        materializeLazyLocals(frame_iter);
+        return true;
+    });
+}
+
 class PythonUnwindSession {
     ExcInfo exc_info;
     PythonStackExtractor pystack_extractor;
@@ -605,6 +663,8 @@ public:
         bool found_frame = pystack_extractor.handleCFrame(cursor, &frame_iter);
         if (found_frame) {
             frame_iter.getCode()->propagated_cxx_exceptions++;
+            // The traceback (and an except clause in the frame) can look at the locals.
+            materializeLazyLocals(&frame_iter);
             assert(!prev_frame_info);
             prev_frame_info = frame_iter.getFrameInfo();
 
@@ -906,8 +966,9 @@ DeoptState getDeoptState() {
             Box** vregs = frame_iter->getFrameInfo()->vregs;
             int num_vregs_user_visible = cf->code_obj->source->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
             for (int vreg = 0; vreg < num_vregs_user_visible; ++vreg) {
+                // (A lazy local that isn't defined.)
                 if (is_undefined.count(vreg))
-                    assert(0);
+                    continue;
 
                 Box* v = vregs[vreg];
                 if (!v)
@@ -972,6 +1033,7 @@ BORROWED(Box*) FrameInfo::updateBoxedLocals() {
         return code->source->parent_module->getAttrWrapper();
     }
 
+    materializeLazyLocals(frame_info);
     BoxedDict* d = localsForFrame(frame_info->vregs, code->source->cfg);
     BoxedClosure* closure = frame_info->passed_closure;
 

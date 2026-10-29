@@ -1307,6 +1307,11 @@ public:
     static void dealloc(Box* b) noexcept;
 };
 
+// Marks a C++ runtime function that never runs Python code (other than destructors, which any decref can run), so
+// the JIT can call it without first writing the locals it keeps in registers back to the frame.
+void registerNoPythonCodeFunction(void* f);
+bool runsNoPythonCode(void* f);
+
 class BoxedFunctionBase : public Box {
 public:
     Box** weakreflist;

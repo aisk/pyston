@@ -188,6 +188,8 @@ public:
     virtual EndingState getEndingSymbolTable() = 0;
     virtual void doSafePoint(BST_stmt* next_statement) = 0;
     virtual void addFrameStackmapArgs(PatchpointInfo* pp, std::vector<llvm::Value*>& stackmap_args) = 0;
+    virtual bool hasLazyLocals() = 0;
+    virtual void flushLazyLocals() = 0;
     virtual void addOutgoingExceptionState(ExceptionState exception_state) = 0;
     virtual void setIncomingExceptionState(llvm::SmallVector<ExceptionState, 2> exc_state) = 0;
     virtual llvm::BasicBlock* getCXXExcDest(const UnwindInfo&) = 0;

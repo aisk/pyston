@@ -1362,6 +1362,8 @@ static void _addFuncIntFloatUnknown(const char* name, void* int_func, void* floa
     BoxedCode* code = new BoxedCode(2, false, false, name);
     code->addVersion(int_func, UNKNOWN, v_ii);
     code->addVersion(float_func, BOXED_FLOAT, v_if);
+    registerNoPythonCodeFunction(int_func);
+    registerNoPythonCodeFunction(float_func);
     code->addVersion(boxed_func, UNKNOWN, v_iu);
     int_cls->giveAttr(name, new BoxedFunction(code));
 }
@@ -1377,6 +1379,7 @@ static void _addFuncIntUnknown(const char* name, ConcreteCompilerType* rtn_type,
     BoxedCode* code = new BoxedCode(2, false, false, name);
     code->addVersion(int_func, rtn_type, v_ii);
     code->addVersion(boxed_func, UNKNOWN, v_iu);
+    registerNoPythonCodeFunction(int_func);
     int_cls->giveAttr(name, new BoxedFunction(code));
 }
 

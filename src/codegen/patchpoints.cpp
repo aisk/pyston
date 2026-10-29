@@ -56,13 +56,15 @@ std::unique_ptr<ICSetupInfo> ICSetupInfo::initialize(bool has_return_value, int 
 }
 
 int PatchpointInfo::patchpointSize() {
+    // Room for the spills of the frame args beyond what totalSize() includes.
+    int spill_room = (numFrameSpillsSupported() - (isDeopt() ? MAX_FRAME_SPILLS : 0)) * SPILL_SIZE;
     if (icinfo) {
         int r = icinfo->totalSize();
         assert(r > CALL_ONLY_SIZE);
-        return r;
+        return r + spill_room;
     }
 
-    return CALL_ONLY_SIZE;
+    return CALL_ONLY_SIZE + spill_room;
 }
 
 bool StackMap::Record::Location::operator==(const StackMap::Record::Location& rhs) {
@@ -72,7 +74,7 @@ bool StackMap::Record::Location::operator==(const StackMap::Record::Location& rh
 }
 
 void PatchpointInfo::parseLocationMap(StackMap::Record* r, LocationMap* map) {
-    if (!this->isDeopt())
+    if (!this->isDeopt() && frame_info_desc.vars.empty())
         return;
 
     assert(r->locations.size() == totalStackmapArgs());
@@ -95,12 +97,13 @@ void PatchpointInfo::parseLocationMap(StackMap::Record* r, LocationMap* map) {
                                                           .locations = std::move(locations) });
     };
 
+    // Other patchpoints only record the lazy locals.
     auto&& source = parentFunction()->code_obj->source;
-    if (source->is_generator)
+    if (isDeopt() && source->is_generator)
         map->generator.locations.push_back(parse_type(GENERATOR));
-    if (source->scoping.takesClosure())
+    if (isDeopt() && source->scoping.takesClosure())
         map->passed_closure.locations.push_back(parse_type(CLOSURE));
-    if (source->scoping.createsClosure())
+    if (isDeopt() && source->scoping.createsClosure())
         map->created_closure.locations.push_back(parse_type(CLOSURE));
 
     for (FrameVarInfo& frame_var : frame_info_desc.vars) {
@@ -282,6 +285,27 @@ void processStackmap(CompiledFunction* cf, StackMap* stackmap) {
         }
         RELEASE_ASSERT(nspills <= pp->numFrameSpillsSupported(), "did %d spills but expected only %d!", nspills,
                        pp->numFrameSpillsSupported());
+
+        // ICs expect their region to be at most totalSize() long, so skip the spill room that we didn't use.
+        // (totalSize() of deopts already includes room for MAX_FRAME_SPILLS spills.)
+        if (pp->getICInfo()) {
+            uint8_t* ic_start = end_addr - pp->getICInfo()->totalSize();
+            RELEASE_ASSERT(pp->isDeopt() || start_addr <= ic_start, "");
+            if (start_addr < ic_start) {
+                // Jump over the room, since it can be large and the code runs on every call.
+                int gap = ic_start - start_addr;
+                memset(start_addr, 0x90, gap); // nops
+                if (gap >= 2 && gap - 2 <= 127) {
+                    start_addr[0] = 0xeb; // jmp rel8
+                    start_addr[1] = gap - 2;
+                } else if (gap >= 5) {
+                    start_addr[0] = 0xe9; // jmp rel32
+                    int32_t rel = gap - 5;
+                    memcpy(start_addr + 1, &rel, sizeof(rel));
+                }
+                start_addr = ic_start;
+            }
+        }
 
         assert(scratch_size % sizeof(void*) == 0);
         assert(scratch_rbp_offset % sizeof(void*) == 0);

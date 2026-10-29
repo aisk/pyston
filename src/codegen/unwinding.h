@@ -96,6 +96,8 @@ void logByCurrentPythonLine(const std::string& stat_name);
 
 // Adds stack locals and closure locals into the locals dict, and returns it.
 BORROWED(Box*) fastLocalsToBoxedLocals();
+// Writes the lazy locals of the frame into its vregs, if the frame is running in the LLVM tier.
+void materializeLazyLocals(FrameInfo* frame_info);
 
 class PythonFrameIteratorImpl;
 class PythonFrameIterator {

@@ -635,6 +635,16 @@ void BoxedCode::addVersion(void* f, ConcreteCompilerType* rtn_type, ExceptionSty
     return BoxedCode::addVersion(f, rtn_type, arg_types, exception_style);
 }
 
+static std::unordered_set<void*> no_python_code_functions;
+
+void registerNoPythonCodeFunction(void* f) {
+    no_python_code_functions.insert(f);
+}
+
+bool runsNoPythonCode(void* f) {
+    return no_python_code_functions.count(f);
+}
+
 static ConcreteCompilerType* processType(ConcreteCompilerType* type) {
     assert(type);
     return type;

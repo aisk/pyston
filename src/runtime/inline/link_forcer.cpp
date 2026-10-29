@@ -108,6 +108,7 @@ void force() {
     FORCE(assignSlice);
 
     FORCE(unpackIntoArray);
+    FORCE(unpackTupleOrListIntoArray);
     FORCE(raiseAttributeError);
     FORCE(raiseAttributeErrorStr);
     FORCE(raiseAttributeErrorCapi);

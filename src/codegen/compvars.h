@@ -337,6 +337,9 @@ ConcreteCompilerVariable* doIs(IREmitter& emitter, CompilerVariable* lhs, Compil
 // a boxed representation (makeUnboxedInt)
 CompilerVariable* makeInt(int64_t);
 CompilerVariable* makeUnboxedFromPhi(ConcreteCompilerVariable*);
+// For an INT or FLOAT variable: the box it already has (or NULL), and its unboxed value.
+ConcreteCompilerVariable* getExistingBox(CompilerVariable*);
+llvm::Value* getUnboxedValue(CompilerVariable*);
 CompilerVariable* makeInt(llvm::Value*);
 CompilerVariable* makeUnboxedInt(IREmitter&, ConcreteCompilerVariable*);
 CompilerVariable* makeUnboxedInt(IREmitter&, llvm::Value*);

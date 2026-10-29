@@ -844,6 +844,8 @@ static void _addFunc(const char* name, ConcreteCompilerType* rtn_type, void* flo
     BoxedCode* code = new BoxedCode(2, false, false, name);
     code->addVersion(float_func, rtn_type, v_ff);
     code->addVersion(int_func, rtn_type, v_fi);
+    registerNoPythonCodeFunction(float_func);
+    registerNoPythonCodeFunction(int_func);
     code->addVersion(boxed_func, UNKNOWN, v_uu);
     float_cls->giveAttr(name, new BoxedFunction(code));
 }
@@ -924,6 +926,9 @@ void setupFloat() {
                         new BoxedFunction(BoxedCode::create((void*)floatPos, BOXED_FLOAT, 1, "float.__pos__")));
     float_cls->giveAttr("__abs__",
                         new BoxedFunction(BoxedCode::create((void*)floatAbs, BOXED_FLOAT, 1, "float.__abs__")));
+    registerNoPythonCodeFunction((void*)floatNeg);
+    registerNoPythonCodeFunction((void*)floatPos);
+    registerNoPythonCodeFunction((void*)floatAbs);
 
     BoxedCode* nonzero = BoxedCode::create((void*)floatNonzeroUnboxed, BOOL, 1, "float.__bool__");
     nonzero->addVersion((void*)floatNonzero, UNKNOWN);

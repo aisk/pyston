@@ -67,6 +67,8 @@ void setupRange() {
     PyRangeIter_Type.setattr(autoDecref(internStringMortal("__next__")), autoDecref(new BoxedFunction(next)), NULL);
 
     PyRangeIter_Type.tpp_hasnext = rangeiterHasnextUnboxed;
+    registerNoPythonCodeFunction((void*)rangeiterHasnextUnboxed);
+    registerNoPythonCodeFunction((void*)rangeiterNextUnboxed);
 
     // Like the frozen C++ classes, so the JIT can speculate on them. freeze() itself would replace the C slots.
     PyRange_Type.is_constant = true;

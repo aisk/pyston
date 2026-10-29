@@ -371,6 +371,12 @@ extern "C" Box** unpackIntoArray(Box* obj, int64_t expected_size, Box** out_keep
     abort();
 }
 
+// The same for the cases that don't run Python code.
+extern "C" Box** unpackTupleOrListIntoArray(Box* obj, int64_t expected_size, Box** out_keep_alive) {
+    assert(obj->cls == tuple_cls || obj->cls == list_cls);
+    return unpackIntoArray(obj, expected_size, out_keep_alive);
+}
+
 static void clear_slots(PyTypeObject* type, PyObject* self) noexcept {
     Py_ssize_t i, n;
     PyMemberDef* mp;
