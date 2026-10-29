@@ -389,7 +389,12 @@ private:
     }
     void visit_locals(BST_Locals* node) override { _doSet(node->vreg_dst, DICT); }
     void visit_getiter(BST_GetIter* node) override {
-        _doSet(node->vreg_dst, getType(node->vreg_value)->getPystonIterType());
+        CompilerType* rtn = getType(node->vreg_value)->getPystonIterType();
+        // The iterator class of a loop rarely changes, and an inner loop can trigger OSR when its GET_ITER only
+        // ran once or twice, so speculate on it as soon as it looks monomorphic.
+        if (speculation != TypeAnalysis::NONE && rtn == UNKNOWN)
+            rtn = processSpeculation(predictClassFor(node, 1), node, rtn);
+        _doSet(node->vreg_dst, rtn);
     }
     void visit_importfrom(BST_ImportFrom* node) override { _doSet(node->vreg_dst, UNKNOWN); }
     void visit_importname(BST_ImportName* node) override { _doSet(node->vreg_dst, UNKNOWN); }
@@ -472,7 +477,10 @@ private:
         CompilerType* getitem_type = val->getattrType(name, true);
         std::vector<CompilerType*> args;
         args.push_back(slice);
-        _doSet(node->vreg_dst, getitem_type->callType(ArgPassSpec(1), args, NULL));
+        CompilerType* rtn = getitem_type->callType(ArgPassSpec(1), args, NULL);
+        if (speculation != TypeAnalysis::NONE && rtn == UNKNOWN)
+            rtn = processSpeculation(predictClassFor(node), node, rtn);
+        _doSet(node->vreg_dst, rtn);
     }
 
     void visit_loadsubslice(BST_LoadSubSlice* node) override {

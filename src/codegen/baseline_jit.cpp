@@ -164,7 +164,8 @@ void JitCodeBlock::fragmentAbort(bool not_enough_space) {
 }
 
 void JitCodeBlock::fragmentFinished(int bytes_written, int num_bytes_overlapping, void* next_fragment_start,
-                                    std::vector<std::unique_ptr<ICInfo>>&& pp_ic_infos, ICInfo& ic_info) {
+                                    std::vector<std::unique_ptr<ICInfo>>&& pp_ic_infos,
+                                    std::vector<std::unique_ptr<NodeTypeRecorder>>&& type_recorders, ICInfo& ic_info) {
     assert(next_fragment_start == bytes_written + a.curInstPointer() - num_bytes_overlapping);
     a.setCurInstPointer((uint8_t*)next_fragment_start);
 
@@ -174,6 +175,8 @@ void JitCodeBlock::fragmentFinished(int bytes_written, int num_bytes_overlapping
     ic_info.appendDecrefInfosTo(decref_infos);
     std::move(std::begin(pp_ic_infos), std::end(pp_ic_infos), std::back_inserter(this->pp_ic_infos));
     pp_ic_infos.clear();
+    std::move(std::begin(type_recorders), std::end(type_recorders), std::back_inserter(this->type_recorders));
+    type_recorders.clear();
 }
 
 JitFragmentWriter::JitFragmentWriter(BoxedCode* code, CFGBlock* block, std::unique_ptr<ICInfo> ic_info,
@@ -472,8 +475,19 @@ RewriterVar* JitFragmentWriter::emitGetLocalMustExist(int vreg) {
     return val_var;
 }
 
-RewriterVar* JitFragmentWriter::emitGetPystonIter(RewriterVar* v) {
-    return call(false, (void*)getPystonIter, v)->setType(RefType::OWNED);
+RewriterVar* JitFragmentWriter::emitGetPystonIter(BST_stmt* node, RewriterVar* v) {
+    RewriterVar* rtn = call(false, (void*)getPystonIter, v)->setType(RefType::OWNED);
+
+    // Record the iterator type, so that the LLVM tier can specialize the loop, e.g. for a range() created in an
+    // outer loop. There is no IC here, and giving the node an ICInfo would change how the LLVM tier sizes its own IC.
+    type_recorders.emplace_back(new NodeTypeRecorder(node));
+    TypeRecorder* type_recorder = type_recorders.back().get();
+    RewriterVar* obj_cls_var = rtn->getAttr(offsetof(Box, cls));
+    addAction([=]() {
+        _emitRecordType(obj_cls_var, type_recorder);
+        rtn->bumpUse();
+    }, { obj_cls_var, rtn }, ActionType::NORMAL);
+    return rtn;
 }
 
 RewriterVar* JitFragmentWriter::emitHasnext(RewriterVar* v) {
@@ -899,7 +913,7 @@ std::pair<int, llvm::DenseSet<int>> JitFragmentWriter::finishCompilation() {
                "Error! wrote more bytes out after the 'retq' that we thought was going to be the end of the assembly.  "
                "We will end up overwriting those instructions.");
     code_block.fragmentFinished(assembler->bytesWritten(), num_bytes_overlapping, next_fragment_start,
-                                std::move(ic_infos), *ic_info);
+                                std::move(ic_infos), std::move(type_recorders), *ic_info);
 
     return std::make_pair(exit_info.num_bytes, std::move(known_non_null_vregs));
 }
@@ -1216,10 +1230,12 @@ void JitFragmentWriter::_emitPPCall(RewriterVar* result, void* func_addr, llvm::
     }
 }
 
-void JitFragmentWriter::_emitRecordType(RewriterVar* obj_cls_var) {
-    assert(!pp_infos.back().type_recorder);
-    TypeRecorder* type_recorder = new TypeRecorder;
-    pp_infos.back().type_recorder.reset(type_recorder);
+void JitFragmentWriter::_emitRecordType(RewriterVar* obj_cls_var, TypeRecorder* type_recorder) {
+    if (!type_recorder) {
+        assert(!pp_infos.back().type_recorder);
+        type_recorder = new TypeRecorder;
+        pp_infos.back().type_recorder.reset(type_recorder);
+    }
 
     // This directly emits the instructions of the recordType() function.
     assembler::Register obj_cls_reg = obj_cls_var->getInReg();
@@ -1227,12 +1243,14 @@ void JitFragmentWriter::_emitRecordType(RewriterVar* obj_cls_var) {
     const_loader.loadConstIntoReg((uint64_t)type_recorder, type_recorder_reg);
     assembler::Indirect last_seen_count = assembler::Indirect(type_recorder_reg, offsetof(TypeRecorder, last_count));
     assembler::Indirect last_seen_indirect = assembler::Indirect(type_recorder_reg, offsetof(TypeRecorder, last_seen));
+    assembler::Indirect num_changes = assembler::Indirect(type_recorder_reg, offsetof(TypeRecorder, num_changes));
 
     assembler->cmp(last_seen_indirect, obj_cls_reg);
     {
         assembler::ForwardJump je(*assembler, assembler::COND_EQUAL);
         assembler->mov(obj_cls_reg, last_seen_indirect);
         assembler->movq(assembler::Immediate(0ul), last_seen_count);
+        assembler->incq(num_changes);
     }
     assembler->incq(last_seen_count);
 

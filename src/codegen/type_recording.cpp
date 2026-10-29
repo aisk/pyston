@@ -14,6 +14,8 @@
 
 #include "codegen/type_recording.h"
 
+#include "llvm/ADT/DenseMap.h"
+
 #include "asm_writing/icinfo.h"
 #include "core/options.h"
 #include "core/types.h"
@@ -33,6 +35,7 @@ Box* recordType(TypeRecorder* self, Box* obj) {
     if (cls != self->last_seen) {
         self->last_seen = cls;
         self->last_count = 1;
+        self->num_changes++;
     } else {
         self->last_count++;
     }
@@ -42,19 +45,38 @@ Box* recordType(TypeRecorder* self, Box* obj) {
     return obj;
 }
 
-BoxedClass* predictClassFor(BST_stmt* node) {
-    ICInfo* ic = ICInfo::getICInfoForNode(node);
-    if (!ic || !ic->getTypeRecorder())
-        return NULL;
+static llvm::DenseMap<BST_stmt*, NodeTypeRecorder*> recorders_by_node;
 
-    return ic->getTypeRecorder()->predict();
+NodeTypeRecorder::NodeTypeRecorder(BST_stmt* node) : node(node) {
+    recorders_by_node[node] = this;
 }
 
-BoxedClass* TypeRecorder::predict() {
+NodeTypeRecorder::~NodeTypeRecorder() {
+    auto it = recorders_by_node.find(node);
+    if (it != recorders_by_node.end() && it->second == this)
+        recorders_by_node.erase(it);
+}
+
+BoxedClass* predictClassFor(BST_stmt* node, int64_t monomorphic_threshold) {
+    ICInfo* ic = ICInfo::getICInfoForNode(node);
+    if (ic && ic->getTypeRecorder())
+        return ic->getTypeRecorder()->predict(monomorphic_threshold);
+
+    auto it = recorders_by_node.find(node);
+    if (it != recorders_by_node.end())
+        return it->second->predict(monomorphic_threshold);
+    return NULL;
+}
+
+BoxedClass* TypeRecorder::predict(int64_t monomorphic_threshold) {
     if (!ENABLE_TYPE_FEEDBACK)
         return NULL;
 
     if (last_count > SPECULATION_THRESHOLD)
+        return last_seen;
+
+    // Code in an outer loop can get compiled after only a few runs, when the inner loop triggers OSR.
+    if (num_changes == 1 && last_count >= monomorphic_threshold)
         return last_seen;
 
     return NULL;
