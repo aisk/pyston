@@ -97,6 +97,7 @@ extern "C" Box* unaryop(Box* operand, int op_type) __attribute__((noinline));
 extern "C" Box* importFrom(Box* obj, BoxedString* attr) __attribute__((noinline));
 extern "C" Box* importStar(Box* from_module, Box* to_globals) __attribute__((noinline));
 extern "C" Box** unpackIntoArray(Box* obj, int64_t expected_size, Box** out_keep_alive);
+extern "C" Box** unpackTupleOrListIntoArray(Box* obj, int64_t expected_size, Box** out_keep_alive);
 // Builtin function that the CFG uses for starred assignment targets (`a, *b = obj`).
 extern Box* unpack_starred_func, *dict_merge_mapping_func;
 // sys.exc_info, used by the CFG to save the exception state around except handlers.

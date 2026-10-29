@@ -15,6 +15,7 @@
 #ifndef PYSTON_CODEGEN_PATCHPOINTS_H
 #define PYSTON_CODEGEN_PATCHPOINTS_H
 
+#include <algorithm>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -39,6 +40,10 @@ extern const int XDECREF_PP_SIZE;
 static const int MAX_FRAME_SPILLS = 9; // TODO this shouldn't have to be larger than the set of non-callee-save args (9)
                                        // except that will we currently spill the same reg multiple times
 static const int CALL_ONLY_SIZE = 13 + 1; // 13 for the call, + 1 if we want to nop/trap
+
+// Frame args can only need spilling if they are in one of the caller-save registers (9 GP and 16 XMM ones).
+static const int MAX_CALLER_SAVE_REGS = 25;
+static const int SPILL_SIZE = 9; // 7 bytes for GP, 9 for XMM
 
 static const int DEOPT_CALL_ONLY_SIZE
     = 13 + (MAX_FRAME_SPILLS * 9)
@@ -135,10 +140,16 @@ public:
     FrameInfoDesc& getFrameDesc() { return frame_info_desc; }
 
     int scratchStackmapArg() { return 0; }
-    int scratchSize() { return isDeopt() ? MAX_FRAME_SPILLS * sizeof(void*) : 96; }
+    int scratchSize() { return (isDeopt() ? 0 : 96) + numFrameSpillsSupported() * sizeof(void*); }
     bool isDeopt() const { return icinfo ? icinfo->isDeopt() : false; }
     bool isFrameInfoStackmap() const { return is_frame_info_stackmap; }
-    int numFrameSpillsSupported() const { return isDeopt() ? MAX_FRAME_SPILLS : 0; }
+    // Deopts always have room for MAX_FRAME_SPILLS spills, other patchpoints only get room if they have frame args
+    // (the lazy locals).
+    int numFrameSpillsSupported() const {
+        assert(num_frame_stackmap_args >= 0);
+        int n = std::min(num_frame_stackmap_args, MAX_CALLER_SAVE_REGS);
+        return isDeopt() ? std::max(n, MAX_FRAME_SPILLS) : n;
+    }
 
     void addFrameVar(int vreg, CompilerType* type) {
         frame_info_desc.vars.push_back(FrameVarInfo({.vreg = vreg, .type = type }));

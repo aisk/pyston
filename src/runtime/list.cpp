@@ -1519,6 +1519,7 @@ void setupList() {
 
     BoxedCode* getitem = new BoxedCode(2, false, false, "list.__getitem__");
     getitem->addVersion((void*)listGetitemInt, UNKNOWN, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT });
+    registerNoPythonCodeFunction((void*)listGetitemInt);
     getitem->addVersion((void*)listGetitemSlice<CXX>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE }, CXX);
     getitem->addVersion((void*)listGetitem<CXX>, UNKNOWN, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN }, CXX);
     getitem->addVersion((void*)listGetitemSlice<CAPI>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE }, CAPI);
@@ -1618,6 +1619,10 @@ void setupList() {
                                                                          "list_iterator.__length_hint__")));
     list_iterator_cls->freeze();
     list_iterator_cls->tpp_hasnext = listiterHasnextUnboxed;
+    registerNoPythonCodeFunction((void*)listIter);
+    registerNoPythonCodeFunction((void*)listiterHasnextUnboxed);
+    registerNoPythonCodeFunction((void*)listiterNext<CXX>);
+    registerNoPythonCodeFunction((void*)listiterNext<CAPI>);
     list_iterator_cls->tp_iternext = listiter_next;
     list_iterator_cls->tp_iter = PyObject_SelfIter;
 

@@ -38,9 +38,10 @@ struct GlobalFuncs {
         importFrom, importStar, repr, exceptionMatches, yield_capi, getiterHelper, hasnext, setGlobal,
         apply_slice, applySlice, assignSlice;
 
-    llvm::FunctionCallee unpackIntoArray, raiseAttributeError, raiseAttributeErrorStr, raiseAttributeErrorCapi,
-        raiseAttributeErrorStrCapi, raiseNotIterableError, raiseIndexErrorStr, raiseIndexErrorStrCapi,
-        assertNameDefined, assertFail, assertFailDerefNameDefined, printExprHelper, printHelper, delClosureVar;
+    llvm::FunctionCallee unpackIntoArray, unpackTupleOrListIntoArray, raiseAttributeError, raiseAttributeErrorStr,
+        raiseAttributeErrorCapi, raiseAttributeErrorStrCapi, raiseNotIterableError, raiseIndexErrorStr,
+        raiseIndexErrorStrCapi, assertNameDefined, assertFail, assertFailDerefNameDefined, printExprHelper, printHelper,
+        delClosureVar;
     llvm::FunctionCallee listAppendInternal, dictSetInternal;
     ExceptionSwitchable<llvm::FunctionCallee> runtimeCall0, runtimeCall1, runtimeCall2, runtimeCall3, runtimeCall, runtimeCallN;
     ExceptionSwitchable<llvm::FunctionCallee> callattr0, callattr1, callattr2, callattr3, callattr, callattrN;

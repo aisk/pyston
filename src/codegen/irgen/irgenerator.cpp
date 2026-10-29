@@ -14,6 +14,8 @@
 
 #include "codegen/irgen/irgenerator.h"
 
+#include <algorithm>
+
 #include "llvm/IR/DebugInfoMetadata.h"
 
 #include "llvm/IR/Module.h"
@@ -193,6 +195,33 @@ template <typename Builder> static llvm::Value* getFrameObjGep(Builder& builder,
     return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 2);
     // TODO: this could be made more resilient by doing something like
     // gep->accumulateConstantOffset(g.tm->getDataLayout(), ap_offset)
+}
+
+// Puts the value of a lazy local into its vreg, if it is defined.
+static void storeLazyLocal(Box** vreg, BORROWED(Box*) val, bool is_defined) noexcept {
+    if (!is_defined)
+        return;
+    Box* old = *vreg;
+    *vreg = incref(val);
+    Py_XDECREF(old);
+}
+
+// These write an unboxed local into its vreg, unless the vreg already has the same value (like a loop's outer
+// counter, flushed again on every iteration of the inner loop).
+static void storeLazyInt(Box** vreg, int64_t n) noexcept {
+    Box* old = *vreg;
+    if (old && old->cls == int_cls && static_cast<BoxedInt*>(old)->n == n)
+        return;
+    *vreg = boxInt(n);
+    Py_XDECREF(old);
+}
+
+static void storeLazyFloat(Box** vreg, double d) noexcept {
+    Box* old = *vreg;
+    if (old && old->cls == float_cls && memcmp(&static_cast<BoxedFloat*>(old)->d, &d, sizeof(d)) == 0)
+        return;
+    *vreg = boxFloat(d);
+    Py_XDECREF(old);
 }
 
 template <typename Builder> static llvm::Value* getPassedClosureGep(Builder& builder, llvm::Value* v) {
@@ -443,6 +472,8 @@ private:
         builder.CreateCondBr(is_zero, join_block, pendingcalls_set, branch_weights);
         {
             setCurrentBasicBlock(pendingcalls_set);
+            // Signal handlers can look at the frame or raise.
+            irgenerator->flushLazyLocals();
 
             if (exc_dest) {
                 builder.CreateInvoke(g.funcs.makePendingCalls, join_block, exc_dest);
@@ -468,11 +499,20 @@ private:
         llvm::BasicBlock* exc_dest
             = irgenerator->getCAPIExcDest(curblock, unw_info.exc_dest, unw_info.current_stmt, unw_info.is_after_deopt);
 
+        // The exception destination is shared, so this call site needs its own block to flush the lazy locals.
+        if (irgenerator->hasLazyLocals()) {
+            llvm::BasicBlock* from_block = curblock;
+            llvm::BasicBlock* flush_bb = createBasicBlock("capi_exc_flush_lazy");
+            setCurrentBasicBlock(flush_bb);
+            irgenerator->flushLazyLocals();
+            getBuilder()->CreateBr(exc_dest);
+            setCurrentBasicBlock(from_block);
+            exc_dest = flush_bb;
+        }
+
         if (exc_val == ALWAYS_THROWS) {
             assert(returned_val->getType() == g.void_);
 
-            llvm::BasicBlock* exc_dest = irgenerator->getCAPIExcDest(curblock, unw_info.exc_dest, unw_info.current_stmt,
-                                                                     unw_info.is_after_deopt);
             getBuilder()->CreateBr(exc_dest);
         } else {
             assert(returned_val->getType() == exc_val->getType());
@@ -486,6 +526,21 @@ private:
     llvm::CallBase* emitCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee,
                              const std::vector<llvm::Value*>& args, ExceptionStyle target_exception_style,
                              llvm::Value* capi_exc_value) {
+        // Only patchpoints record the lazy locals. Functions that don't run Python code can only expose the frame
+        // by throwing, so for those the exception path writes the locals out instead.
+        bool flush_lazy_locals_on_throw = false;
+        auto* callee_func = llvm::dyn_cast<llvm::Function>(callee.getCallee());
+        if (!callee_func || !callee_func->isIntrinsic()) {
+            auto* ce = llvm::dyn_cast<llvm::ConstantExpr>(callee.getCallee());
+            auto* addr = ce && ce->getOpcode() == llvm::Instruction::IntToPtr
+                             ? llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0))
+                             : NULL;
+            if (addr && runsNoPythonCode((void*)addr->getZExtValue()))
+                flush_lazy_locals_on_throw = irgenerator->hasLazyLocals();
+            else
+                irgenerator->flushLazyLocals();
+        }
+
         emitSetCurrentStmt(unw_info.current_stmt);
 
         if (target_exception_style == CAPI)
@@ -496,8 +551,9 @@ private:
             needs_cxx_interception = false;
         } else {
             bool needs_refcounting_fixup = false;
-            needs_cxx_interception = (target_exception_style == CXX && (needs_refcounting_fixup || unw_info.hasHandler()
-                                                                        || irstate->getExceptionStyle() == CAPI));
+            needs_cxx_interception = (target_exception_style == CXX
+                                      && (needs_refcounting_fixup || unw_info.hasHandler()
+                                          || irstate->getExceptionStyle() == CAPI || flush_lazy_locals_on_throw));
         }
 
         if (needs_cxx_interception) {
@@ -570,12 +626,16 @@ private:
         }
         assert(func_addr);
 
-        int pp_size = pp ? pp->totalSize() : CALL_ONLY_SIZE;
         auto calling_convention = pp ? pp->getCallingConvention() : (llvm::CallingConv::ID)llvm::CallingConv::C;
         PatchpointInfo* info
             = PatchpointInfo::create(currentFunction(), std::move(pp), ic_stackmap_args.size(), func_addr);
 
         int64_t pp_id = info->getId();
+
+        // The frame args decide how much room the patchpoint needs for spilling them.
+        std::vector<llvm::Value*> frame_args;
+        irgenerator->addFrameStackmapArgs(info, frame_args);
+        int pp_size = info->patchpointSize();
 
 
         std::vector<llvm::Value*> pp_args;
@@ -595,8 +655,7 @@ private:
         pp_args.push_back(scratch_space);
 
         pp_args.insert(pp_args.end(), ic_stackmap_args.begin(), ic_stackmap_args.end());
-
-        irgenerator->addFrameStackmapArgs(info, pp_args);
+        pp_args.insert(pp_args.end(), frame_args.begin(), frame_args.end());
 
         llvm::Function* patchpoint;
         if (return_type->isIntegerTy() || return_type->isPointerTy()) {
@@ -784,6 +843,8 @@ private:
     // symbol_table tracks which (non-global) python variables are bound to which CompilerVariables
     SymbolTable symbol_table;
     DefinednessTable definedness_vars;
+    // The lazy locals whose vregs are out of date, see keepLocalLazy().
+    llvm::DenseSet<int> lazy_vregs;
 
     std::unordered_map<CFGBlock*, llvm::BasicBlock*>& entry_blocks;
     CFGBlock* myblock;
@@ -1715,16 +1776,152 @@ private:
             if (prev) {
                 auto* old_value = emitter.getBuilder()->CreateLoad(g.llvm_value_type_ptr, gep);
                 emitter.setType(old_value, RefType::OWNED);
-                if (potentially_undefined)
+                // The vreg of a lazy local is empty if it was never flushed.
+                if (potentially_undefined || lazy_vregs.count(vreg))
                     emitter.setNullable(old_value, true);
             }
 
             llvm::Value* new_val = get_llvm_val_cb();
             auto* store = emitter.getBuilder()->CreateStore(new_val, gep);
             emitter.refConsumed(new_val, store);
+            lazy_vregs.erase(vreg);
         }
     }
 
+    // Lazy locals: the LLVM tier doesn't box ints and floats to store them in the frame's vregs.  The vregs of these
+    // names are out of date, and get updated (flushed) only when something could look at them: before calls that
+    // don't record the lazy locals in their stackmap, on exception paths, and when returning from a function whose
+    // frame object escaped.  Patchpoints record the lazy locals, and the runtime writes them into the vregs if it
+    // needs the frame's locals while the function is running (see materializeLazyLocals()).
+    bool keepLocalLazy(int vreg, CompilerVariable* val) {
+        CompilerType* t = val->getType();
+        return ENABLE_LAZY_LOCALS && (t == INT || t == FLOAT) && !irstate->getSourceInfo()->is_generator
+               && irstate->getSourceInfo()->cfg->getVRegInfo().isUserVisibleVReg(vreg);
+    }
+
+    template <typename GetLLVMValCB>
+    void _setVRegOrKeepLazy(int vreg, CompilerVariable* val, GetLLVMValCB get_llvm_val_cb, CompilerVariable* prev,
+                            bool potentially_undefined) {
+        // Storing a value that is already boxed is cheap, and saves flushing it later.
+        if (keepLocalLazy(vreg, val) && !getExistingBox(val))
+            lazy_vregs.insert(vreg);
+        else
+            _setVRegIfUserVisible(vreg, get_llvm_val_cb, prev, potentially_undefined);
+    }
+
+    // Stores the boxed value of a lazy local into its vreg (if the name is defined).
+    void _flushLazyLocal(int vreg) {
+        CompilerVariable* var = symbol_table[vreg];
+        assert(var);
+        llvm::Value* is_defined = definedness_vars[vreg];
+        llvm::BasicBlock* join = NULL;
+        if (is_defined) {
+            is_defined = i1FromLLVMBool(emitter, is_defined);
+            llvm::BasicBlock* store_bb = emitter.createBasicBlock("flush_lazy_local");
+            join = emitter.createBasicBlock("flush_lazy_local_done");
+            emitter.getBuilder()->CreateCondBr(is_defined, store_bb, join);
+            emitter.setCurrentBasicBlock(store_bb);
+        }
+        if (ConcreteCompilerVariable* boxed = getExistingBox(var)) {
+            _setVRegIfUserVisible(vreg, [&]() { return boxed->getValue(); }, var, true);
+        } else {
+            static llvm::FunctionCallee store_int
+                = llvm::FunctionCallee(llvm::FunctionType::get(g.void_, { g.llvm_value_type_ptr_ptr, g.i64 }, false),
+                                       embedConstantPtr((void*)storeLazyInt, g.i8_ptr));
+            static llvm::FunctionCallee store_float = llvm::FunctionCallee(
+                llvm::FunctionType::get(g.void_, { g.llvm_value_type_ptr_ptr, g.double_ }, false),
+                embedConstantPtr((void*)storeLazyFloat, g.i8_ptr));
+            auto b = emitter.getBuilder();
+            auto* gep = b->CreateConstInBoundsGEP1_64(g.llvm_value_type_ptr, irstate->getVRegsVar(), vreg);
+            llvm::Value* val = getUnboxedValue(var);
+            if (var->getType() == INT) {
+                // Inline the check of storeLazyInt() that the vreg already has this int.
+                llvm::BasicBlock* check_bb = emitter.createBasicBlock("flush_lazy_int_check");
+                llvm::BasicBlock* call_bb = emitter.createBasicBlock("flush_lazy_int_store");
+                llvm::BasicBlock* done_bb = emitter.createBasicBlock("flush_lazy_int_done");
+                llvm::Value* old = b->CreateLoad(g.llvm_value_type_ptr, gep);
+                b->CreateCondBr(b->CreateICmpEQ(old, getNullPtr(g.llvm_value_type_ptr)), call_bb, check_bb);
+
+                emitter.setCurrentBasicBlock(check_bb);
+                llvm::Value* cls = b->CreateLoad(g.llvm_class_type_ptr,
+                                                 b->CreateConstInBoundsGEP1_64(g.i8, old, offsetof(Box, cls)));
+                llvm::Value* n = b->CreateLoad(g.i64, b->CreateConstInBoundsGEP1_64(g.i8, old, offsetof(BoxedInt, n)));
+                llvm::Value* same = b->CreateAnd(
+                    b->CreateICmpEQ(cls, embedRelocatablePtr(int_cls, g.llvm_class_type_ptr)), b->CreateICmpEQ(n, val));
+                b->CreateCondBr(same, done_bb, call_bb);
+
+                emitter.setCurrentBasicBlock(call_bb);
+                b->CreateCall(store_int, { gep, val });
+                b->CreateBr(done_bb);
+                emitter.setCurrentBasicBlock(done_bb);
+            } else {
+                b->CreateCall(store_float, { gep, val });
+            }
+            lazy_vregs.erase(vreg);
+        }
+        if (join) {
+            emitter.getBuilder()->CreateBr(join);
+            emitter.setCurrentBasicBlock(join);
+        }
+    }
+
+    // The same, but without creating new blocks (for the end of a block).  boxed is borrowed.
+    void _flushLazyLocalAtBlockEnd(int vreg, llvm::Value* boxed) {
+        llvm::Value* is_defined = definedness_vars[vreg];
+        if (!is_defined) {
+            _setVRegIfUserVisible(vreg, [&]() { return boxed; }, symbol_table[vreg], true);
+            return;
+        }
+
+        static llvm::FunctionCallee store_func = llvm::FunctionCallee(
+            llvm::FunctionType::get(g.void_, { g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i1 }, false),
+            embedConstantPtr((void*)storeLazyLocal, g.i8_ptr));
+        auto* gep
+            = emitter.getBuilder()->CreateConstInBoundsGEP1_64(g.llvm_value_type_ptr, irstate->getVRegsVar(), vreg);
+        auto* call = emitter.getBuilder()->CreateCall(store_func, { gep, boxed, i1FromLLVMBool(emitter, is_defined) });
+        emitter.refUsed(boxed, call);
+        lazy_vregs.erase(vreg);
+    }
+
+public:
+    bool hasLazyLocals() override { return !lazy_vregs.empty(); }
+
+    // The current block may not be on the main path (it can be a slow path or an exception path), so this neither
+    // caches the boxes in the variables nor marks the vregs as up to date.
+    void flushLazyLocals() override {
+        if (lazy_vregs.empty())
+            return;
+
+        std::vector<int> vregs(lazy_vregs.begin(), lazy_vregs.end());
+        std::sort(vregs.begin(), vregs.end());
+        for (int vreg : vregs)
+            _flushLazyLocal(vreg);
+
+        // (_setVRegIfUserVisible() took them out.)
+        lazy_vregs.insert(vregs.begin(), vregs.end());
+    }
+
+    // Flushes the lazy locals if the frame object escaped, since it reads the locals when the frame exits.
+    void flushLazyLocalsForExit() {
+        if (lazy_vregs.empty())
+            return;
+
+        auto b = emitter.getBuilder();
+        llvm::Value* frame_obj = b->CreateLoad(g.i8_ptr, getFrameObjGep(*b, irstate->getFrameInfoVar()));
+        llvm::BasicBlock* flush_bb = emitter.createBasicBlock("flush_lazy_locals");
+        llvm::BasicBlock* join = emitter.createBasicBlock("flush_lazy_locals_done");
+        llvm::Metadata* md_vals[]
+            = { llvm::MDString::get(g.context, "branch_weights"), llvm::ConstantAsMetadata::get(getConstantInt(1)),
+                llvm::ConstantAsMetadata::get(getConstantInt(1000)) };
+        b->CreateCondBr(b->CreateICmpNE(frame_obj, getNullPtr(g.i8_ptr)), flush_bb, join,
+                        llvm::MDNode::get(g.context, md_vals));
+        emitter.setCurrentBasicBlock(flush_bb);
+        flushLazyLocals();
+        emitter.getBuilder()->CreateBr(join);
+        emitter.setCurrentBasicBlock(join);
+    }
+
+private:
     // only updates symbol_table if we're *not* setting a global
     void _doSet(BST_Name* node, CompilerVariable* val, const UnwindInfo& unw_info) {
         assert(node->id.s() != "None");
@@ -1785,7 +1982,7 @@ private:
             }
 
             auto&& get_llvm_val = [&]() { return val->makeConverted(emitter, UNKNOWN)->getValue(); };
-            _setVRegIfUserVisible(vreg, get_llvm_val, prev, maybe_was_undefined);
+            _setVRegOrKeepLazy(vreg, val, get_llvm_val, prev, maybe_was_undefined);
         }
     }
 
@@ -1865,7 +2062,7 @@ private:
             }
 
             auto&& get_llvm_val = [&]() { return val->makeConverted(emitter, UNKNOWN)->getValue(); };
-            _setVRegIfUserVisible(vreg, get_llvm_val, prev, maybe_was_undefined);
+            _setVRegOrKeepLazy(vreg, val, get_llvm_val, prev, maybe_was_undefined);
         }
     }
 
@@ -1968,7 +2165,7 @@ private:
         bool maybe_was_undefined = popDefinedVar(vreg, true);
 
         auto&& get_llvm_val = [&]() { return val->makeConverted(emitter, UNKNOWN)->getValue(); };
-        _setVRegIfUserVisible(vreg, get_llvm_val, prev, maybe_was_undefined);
+        _setVRegOrKeepLazy(vreg, val, get_llvm_val, prev, maybe_was_undefined);
     }
 
     void doAssert(BST_Assert* node, const UnwindInfo& unw_info) {
@@ -2193,6 +2390,7 @@ private:
 
         emitter.emitSetCurrentStmt(node);
 
+        flushLazyLocalsForExit();
         if (!irstate->getCurFunction()->entry_descriptor)
             emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
 
@@ -2662,6 +2860,9 @@ private:
                 // printf("have to convert %s from %s to %s\n", p.first.c_str(),
                 // p.second->getType()->debugName().c_str(), phi_type->debugName().c_str());
                 ConcreteCompilerVariable* v = val->makeConverted(emitter, phi_type);
+                // The next block only treats ints and floats as lazy locals.
+                if (lazy_vregs.count(vreg) && phi_type != UNBOXED_INT_PHI && phi_type != UNBOXED_FLOAT_PHI)
+                    _flushLazyLocalAtBlockEnd(vreg, v->getValue());
                 symbol_table[vreg] = v;
             } else {
                 if (myblock->successors().size()) {
@@ -2740,13 +2941,12 @@ public:
             if (scoping.createsClosure())
                 stackmap_args.push_back(irstate->getCreatedClosure());
 
-            typedef std::pair<InternedString, CompilerVariable*> Entry;
             for (auto&& p : symbol_table) {
                 int vreg = p.first;
 
                 // We never have to include non compiler generated vars because the user visible variables are stored
-                // inside the vregs array.
-                if (vregs.isUserVisibleVReg(vreg)) {
+                // inside the vregs array, except for the lazy locals.
+                if (vregs.isUserVisibleVReg(vreg) && !lazy_vregs.count(vreg)) {
                     assert(!vregs.getName(p.first).isCompilerCreatedName());
                     continue;
                 }
@@ -2757,13 +2957,28 @@ public:
             }
 
             for (auto&& p : definedness_vars) {
-                if (vregs.isUserVisibleVReg(p.first))
+                if (vregs.isUserVisibleVReg(p.first) && !lazy_vregs.count(p.first))
                     continue;
 
                 assert(symbol_table[p.first]);
 
                 stackmap_args.push_back(p.second);
                 pp->addPotentiallyUndefined(p.first);
+            }
+        } else if (ENABLE_FRAME_INTROSPECTION) {
+            // Other calls only need the lazy locals, see materializeLazyLocals().
+            std::vector<int> lazy(lazy_vregs.begin(), lazy_vregs.end());
+            std::sort(lazy.begin(), lazy.end());
+            for (int vreg : lazy) {
+                CompilerVariable* v = symbol_table[vreg];
+                v->serializeToFrame(stackmap_args);
+                pp->addFrameVar(vreg, v->getType());
+            }
+            for (int vreg : lazy) {
+                if (llvm::Value* is_defined = definedness_vars[vreg]) {
+                    stackmap_args.push_back(is_defined);
+                    pp->addPotentiallyUndefined(vreg);
+                }
             }
         }
 
@@ -2999,6 +3214,11 @@ public:
             }
             printf("\n");
         }
+        // We don't track across blocks which vregs are up to date.
+        for (auto&& p : symbol_table) {
+            if (keepLocalLazy(p.first, p.second))
+                lazy_vregs.insert(p.first);
+        }
         for (BST_stmt* stmt : *block) {
             if (state == DEAD)
                 break;
@@ -3148,7 +3368,7 @@ public:
 
         llvm::BasicBlock* cxx_exc_dest = llvm::BasicBlock::Create(g.context, "cxxwrapper", irstate->getLLVMFunction());
 
-        emitter.getBuilder()->SetInsertPoint(cxx_exc_dest);
+        emitter.setCurrentBasicBlock(cxx_exc_dest);
 
         llvm::Value* exc_type, *exc_value, *exc_traceback;
         std::tie(exc_type, exc_value, exc_traceback) = createLandingpad(cxx_exc_dest);
@@ -3156,10 +3376,13 @@ public:
         emitter.setType(exc_value, RefType::OWNED);
         emitter.setType(exc_traceback, RefType::OWNED);
 
+        flushLazyLocals();
+
         // final_dest==NULL => propagate the exception out of the function.
         if (final_dest) {
             // Catch the exception and forward to final_dest:
-            addOutgoingExceptionState(ExceptionState(cxx_exc_dest, new ConcreteCompilerVariable(UNKNOWN, exc_type),
+            // (Flushing the lazy locals can have moved us out of cxx_exc_dest.)
+            addOutgoingExceptionState(ExceptionState(curblock, new ConcreteCompilerVariable(UNKNOWN, exc_type),
                                                      new ConcreteCompilerVariable(UNKNOWN, exc_value),
                                                      new ConcreteCompilerVariable(UNKNOWN, exc_traceback)));
 

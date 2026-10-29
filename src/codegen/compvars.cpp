@@ -515,9 +515,35 @@ public:
     std::vector<CompilerVariable*> unpack(IREmitter& emitter, const OpInfo& info, VAR* var, int num_into) override {
         llvm::Value* scratch
             = emitter.getBuilder()->CreateBitCast(emitter.getScratch(sizeof(Box*)), g.llvm_value_type_ptr_ptr);
-        llvm::Value* unpacked = emitter.createCall3(info.unw_info, g.funcs.unpackIntoArray, var->getValue(),
-                                                    getConstantInt(num_into, g.i64), scratch);
-        assert(unpacked->getType() == g.llvm_value_type_ptr_ptr);
+
+        // Tuples and lists get their own call, since it doesn't run Python code (which lets the LLVM tier keep
+        // its int and float locals out of the frame across it).
+        auto b = emitter.getBuilder();
+        llvm::Value* cls = b->CreateLoad(g.llvm_class_type_ptr,
+                                         b->CreateConstInBoundsGEP1_64(g.i8, var->getValue(), offsetof(Box, cls)));
+        llvm::Value* is_seq = b->CreateOr(b->CreateICmpEQ(cls, embedRelocatablePtr(tuple_cls, g.llvm_class_type_ptr)),
+                                          b->CreateICmpEQ(cls, embedRelocatablePtr(list_cls, g.llvm_class_type_ptr)));
+        llvm::BasicBlock* seq_bb = emitter.createBasicBlock("unpack_seq");
+        llvm::BasicBlock* generic_bb = emitter.createBasicBlock("unpack_generic");
+        llvm::BasicBlock* join_bb = emitter.createBasicBlock("unpack_done");
+        b->CreateCondBr(is_seq, seq_bb, generic_bb);
+
+        emitter.setCurrentBasicBlock(seq_bb);
+        llvm::Value* unpacked_seq = emitter.createCall3(info.unw_info, g.funcs.unpackTupleOrListIntoArray,
+                                                        var->getValue(), getConstantInt(num_into, g.i64), scratch);
+        llvm::BasicBlock* seq_end = emitter.currentBasicBlock();
+        emitter.getBuilder()->CreateBr(join_bb);
+
+        emitter.setCurrentBasicBlock(generic_bb);
+        llvm::Value* unpacked_generic = emitter.createCall3(info.unw_info, g.funcs.unpackIntoArray, var->getValue(),
+                                                            getConstantInt(num_into, g.i64), scratch);
+        llvm::BasicBlock* generic_end = emitter.currentBasicBlock();
+        emitter.getBuilder()->CreateBr(join_bb);
+
+        emitter.setCurrentBasicBlock(join_bb);
+        llvm::PHINode* unpacked = emitter.getBuilder()->CreatePHI(g.llvm_value_type_ptr_ptr, 2);
+        unpacked->addIncoming(unpacked_seq, seq_end);
+        unpacked->addIncoming(unpacked_generic, generic_end);
 
         std::vector<CompilerVariable*> rtn;
         for (int i = 0; i < num_into; i++) {
@@ -1762,6 +1788,20 @@ ConcreteCompilerType* UNBOXED_FLOAT_PHI = new UnboxedPhiType(true);
 
 CompilerVariable* makeUnboxedFromPhi(ConcreteCompilerVariable* v) {
     return static_cast<UnboxedPhiType*>(v->getType())->makeUnboxed(v->getValue());
+}
+
+ConcreteCompilerVariable* getExistingBox(CompilerVariable* v) {
+    if (v->getType() == INT)
+        return static_cast<IntType::VAR*>(v)->getValue()->boxed;
+    assert(v->getType() == FLOAT);
+    return static_cast<FloatType::VAR*>(v)->getValue()->boxed;
+}
+
+llvm::Value* getUnboxedValue(CompilerVariable* v) {
+    if (v->getType() == INT)
+        return IntType::extractInt(v);
+    assert(v->getType() == FLOAT);
+    return static_cast<FloatType::VAR*>(v)->getValue()->val;
 }
 
 ConcreteCompilerType* UNBOXED_INT = new PhonyUnboxedType(llvm::Type::getInt64Ty(getGlobalLLVMContext()), INT);

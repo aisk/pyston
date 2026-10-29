@@ -82,6 +82,8 @@ bool ENABLE_RUNTIME_ICS = 1 && _GLOBAL_ENABLE;
 bool ENABLE_JIT_OBJECT_CACHE = 0 && _GLOBAL_ENABLE;
 
 bool ENABLE_FRAME_INTROSPECTION = 1;
+// Lets the LLVM tier keep int and float locals out of the frame until something looks at them.
+bool ENABLE_LAZY_LOCALS = 1;
 
 extern "C" {
 int Py_FrozenFlag = 1;

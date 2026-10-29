@@ -220,6 +220,8 @@ void initGlobalFuncs(GlobalState& g) {
     GET(assignSlice);
 
     GET(unpackIntoArray);
+    GET(unpackTupleOrListIntoArray);
+    registerNoPythonCodeFunction((void*)unpackTupleOrListIntoArray);
     GET(raiseAttributeError);
     GET(raiseAttributeErrorStr);
     GET(raiseAttributeErrorCapi);
@@ -319,6 +321,9 @@ void initGlobalFuncs(GlobalState& g) {
     GET(div_float_float);
     GET(floordiv_float_float);
     GET(mod_float_float);
+    registerNoPythonCodeFunction((void*)div_float_float);
+    registerNoPythonCodeFunction((void*)floordiv_float_float);
+    registerNoPythonCodeFunction((void*)mod_float_float);
 
     GET(dump);
 
