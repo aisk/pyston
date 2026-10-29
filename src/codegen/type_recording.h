@@ -16,6 +16,7 @@
 #define PYSTON_CODEGEN_TYPERECORDING_H
 
 #include <cstdint>
+#include "core/options.h"
 
 namespace pyston {
 
@@ -36,15 +37,27 @@ class TypeRecorder {
 public:
     BoxedClass* last_seen;
     int64_t last_count;
+    // How many times last_seen changed, so 1 means that only one class was ever seen.
+    int64_t num_changes;
 
-    constexpr TypeRecorder() : last_seen(nullptr), last_count(0) {}
+    constexpr TypeRecorder() : last_seen(nullptr), last_count(0), num_changes(0) {}
 
-    BoxedClass* predict();
+    BoxedClass* predict(int64_t monomorphic_threshold = MONOMORPHIC_SPECULATION_THRESHOLD);
 
     friend Box* recordType(TypeRecorder*, Box*);
 };
 
-BoxedClass* predictClassFor(BST_stmt* node);
+// A type recorder for a node without an IC. It is what predictClassFor() uses for the node while it lives.
+class NodeTypeRecorder : public TypeRecorder {
+private:
+    BST_stmt* node;
+
+public:
+    NodeTypeRecorder(BST_stmt* node);
+    ~NodeTypeRecorder();
+};
+
+BoxedClass* predictClassFor(BST_stmt* node, int64_t monomorphic_threshold = MONOMORPHIC_SPECULATION_THRESHOLD);
 }
 
 #endif

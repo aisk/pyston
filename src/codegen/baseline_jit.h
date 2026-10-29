@@ -20,6 +20,7 @@
 #include "asm_writing/rewriter.h"
 #include "codegen/ast_interpreter.h"
 #include "codegen/patchpoints.h"
+#include "codegen/type_recording.h"
 
 namespace pyston {
 
@@ -180,6 +181,7 @@ private:
     std::vector<DecrefInfo> decref_infos;
     RegisterEHFrame register_eh_info;
     std::vector<std::unique_ptr<ICInfo>> pp_ic_infos;
+    std::vector<std::unique_ptr<NodeTypeRecorder>> type_recorders;
 
 
 public:
@@ -191,7 +193,8 @@ public:
     bool shouldCreateNewBlock() const { return asm_failed || a.bytesLeft() < 128; }
     void fragmentAbort(bool not_enough_space);
     void fragmentFinished(int bytes_witten, int num_bytes_overlapping, void* next_fragment_start,
-                          std::vector<std::unique_ptr<ICInfo>>&& pp_ic_infos, ICInfo& ic_info);
+                          std::vector<std::unique_ptr<ICInfo>>&& pp_ic_infos,
+                          std::vector<std::unique_ptr<NodeTypeRecorder>>&& type_recorders, ICInfo& ic_info);
 };
 
 // Hold the ICInfo of the JitFragmentWriter in a separate class from which JitFragmentWriter derives.
@@ -255,6 +258,7 @@ private:
     };
 
     llvm::SmallVector<PPInfo, 8> pp_infos;
+    std::vector<std::unique_ptr<NodeTypeRecorder>> type_recorders;
 
 public:
     JitFragmentWriter(BoxedCode* code, CFGBlock* block, std::unique_ptr<ICInfo> ic_info,
@@ -291,7 +295,7 @@ public:
     RewriterVar* emitGetItem(BST_stmt* node, RewriterVar* value, RewriterVar* slice);
     RewriterVar* emitGetLocal(InternedString name, int vreg);
     RewriterVar* emitGetLocalMustExist(int vreg);
-    RewriterVar* emitGetPystonIter(RewriterVar* v);
+    RewriterVar* emitGetPystonIter(BST_stmt* node, RewriterVar* v);
     RewriterVar* emitHasnext(RewriterVar* v);
     RewriterVar* emitImportFrom(RewriterVar* module, BoxedString* s);
     RewriterVar* emitImportName(int level, RewriterVar* from_imports, BoxedString* s);
@@ -377,7 +381,7 @@ private:
     void _emitOSRPoint();
     void _emitPPCall(RewriterVar* result, void* func_addr, llvm::ArrayRef<RewriterVar*> args, unsigned short pp_size,
                      BST_stmt* bst_node, llvm::ArrayRef<RewriterVar*> vars_to_bump);
-    void _emitRecordType(RewriterVar* obj_cls_var);
+    void _emitRecordType(RewriterVar* obj_cls_var, TypeRecorder* type_recorder = NULL);
     void _emitReturn(RewriterVar* v);
     void _emitSideExit(STOLEN(RewriterVar*) var, RewriterVar* val_constant, CFGBlock* next_block,
                        RewriterVar* false_path);

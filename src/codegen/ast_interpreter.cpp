@@ -818,7 +818,7 @@ Value ASTInterpreter::visit_locals(BST_Locals* node) {
 Value ASTInterpreter::visit_getiter(BST_GetIter* node) {
     Value val = getVReg(node->vreg_value);
     AUTO_DECREF(val.o);
-    return Value(getPystonIter(val.o), jit ? jit->emitGetPystonIter(val) : NULL);
+    return Value(getPystonIter(val.o), jit ? jit->emitGetPystonIter(node, val) : NULL);
 }
 
 Value ASTInterpreter::visit_importfrom(BST_ImportFrom* node) {
