@@ -1418,9 +1418,7 @@ public:
             BOXED_INT, emitter.setType(b->CreateCall(g.funcs.boxInt, r), RefType::OWNED));
         CompilerVariable* slow = bl->binexp(emitter, info, br, op_type, exp_type);
         ConcreteCompilerVariable* slow_boxed = slow->makeConverted(emitter, UNKNOWN);
-        llvm::Value* deopt_val = emitter.createDeopt(info.unw_info.current_stmt, slow_boxed->getValue());
-        llvm::Instruction* ret = emitter.getBuilder()->CreateRet(deopt_val);
-        emitter.refConsumed(deopt_val, ret);
+        emitter.createDeoptExit(info.unw_info.current_stmt, slow_boxed->getValue());
 
         emitter.setCurrentBasicBlock(ok_bb);
         return makeInt(val);

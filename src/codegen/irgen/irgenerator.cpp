@@ -50,7 +50,7 @@ extern "C" void dumpLLVM(void* _v) {
 
 IRGenState::IRGenState(BoxedCode* code, CompiledFunction* cf, llvm::Function* func, SourceInfo* source_info,
                        std::unique_ptr<PhiAnalysis> phis, const ParamNames* param_names, GCBuilder* gc,
-                       llvm::MDNode* func_dbg_info, RefcountTracker* refcount_tracker)
+                       llvm::MDNode* func_dbg_info, RefcountTracker* refcount_tracker, InlineInfo* inline_info)
     : code(code),
       cf(cf),
       func(func),
@@ -60,14 +60,16 @@ IRGenState::IRGenState(BoxedCode* code, CompiledFunction* cf, llvm::Function* fu
       gc(gc),
       func_dbg_info(func_dbg_info),
       refcount_tracker(refcount_tracker),
+      inline_info(inline_info),
       scratch_space(NULL),
       frame_info(NULL),
+      frame_info_ptr_slot(NULL),
       globals(NULL),
       vregs(NULL),
       stmt(NULL),
       scratch_size(0) {
     assert(func);
-    assert(cf->code_obj->source.get() == source_info); // I guess this is duplicate now
+    assert(inline_info || cf->code_obj->source.get() == source_info); // I guess this is duplicate now
 }
 
 IRGenState::~IRGenState() {
@@ -110,6 +112,9 @@ void IRGenState::setPassedGenerator(llvm::Value* v) {
 }
 
 llvm::Value* IRGenState::getScratchSpace(int min_bytes) {
+    if (inline_info)
+        return inline_info->caller->getScratchSpace(min_bytes);
+
     llvm::BasicBlock& entry_block = getLLVMFunction()->getEntryBlock();
 
     if (scratch_space) {
@@ -254,6 +259,87 @@ template <typename Builder> static llvm::Value* getCodeGep(Builder& builder, llv
     return builder.CreateConstInBoundsGEP2_32(g.llvm_frame_info_type, v, 0, 9);
 }
 
+// Allocates (with alloca_builder) and initializes (with builder) a new FrameInfo, and pushes it.
+void IRGenState::initNewFrameInfo(llvm::IRBuilder<>& alloca_builder, llvm::IRBuilder<>& builder,
+                                  llvm::Value* passed_closure, llvm::Value* passed_globals) {
+    llvm::AllocaInst* al = alloca_builder.CreateAlloca(g.llvm_frame_info_type, NULL, "frame_info");
+    assert(al->isStaticAlloca());
+
+    assert(!vregs);
+    int num_user_visible_vregs = getSourceInfo()->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
+    if (num_user_visible_vregs > 0) {
+        auto* vregs_alloca
+            = alloca_builder.CreateAlloca(g.llvm_value_type_ptr, getConstantInt(num_user_visible_vregs), "vregs");
+        // Clear the vregs array because 0 means undefined valued.
+        builder.CreateMemSet(vregs_alloca, getConstantInt(0, g.i8),
+                             getConstantInt(num_user_visible_vregs * sizeof(Box*)), vregs_alloca->getAlign());
+        vregs = vregs_alloca;
+    } else
+        vregs = getNullPtr(g.llvm_value_type_ptr_ptr);
+
+    // frame_info.exc.type = NULL
+    llvm::Constant* null_value = getNullPtr(g.llvm_value_type_ptr);
+    getRefcounts()->setType(null_value, RefType::BORROWED);
+    getRefcounts()->setNullable(null_value, true);
+    llvm::Value* exc_info = getExcinfoGep(builder, al);
+    builder.CreateStore(null_value, builder.CreateConstInBoundsGEP2_32(g.llvm_excinfo_type, exc_info, 0,
+                                                                       offsetof(ExcInfo, type) / sizeof(Box*)));
+
+    // frame_info.boxedLocals = NULL
+    llvm::Value* boxed_locals_gep = getBoxedLocalsGep(builder, al);
+    builder.CreateStore(getNullPtr(g.llvm_value_type_ptr), boxed_locals_gep);
+
+    if (getScopeInfo().usesNameLookup()) {
+        // frame_info.boxedLocals = createDict(), or the namespace prepared for a class body
+        // (Since this can call into the GC, we have to initialize it to NULL first as we did above.)
+        bool is_class_body = getCode()->source->ast_type == AST_TYPE::ClassDef;
+        this->boxed_locals = builder.CreateCall(is_class_body ? g.funcs.createClassNamespace : g.funcs.createDict);
+        getRefcounts()->setType(this->boxed_locals, RefType::OWNED);
+        auto inst = builder.CreateStore(this->boxed_locals, boxed_locals_gep);
+        getRefcounts()->refConsumed(this->boxed_locals, inst);
+    }
+
+    // frame_info.frame_obj = NULL
+    static llvm::Type* llvm_frame_obj_type_ptr
+        = llvm::cast<llvm::StructType>(g.llvm_frame_info_type)->getElementType(2);
+    auto null_frame = getNullPtr(llvm_frame_obj_type_ptr);
+    getRefcounts()->setType(null_frame, RefType::BORROWED);
+    builder.CreateStore(null_frame, getFrameObjGep(builder, al));
+
+    // set  frame_info.passed_closure
+    builder.CreateStore(passed_closure, getPassedClosureGep(builder, al));
+    // set frame_info.globals
+    auto globals_store = builder.CreateStore(passed_globals, getGlobalsGep(builder, al));
+    getRefcounts()->refConsumed(passed_globals, globals_store);
+    // set frame_info.vregs
+    builder.CreateStore(vregs, getVRegsGep(builder, al));
+    builder.CreateStore(getConstantInt(num_user_visible_vregs, g.i32), getNumVRegsGep(builder, al));
+    builder.CreateStore(
+        getRefcounts()->setType(embedRelocatablePtr(getCode(), g.llvm_code_type_ptr), RefType::BORROWED),
+        getCodeGep(builder, al));
+
+    this->frame_info = al;
+    this->globals = passed_globals;
+
+    builder.CreateCall(g.funcs.initFrame, this->frame_info);
+}
+
+void IRGenState::setupInlinedFrameInfoVar(llvm::BasicBlock* bb) {
+    assert(inline_info);
+    assert(!frame_info);
+    llvm::BasicBlock& entry_block = getLLVMFunction()->getEntryBlock();
+    llvm::IRBuilder<> alloca_builder(&entry_block, entry_block.getFirstInsertionPt());
+    llvm::IRBuilder<> builder(bb);
+
+    llvm::Value* passed_closure = getNullPtr(g.llvm_closure_type_ptr);
+    getRefcounts()->setType(passed_closure, RefType::BORROWED);
+    initNewFrameInfo(alloca_builder, builder, passed_closure, inline_info->globals);
+
+    stmt = getStmtGep(builder, frame_info);
+    frame_info_ptr_slot = inline_info->caller->getFrameInfoPtrSlot();
+    builder.CreateStore(frame_info, frame_info_ptr_slot);
+}
+
 void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* passed_globals,
                                    llvm::Value* frame_info_arg) {
     /*
@@ -314,70 +400,11 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
         }
     } else {
         // The "normal" case
-        llvm::AllocaInst* al = builder.CreateAlloca(g.llvm_frame_info_type, NULL, "frame_info");
-        assert(al->isStaticAlloca());
-
-        assert(!vregs);
-        int num_user_visible_vregs = getSourceInfo()->cfg->getVRegInfo().getNumOfUserVisibleVRegs();
-        if (num_user_visible_vregs > 0) {
-            auto* vregs_alloca
-                = builder.CreateAlloca(g.llvm_value_type_ptr, getConstantInt(num_user_visible_vregs), "vregs");
-            // Clear the vregs array because 0 means undefined valued.
-            builder.CreateMemSet(vregs_alloca, getConstantInt(0, g.i8),
-                                 getConstantInt(num_user_visible_vregs * sizeof(Box*)), vregs_alloca->getAlign());
-            vregs = vregs_alloca;
-        } else
-            vregs = getNullPtr(g.llvm_value_type_ptr_ptr);
-
-        // frame_info.exc.type = NULL
-        llvm::Constant* null_value = getNullPtr(g.llvm_value_type_ptr);
-        getRefcounts()->setType(null_value, RefType::BORROWED);
-        getRefcounts()->setNullable(null_value, true);
-        llvm::Value* exc_info = getExcinfoGep(builder, al);
-        builder.CreateStore(null_value, builder.CreateConstInBoundsGEP2_32(g.llvm_excinfo_type, exc_info, 0,
-                                                                           offsetof(ExcInfo, type) / sizeof(Box*)));
-
-        // frame_info.boxedLocals = NULL
-        llvm::Value* boxed_locals_gep = getBoxedLocalsGep(builder, al);
-        builder.CreateStore(getNullPtr(g.llvm_value_type_ptr), boxed_locals_gep);
-
-        if (getScopeInfo().usesNameLookup()) {
-            // frame_info.boxedLocals = createDict(), or the namespace prepared for a class body
-            // (Since this can call into the GC, we have to initialize it to NULL first as we did above.)
-            bool is_class_body = getCode()->source->ast_type == AST_TYPE::ClassDef;
-            this->boxed_locals
-                = builder.CreateCall(is_class_body ? g.funcs.createClassNamespace : g.funcs.createDict);
-            getRefcounts()->setType(this->boxed_locals, RefType::OWNED);
-            auto inst = builder.CreateStore(this->boxed_locals, boxed_locals_gep);
-            getRefcounts()->refConsumed(this->boxed_locals, inst);
-        }
-
-        // frame_info.frame_obj = NULL
-        static llvm::Type* llvm_frame_obj_type_ptr
-            = llvm::cast<llvm::StructType>(g.llvm_frame_info_type)->getElementType(2);
-        auto null_frame = getNullPtr(llvm_frame_obj_type_ptr);
-        getRefcounts()->setType(null_frame, RefType::BORROWED);
-        builder.CreateStore(null_frame, getFrameObjGep(builder, al));
-
-        // set  frame_info.passed_closure
-        builder.CreateStore(passed_closure, getPassedClosureGep(builder, al));
-        // set frame_info.globals
-        auto globals_store = builder.CreateStore(passed_globals, getGlobalsGep(builder, al));
-        getRefcounts()->refConsumed(passed_globals, globals_store);
-        // set frame_info.vregs
-        builder.CreateStore(vregs, getVRegsGep(builder, al));
-        builder.CreateStore(getConstantInt(num_user_visible_vregs, g.i32), getNumVRegsGep(builder, al));
-        builder.CreateStore(
-            getRefcounts()->setType(embedRelocatablePtr(getCode(), g.llvm_code_type_ptr), RefType::BORROWED),
-            getCodeGep(builder, al));
-
-        this->frame_info = al;
-        this->globals = passed_globals;
-
-        builder.CreateCall(g.funcs.initFrame, this->frame_info);
+        initNewFrameInfo(builder, builder, passed_closure, passed_globals);
     }
 
     stmt = getStmtGep(builder, frame_info);
+    frame_info_ptr_slot = al_pointer_to_frame_info;
     builder.CreateStore(this->frame_info, al_pointer_to_frame_info);
     // Create stackmap to make a pointer to the frame_info location known
     PatchpointInfo* info = PatchpointInfo::create(getCurFunction(), 0, 0, 0);
@@ -393,6 +420,11 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
 llvm::Value* IRGenState::getFrameInfoVar() {
     assert(frame_info);
     return frame_info;
+}
+
+llvm::Value* IRGenState::getFrameInfoPtrSlot() {
+    assert(frame_info_ptr_slot);
+    return frame_info_ptr_slot;
 }
 
 llvm::Value* IRGenState::getBoxedLocalsVar() {
@@ -511,7 +543,7 @@ private:
         }
 
         if (exc_val == ALWAYS_THROWS) {
-            assert(returned_val->getType() == g.void_);
+            assert(!returned_val || returned_val->getType() == g.void_);
 
             getBuilder()->CreateBr(exc_dest);
         } else {
@@ -523,6 +555,14 @@ private:
         setCurrentBasicBlock(normal_dest);
     }
 
+public:
+    // Handles the CAPI exception that is set, like after a call that raised it.
+    void propagateCapiException(const UnwindInfo& unw_info) {
+        checkAndPropagateCapiException(unw_info, NULL, ALWAYS_THROWS);
+        getBuilder()->CreateUnreachable();
+    }
+
+private:
     llvm::CallBase* emitCall(const UnwindInfo& unw_info, llvm::FunctionCallee callee,
                              const std::vector<llvm::Value*>& args, ExceptionStyle target_exception_style,
                              llvm::Value* capi_exc_value) {
@@ -787,6 +827,18 @@ public:
         return rtn;
     }
 
+    void createDeoptExit(BST_stmt* current_stmt, llvm::Value* node_value) override {
+        llvm::Value* v = createDeopt(current_stmt, node_value);
+        llvm::Instruction* exit;
+        if (InlineInfo* inline_info = irstate->getInlineInfo()) {
+            inline_info->deopt_value->addIncoming(v, getBuilder()->GetInsertBlock());
+            exit = getBuilder()->CreateBr(inline_info->deopt_exit);
+        } else {
+            exit = getBuilder()->CreateRet(v);
+        }
+        refConsumed(v, exit);
+    }
+
     Box* getIntConstant(int64_t n) override { return irstate->getCodeConstants().getIntConstant(n); }
 
     Box* getFloatConstant(double d) override { return irstate->getCodeConstants().getFloatConstant(d); }
@@ -913,9 +965,7 @@ private:
 
         curblock = deopt_bb;
         emitter.getBuilder()->SetInsertPoint(curblock);
-        llvm::Value* v = emitter.createDeopt(current_statement, node_value);
-        llvm::Instruction* ret_inst = emitter.getBuilder()->CreateRet(v);
-        irstate->getRefcounts()->refConsumed(v, ret_inst);
+        emitter.createDeoptExit(current_statement, node_value);
 
         curblock = success_bb;
         emitter.getBuilder()->SetInsertPoint(curblock);
@@ -1156,6 +1206,184 @@ private:
         return rtn;
     }
 
+    // The result of the last call that got inlined (the type analysis doesn't know about inlining).
+    CompilerVariable* inlined_call_result = NULL;
+
+    // Returns the code of the function a call can inline, if any.  For now, these are small functions that come from
+    // globals, called with just positional arguments.
+    BoxedCode* getCodeToInline(BST_CallFunc* node) {
+        if (!ENABLE_PYTHON_INLINING || irstate->getInlineInfo() || irstate->getEffortLevel() < EffortLevel::MODERATE)
+            return NULL;
+        if (node->num_keywords || node->vreg_starargs != VREG_UNDEFINED || node->vreg_kwargs != VREG_UNDEFINED)
+            return NULL;
+        if (!irstate->getSourceInfo()->scoping.areGlobalsFromModule())
+            return NULL;
+
+        // Look up the global now; the inlined code gets guarded on its code object.  (In a try block, the load
+        // ends the block before the call.)
+        BST_stmt* def = NULL;
+        for (CFGBlock* b = myblock; !def;) {
+            for (BST_stmt* stmt : *b) {
+                if (stmt == node)
+                    break;
+                if (stmt->has_dest_vreg() && ((BST_stmt_with_dest*)stmt)->vreg_dst == node->vreg_func)
+                    def = stmt;
+            }
+            if (b->predecessors.size() != 1)
+                break;
+            b = b->predecessors[0];
+        }
+        if (!def || def->type() != BST_TYPE::LoadName)
+            return NULL;
+        BST_LoadName* load = bst_cast<BST_LoadName>(def);
+        if (load->lookup_type != ScopeInfo::VarScopeType::GLOBAL)
+            return NULL;
+        BoxedString* name = irstate->getCodeConstants().getInternedString(load->index_id).getBox();
+        Box* f = irstate->getSourceInfo()->parent_module->getattr(name);
+        if (!f || f->cls != function_cls)
+            return NULL;
+
+        BoxedFunction* func = static_cast<BoxedFunction*>(f);
+        BoxedCode* code = func->code;
+        SourceInfo* source = code->source.get();
+        if (func->closure || !source || !source->cfg || source->is_generator)
+            return NULL;
+        auto&& scoping = source->scoping;
+        if (scoping.takesClosure() || scoping.createsClosure() || scoping.usesNameLookup()
+            || !scoping.areGlobalsFromModule())
+            return NULL;
+        if (code->takes_varargs || code->takes_kwargs || code->num_kwonly || code->num_args != node->num_args)
+            return NULL;
+        int num_stmts = 0;
+        bool returns = false;
+        for (CFGBlock* b : source->cfg->blocks) {
+            for (BST_stmt* stmt : *b) {
+                num_stmts++;
+                returns |= stmt->type() == BST_TYPE::Return;
+            }
+        }
+        if (!returns || num_stmts > INLINING_MAX_STMTS)
+            return NULL;
+        return code;
+    }
+
+    CompilerVariable* tryInlineCall(BST_CallFunc* node, CompilerVariable* func,
+                                    const std::vector<CompilerVariable*>& args, ArgPassSpec argspec,
+                                    const UnwindInfo& unw_info) {
+        BoxedCode* code = getCodeToInline(node);
+        if (!code)
+            return NULL;
+        // The compiled code refers to it.
+        Py_INCREF(code);
+
+        static StatCounter num_inlined("num_inlined_calls");
+        num_inlined.log();
+        if (VERBOSITY("irgen") >= 1)
+            printf("Inlining %s:%d into %s:%d\n", code->name->c_str(), code->firstlineno,
+                   irstate->getCode()->name->c_str(), node->lineno);
+
+        auto b = emitter.getBuilder();
+        llvm::Metadata* md_vals[]
+            = { llvm::MDString::get(g.context, "branch_weights"), llvm::ConstantAsMetadata::get(getConstantInt(1000)),
+                llvm::ConstantAsMetadata::get(getConstantInt(1)) };
+        llvm::MDNode* likely = llvm::MDNode::get(g.context, md_vals);
+
+        // Check that this calls a function with the code.
+        llvm::Value* f = func->makeConverted(emitter, UNKNOWN)->getValue();
+        llvm::BasicBlock* check_code_bb = emitter.createBasicBlock("inline_check_code");
+        llvm::BasicBlock* inline_bb = emitter.createBasicBlock("inline");
+        llvm::BasicBlock* fallback_bb = emitter.createBasicBlock("inline_fallback");
+        llvm::Value* cls
+            = b->CreateLoad(g.llvm_class_type_ptr, b->CreateConstInBoundsGEP1_64(g.i8, f, offsetof(Box, cls)));
+        b->CreateCondBr(b->CreateICmpEQ(cls, embedRelocatablePtr(function_cls, g.llvm_class_type_ptr)), check_code_bb,
+                        fallback_bb, likely);
+        emitter.setCurrentBasicBlock(check_code_bb);
+        llvm::Value* f_code
+            = b->CreateLoad(g.i8_ptr, b->CreateConstInBoundsGEP1_64(g.i8, f, offsetof(BoxedFunction, code)));
+        b->CreateCondBr(b->CreateICmpEQ(f_code, embedRelocatablePtr(code, g.i8_ptr)), inline_bb, fallback_bb, likely);
+
+        // Otherwise, make the call and deopt.  (The paths use copies of the arguments, since an int or float
+        // variable remembers its box, and these blocks don't dominate the rest of the caller.)
+        emitter.setCurrentBasicBlock(fallback_bb);
+        DupCache cache;
+        std::vector<CompilerVariable*> fallback_args;
+        for (CompilerVariable* arg : args)
+            fallback_args.push_back(arg->dup(cache));
+        CompilerVariable* called = func->call(emitter, getOpInfoForNode(node, unw_info), argspec, fallback_args, NULL);
+        emitter.createDeoptExit(node, called->makeConverted(emitter, UNKNOWN)->getValue());
+
+        // The callee records the lazy locals of this frame, or flushes them, like for its own ones.
+        emitter.setCurrentBasicBlock(inline_bb);
+        emitter.emitSetCurrentStmt(node);
+
+        llvm::Value* globals = embedRelocatablePtr(code->source->parent_module, g.llvm_value_type_ptr, "cParentModule");
+        emitter.setType(globals, RefType::BORROWED);
+        InlineInfo inline_info(irstate, this, globals, args, curblock);
+        inline_info.exc_exit = emitter.createBasicBlock("inline_exc_exit");
+        inline_info.deopt_exit = emitter.createBasicBlock("inline_deopt_exit");
+        inline_info.deopt_value = llvm::PHINode::Create(g.llvm_value_type_ptr, 0, "", inline_info.deopt_exit);
+        emitter.setType(inline_info.deopt_value, RefType::OWNED);
+
+        emitInlinedBody(code, &inline_info);
+
+        // Complete the exits of the callee, which all start by making this the frame of the native frame again.
+        auto restore_frame = [&]() { b->CreateStore(irstate->getFrameInfoVar(), irstate->getFrameInfoPtrSlot()); };
+
+        if (llvm::pred_empty(inline_info.exc_exit)) {
+            inline_info.exc_exit->eraseFromParent();
+        } else {
+            emitter.setCurrentBasicBlock(inline_info.exc_exit);
+            restore_frame();
+            emitter.propagateCapiException(unw_info);
+        }
+
+        if (llvm::pred_empty(inline_info.deopt_exit)) {
+            inline_info.deopt_exit->eraseFromParent();
+        } else {
+            emitter.setCurrentBasicBlock(inline_info.deopt_exit);
+            restore_frame();
+            emitter.createDeoptExit(node, inline_info.deopt_value);
+        }
+
+        RELEASE_ASSERT(inline_info.returns.size(), "");
+        llvm::BasicBlock* join = emitter.createBasicBlock("inline_join");
+
+        // With a single return, its block dominates the rest, so the variable can be used as it is.
+        if (inline_info.returns.size() == 1) {
+            emitter.setCurrentBasicBlock(inline_info.returns[0].first);
+            b->CreateBr(join);
+            emitter.setCurrentBasicBlock(join);
+            restore_frame();
+            return inline_info.returns[0].second;
+        }
+
+        ConcreteCompilerType* rtn_type = inline_info.returns[0].second->getConcreteType();
+        for (auto&& p : inline_info.returns) {
+            if (p.second->getConcreteType() != rtn_type)
+                rtn_type = UNKNOWN;
+        }
+
+        llvm::PHINode* phi = llvm::PHINode::Create(rtn_type->llvmType(), inline_info.returns.size(), "", join);
+        bool is_boxed = rtn_type->getBoxType() == rtn_type;
+        if (is_boxed)
+            emitter.setType(phi, RefType::OWNED);
+        for (auto&& p : inline_info.returns) {
+            emitter.setCurrentBasicBlock(p.first);
+            llvm::Value* v = p.second->makeConverted(emitter, rtn_type)->getValue();
+            phi->addIncoming(v, b->GetInsertBlock());
+            auto br = b->CreateBr(join);
+            if (is_boxed)
+                emitter.refConsumed(v, br);
+        }
+
+        emitter.setCurrentBasicBlock(join);
+        restore_frame();
+        ConcreteCompilerVariable* rtn = new ConcreteCompilerVariable(rtn_type, phi);
+        if (rtn_type == UNBOXED_INT_PHI || rtn_type == UNBOXED_FLOAT_PHI)
+            return makeUnboxedFromPhi(rtn);
+        return rtn;
+    }
+
     CompilerVariable* evalCall(BST_Call* node, const UnwindInfo& unw_info) {
         bool is_callattr;
         bool callattr_clsonly = false;
@@ -1204,6 +1432,13 @@ private:
 
         // if (VERBOSITY("irgen") >= 1)
         //_addAnnotation("before_call");
+
+        if (!is_callattr) {
+            if (CompilerVariable* rtn = tryInlineCall(bst_cast<BST_CallFunc>(node), func, args, argspec, unw_info)) {
+                inlined_call_result = rtn;
+                return rtn;
+            }
+        }
 
         CompilerVariable* rtn;
         if (is_callattr) {
@@ -1696,6 +1931,9 @@ private:
 
         // Out-guarding:
         BoxedClass* speculated_class = types->speculatedExprClass(node);
+        // An inlined call can have a result that already has the class.
+        if (speculated_class && rtn == inlined_call_result && rtn->canConvertTo(typeFromClass(speculated_class)))
+            speculated_class = NULL;
         if (speculated_class != NULL) {
             assert(rtn);
 
@@ -1889,6 +2127,10 @@ public:
     // The current block may not be on the main path (it can be a slow path or an exception path), so this neither
     // caches the boxes in the variables nor marks the vregs as up to date.
     void flushLazyLocals() override {
+        // Something can look at the caller of an inlined function too.
+        if (InlineInfo* inline_info = irstate->getInlineInfo())
+            emitter.setCurrentBasicBlock(inline_info->caller_generator->flushLazyLocalsAt(curblock));
+
         if (lazy_vregs.empty())
             return;
 
@@ -2382,6 +2624,19 @@ private:
         }
         assert(val);
 
+        if (InlineInfo* inline_info = irstate->getInlineInfo()) {
+            emitter.emitSetCurrentStmt(node);
+            flushLazyLocalsForExit();
+            emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
+
+            // The caller decides how to pass on the value once it knows all the returns.
+            DupCache cache;
+            inline_info->returns.emplace_back(curblock, val->dup(cache));
+            symbol_table.clear();
+            endBlock(DEAD);
+            return;
+        }
+
         ConcreteCompilerType* opt_rtn_type = irstate->getReturnType();
         if (irstate->getReturnType()->llvmType() == val->getConcreteType()->llvmType())
             opt_rtn_type = val->getConcreteType();
@@ -2391,7 +2646,7 @@ private:
         emitter.emitSetCurrentStmt(node);
 
         flushLazyLocalsForExit();
-        if (!irstate->getCurFunction()->entry_descriptor)
+        if (irstate->ownsFrame())
             emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
 
         assert(rtn->getValue());
@@ -2580,7 +2835,7 @@ private:
             emitter.getBuilder()->CreateCall(l_free, malloc_save);
         }
 
-        if (!irstate->getCurFunction()->entry_descriptor)
+        if (irstate->ownsFrame())
             emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
         emitter.getBuilder()->CreateRet(rtn);
 
@@ -2593,7 +2848,9 @@ private:
 
         llvm::BasicBlock* target = entry_blocks[node->target];
 
-        if (ENABLE_OSR && node->target->idx < myblock->idx && irstate->getEffortLevel() < EffortLevel::MAXIMAL) {
+        // (An OSR exit would leave the caller of an inlined function.)
+        if (ENABLE_OSR && node->target->idx < myblock->idx && irstate->getEffortLevel() < EffortLevel::MAXIMAL
+            && !irstate->getInlineInfo()) {
             assert(node->target->predecessors.size() > 1);
             doOSRExit(target, node);
         } else {
@@ -2922,9 +3179,47 @@ private:
         state = new_state;
     }
 
+    void addLazyLocals(PatchpointInfo* pp, std::vector<llvm::Value*>& stackmap_args, bool outer) {
+        std::vector<int> lazy(lazy_vregs.begin(), lazy_vregs.end());
+        std::sort(lazy.begin(), lazy.end());
+        for (int vreg : lazy) {
+            CompilerVariable* v = symbol_table[vreg];
+            v->serializeToFrame(stackmap_args);
+            if (outer)
+                pp->addOuterFrameVar(vreg, v->getType());
+            else
+                pp->addFrameVar(vreg, v->getType());
+        }
+        for (int vreg : lazy) {
+            if (llvm::Value* is_defined = definedness_vars[vreg]) {
+                stackmap_args.push_back(is_defined);
+                if (outer)
+                    pp->addOuterPotentiallyUndefined(vreg);
+                else
+                    pp->addPotentiallyUndefined(vreg);
+            }
+        }
+    }
+
 public:
+    void addOuterLazyLocals(PatchpointInfo* pp, std::vector<llvm::Value*>& stackmap_args) override {
+        addLazyLocals(pp, stackmap_args, true);
+    }
+
+    llvm::BasicBlock* flushLazyLocalsAt(llvm::BasicBlock* bb) override {
+        llvm::BasicBlock* orig_block = curblock;
+        emitter.setCurrentBasicBlock(bb);
+        flushLazyLocals();
+        llvm::BasicBlock* end = curblock;
+        emitter.setCurrentBasicBlock(orig_block);
+        return end;
+    }
+
     void addFrameStackmapArgs(PatchpointInfo* pp, std::vector<llvm::Value*>& stackmap_args) override {
         int initial_args = stackmap_args.size();
+
+        if (irstate->getInlineInfo())
+            pp->getFrameDesc().source = irstate->getSourceInfo();
 
         auto&& vregs = irstate->getSourceInfo()->cfg->getVRegInfo();
 
@@ -2967,19 +3262,12 @@ public:
             }
         } else if (ENABLE_FRAME_INTROSPECTION) {
             // Other calls only need the lazy locals, see materializeLazyLocals().
-            std::vector<int> lazy(lazy_vregs.begin(), lazy_vregs.end());
-            std::sort(lazy.begin(), lazy.end());
-            for (int vreg : lazy) {
-                CompilerVariable* v = symbol_table[vreg];
-                v->serializeToFrame(stackmap_args);
-                pp->addFrameVar(vreg, v->getType());
-            }
-            for (int vreg : lazy) {
-                if (llvm::Value* is_defined = definedness_vars[vreg]) {
-                    stackmap_args.push_back(is_defined);
-                    pp->addPotentiallyUndefined(vreg);
-                }
-            }
+            addLazyLocals(pp, stackmap_args, false);
+        }
+
+        if (InlineInfo* inline_info = irstate->getInlineInfo()) {
+            if (ENABLE_FRAME_INTROSPECTION)
+                inline_info->caller_generator->addOuterLazyLocals(pp, stackmap_args);
         }
 
         int num_frame_args = stackmap_args.size() - initial_args;
@@ -3078,6 +3366,19 @@ public:
             symbol_table[it.first()] = it.second()->dup(cache);
             assert(symbol_table[it.first()]->getType()->isUsable());
         }
+    }
+
+    void doInlinedFunctionEntry() override {
+        InlineInfo* inline_info = irstate->getInlineInfo();
+        irstate->setupInlinedFrameInfoVar(curblock);
+
+        DupCache cache;
+        int i = 0;
+        for (auto&& arg : irstate->getParamNames()->argsAsName()) {
+            _doSet(arg, inline_info->args[i]->dup(cache), UnwindInfo::cantUnwind());
+            ++i;
+        }
+        assert(i == inline_info->args.size());
     }
 
     void doFunctionEntry(const ParamNames& param_names, const std::vector<ConcreteCompilerType*>& arg_types) override {
@@ -3275,6 +3576,17 @@ public:
         emitter.setCurrentBasicBlock(cont_bb);
     }
 
+    // Leaves the function with the CAPI exception that is set.  (After a deopt, the interpreter already exited the
+    // frame.)
+    void emitCapiExceptionExit(bool is_after_deopt) {
+        if (irstate->ownsFrame() && !is_after_deopt)
+            emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
+        if (InlineInfo* inline_info = irstate->getInlineInfo())
+            emitter.getBuilder()->CreateBr(inline_info->exc_exit);
+        else
+            emitter.getBuilder()->CreateRet(getNullPtr(g.llvm_value_type_ptr));
+    }
+
     // Create a (or reuse an existing) block that will catch a CAPI exception, and then forward
     // it to the "final_dest" block.  ie final_dest is a block corresponding to the IR level
     // LANDINGPAD, and this function will create a helper block that fetches the exception.
@@ -3303,9 +3615,7 @@ public:
                     emitter.getBuilder()->CreateCall(g.funcs.reraiseCapiExcAsCxx);
                     emitter.getBuilder()->CreateUnreachable();
                 } else {
-                    if (!irstate->getCurFunction()->entry_descriptor && !is_after_deopt)
-                        emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
-                    emitter.getBuilder()->CreateRet(getNullPtr(g.llvm_value_type_ptr));
+                    emitCapiExceptionExit(is_after_deopt);
                 }
             } else {
                 // Catch the exception and forward to final_dest:
@@ -3393,10 +3703,7 @@ public:
             irstate->getRefcounts()->refConsumed(exc_type, call_inst);
             irstate->getRefcounts()->refConsumed(exc_value, call_inst);
             irstate->getRefcounts()->refConsumed(exc_traceback, call_inst);
-            if (!irstate->getCurFunction()->entry_descriptor && !unw_info.is_after_deopt) {
-                emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
-            }
-            emitter.getBuilder()->CreateRet(getNullPtr(g.llvm_value_type_ptr));
+            emitCapiExceptionExit(unw_info.is_after_deopt);
         } else {
             // auto call_inst = emitter.createCall3(UnwindInfo(unw_info.current_stmt, NO_CXX_INTERCEPTION),
             // g.funcs.rawReraise, exc_type, exc_value, exc_traceback);

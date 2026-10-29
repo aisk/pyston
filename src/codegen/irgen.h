@@ -119,6 +119,8 @@ public:
     // llvm::Value* exc_val, bool double_check = false) = 0;
 
     virtual llvm::Value* createDeopt(BST_stmt* current_stmt, llvm::Value* node_value) = 0;
+    // Deopts, and leaves the function with the result.
+    virtual void createDeoptExit(BST_stmt* current_stmt, llvm::Value* node_value) = 0;
 
     virtual BORROWED(Box*) getIntConstant(int64_t n) = 0;
     virtual BORROWED(Box*) getFloatConstant(double d) = 0;

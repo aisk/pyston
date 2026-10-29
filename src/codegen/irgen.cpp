@@ -483,7 +483,11 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
         // Set initial symbol table:
         // If we're in the starting block, no phis or symbol table changes for us.
         // Generate function entry code instead.
-        if (block == cfg->getStartingBlock()) {
+        if (block == cfg->getStartingBlock() && irstate->getInlineInfo()) {
+            assert(entry_descriptor == NULL);
+            llvm::BranchInst::Create(llvm_entry_blocks[block], irstate->getInlineInfo()->entry_from);
+            generator->doInlinedFunctionEntry();
+        } else if (block == cfg->getStartingBlock()) {
             assert(entry_descriptor == NULL);
 
             if (ENABLE_REOPT && effort < EffortLevel::MAXIMAL && source->ast_type != AST_TYPE::Module) {
@@ -844,6 +848,34 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
             delete p.second;
         }
     }
+}
+
+void emitInlinedBody(BoxedCode* code, InlineInfo* inline_info) {
+    IRGenState* caller = inline_info->caller;
+    SourceInfo* source = code->source.get();
+    EffortLevel effort = caller->getEffortLevel();
+
+    std::vector<ConcreteCompilerType*> arg_types;
+    for (CompilerVariable* arg : inline_info->args)
+        arg_types.push_back(arg->getConcreteType());
+
+    TypeAnalysis::SpeculationLevel speculation_level = TypeAnalysis::NONE;
+    if (ENABLE_SPECULATION && effort >= EffortLevel::MODERATE)
+        speculation_level = TypeAnalysis::SOME;
+    std::unique_ptr<TypeAnalysis> types(
+        doTypeAnalysis(source->cfg, code->param_names, arg_types, effort, speculation_level, code->code_constants));
+
+    LivenessAnalysis* liveness = source->getLiveness(code->code_constants);
+    std::unique_ptr<PhiAnalysis> phis = computeRequiredPhis(code->param_names, source->cfg, liveness);
+
+    IRGenState irstate(code, caller->getCurFunction(), caller->getLLVMFunction(), source, std::move(phis),
+                       &code->param_names, caller->getGC(), caller->getFuncDbgInfo(), caller->getRefcounts(),
+                       inline_info);
+
+    BlockSet blocks;
+    for (CFGBlock* b : source->cfg->blocks)
+        blocks.insert(b);
+    emitBBs(&irstate, types.get(), NULL, blocks);
 }
 
 static void computeBlockSetClosure(BlockSet& blocks) {
