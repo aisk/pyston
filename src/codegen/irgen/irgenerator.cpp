@@ -324,6 +324,8 @@ void IRGenState::initNewFrameInfo(llvm::IRBuilder<>& alloca_builder, llvm::IRBui
     builder.CreateCall(g.funcs.initFrame, this->frame_info);
 }
 
+// TODO: the inlined frame still costs an initFrame/deinitFrame call and a vregs memset on every call.  It could be
+// virtual instead, and only get materialized when something unwinds or deopts through it.
 void IRGenState::setupInlinedFrameInfoVar(llvm::BasicBlock* bb) {
     assert(inline_info);
     assert(!frame_info);
@@ -1211,6 +1213,8 @@ private:
 
     // Returns the code of the function a call can inline, if any.  For now, these are small functions that come from
     // globals, called with just positional arguments.
+    // TODO: inline method calls (callattr on instances with a known class) and __init__, which is what most real
+    // code calls, and what escape analysis needs to see the whole lifetime of an object.
     BoxedCode* getCodeToInline(BST_CallFunc* node) {
         if (!ENABLE_PYTHON_INLINING || irstate->getInlineInfo() || irstate->getEffortLevel() < EffortLevel::MODERATE)
             return NULL;
