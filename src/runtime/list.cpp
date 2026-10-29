@@ -264,6 +264,10 @@ extern "C" Box* listGetitemInt(BoxedList* self, BoxedInt* slice) {
     return incref(listGetitemUnboxed(self, slice->n));
 }
 
+extern "C" Box* listGetitemI64(BoxedList* self, int64_t n) {
+    return incref(listGetitemUnboxed(self, n));
+}
+
 extern "C" BORROWED(PyObject*) PyList_GetItem(PyObject* op, Py_ssize_t i) noexcept {
     RELEASE_ASSERT(PyList_Check(op), "");
     RELEASE_ASSERT(i >= 0, ""); // unlike list.__getitem__, PyList_GetItem doesn't do index wrapping
@@ -1520,6 +1524,7 @@ void setupList() {
     BoxedCode* getitem = new BoxedCode(2, false, false, "list.__getitem__");
     getitem->addVersion((void*)listGetitemInt, UNKNOWN, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT });
     registerNoPythonCodeFunction((void*)listGetitemInt);
+    registerNoPythonCodeFunction((void*)listGetitemI64);
     getitem->addVersion((void*)listGetitemSlice<CXX>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE }, CXX);
     getitem->addVersion((void*)listGetitem<CXX>, UNKNOWN, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN }, CXX);
     getitem->addVersion((void*)listGetitemSlice<CAPI>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE }, CAPI);

@@ -2220,6 +2220,17 @@ public:
         static BoxedString* attr = getStaticString("__getitem__");
         bool no_attribute = false;
 
+        // Index a list with an unboxed int, instead of boxing the index for list.__getitem__.
+        if (cls == list_cls && slice->getType() == INT) {
+            static llvm::FunctionCallee getitem_i64 = llvm::FunctionCallee(
+                llvm::FunctionType::get(g.llvm_value_type_ptr, { g.llvm_value_type_ptr, g.i64 }, false),
+                embedConstantPtr((void*)listGetitemI64, g.i8_ptr));
+            llvm::CallBase* r
+                = emitter.createCall2(info.unw_info, getitem_i64, var->getValue(), IntType::extractInt(slice), CXX);
+            emitter.setType(r, RefType::OWNED);
+            return new ConcreteCompilerVariable(UNKNOWN, r);
+        }
+
         // Only try calling getitem if it's not a slice.  For the slice case, defer to UNKNOWN->getitem, which will
         // call into apply_slice
         if (slice->getType() != UNBOXED_SLICE || extractSlice(slice).step != NULL) {
