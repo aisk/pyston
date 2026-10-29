@@ -2003,15 +2003,25 @@ Box* astInterpretFunction(BoxedCode* code, Box* closure, Box* generator, Box* gl
         if (FORCE_OPTIMIZE)
             new_effort = EffortLevel::MAXIMAL;
 
+        // Specialize the first version on int and float arguments, so that the callee can work on them unboxed.
+        // Call sites guard on the argument classes. If other arguments show up and get the function here again,
+        // compile a version that takes anything, so that there are at most two versions.
+        bool specialize = ENABLE_ARG_SPECIALIZATION;
+        for (CompiledFunction* cf : code->versions) {
+            if (!cf->spec->accepts_all_inputs)
+                specialize = false;
+        }
+
         std::vector<ConcreteCompilerType*> arg_types;
         for (int i = 0; i < code->param_names.totalParameters(); i++) {
             Box* arg = getArg(i, arg1, arg2, arg3, args);
 
             assert(arg || i == code->param_names.kwargsIndex()); // only builtin functions can pass NULL args
 
-            // TODO: reenable argument-type specialization
-            arg_types.push_back(UNKNOWN);
-            // arg_types.push_back(typeFromClass(arg->cls));
+            if (specialize && i < code->param_names.numNormalArgs() && (arg->cls == int_cls || arg->cls == float_cls))
+                arg_types.push_back(typeFromClass(arg->cls));
+            else
+                arg_types.push_back(UNKNOWN);
         }
         FunctionSpecialization* spec = new FunctionSpecialization(UNKNOWN, arg_types);
 
