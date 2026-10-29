@@ -456,9 +456,6 @@ bool frameIsPythonFrame(unw_word_t ip, unw_word_t bp, unw_cursor_t* cursor, Pyth
         }
     }
 
-    if (info->getFrameInfo()->isDisabledFrame())
-        return false;
-
     return true;
 }
 
@@ -480,7 +477,8 @@ private:
     bool skip_next_pythonlike_frame = false;
 
 public:
-    bool handleCFrame(unw_cursor_t* cursor, PythonFrameIteratorImpl* frame_iter) {
+    // *disabled_frame gets set for the frame of a function that deopted.
+    bool handleCFrame(unw_cursor_t* cursor, PythonFrameIteratorImpl* frame_iter, bool* disabled_frame = NULL) {
         unw_word_t ip = get_cursor_ip(cursor);
         unw_word_t bp = get_cursor_bp(cursor);
 
@@ -490,8 +488,13 @@ public:
             assert(!skip_next_pythonlike_frame);
             skip_next_pythonlike_frame = true;
         } else if (frameIsPythonFrame(ip, bp, cursor, frame_iter)) {
-            if (!skip_next_pythonlike_frame)
+            // A frame that deopted has handed its FrameInfo over to the interpreter, which shows up as the frame
+            // instead.  (It still takes the skip, so that the frame after it doesn't.)
+            bool disabled = frame_iter->getFrameInfo()->isDisabledFrame();
+            if (!skip_next_pythonlike_frame && !disabled)
                 rtn = true;
+            if (disabled_frame)
+                *disabled_frame = disabled;
 
             // frame_iter->cf->entry_descriptor will be non-null for OSR frames.
             bool was_osr = (frame_iter->getId().type == PythonFrameId::COMPILED) && (frame_iter->cf->entry_descriptor);
@@ -660,7 +663,12 @@ public:
         }
 
         PythonFrameIteratorImpl frame_iter;
-        bool found_frame = pystack_extractor.handleCFrame(cursor, &frame_iter);
+        bool disabled_frame = false;
+        bool found_frame = pystack_extractor.handleCFrame(cursor, &frame_iter, &disabled_frame);
+        // A frame that deopted can rethrow the exception from its landing pad, which marks it as a reraise for the
+        // frame (like any other frame).  This frame doesn't have a traceback entry though, so the next one does.
+        if (disabled_frame)
+            getIsReraiseFlag() = false;
         if (found_frame) {
             frame_iter.getCode()->propagated_cxx_exceptions++;
             // The traceback (and an except clause in the frame) can look at the locals.
