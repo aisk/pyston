@@ -131,6 +131,9 @@ void ICSlotRewrite::abort() {
     auto ic = getICInfo();
     ic->retry_backoff = std::min(MAX_RETRY_BACKOFF, 2 * ic->retry_backoff);
     ic->retry_in = ic->retry_backoff;
+    // Try another slot next time: this one can be too small for the rewrite (like a slot that got shrunk to its
+    // first rewrite, and then invalidated).
+    ic->next_slot_to_try++;
 }
 
 
