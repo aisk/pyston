@@ -382,6 +382,7 @@ private:
     void _emitPPCall(RewriterVar* result, void* func_addr, llvm::ArrayRef<RewriterVar*> args, unsigned short pp_size,
                      BST_stmt* bst_node, llvm::ArrayRef<RewriterVar*> vars_to_bump);
     void _emitRecordType(RewriterVar* obj_cls_var, TypeRecorder* type_recorder = NULL);
+    void recordReceiverClass(BST_stmt* node, RewriterVar* obj);
     void _emitReturn(RewriterVar* v);
     void _emitSideExit(STOLEN(RewriterVar*) var, RewriterVar* val_constant, CFGBlock* next_block,
                        RewriterVar* false_path);

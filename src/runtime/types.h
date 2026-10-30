@@ -188,6 +188,8 @@ extern "C" inline void listAppendInternal(Box* self, Box* v) __attribute__((visi
 extern "C" inline void listAppendInternalStolen(Box* self, Box* v) __attribute__((visibility("default")));
 extern "C" void listAppendArrayInternal(Box* self, Box** v, int nelts);
 extern "C" Box* listGetitemI64(BoxedList* self, int64_t n);
+// object.__new__(cls) for a class with object.__new__ and its own __init__.
+extern "C" Box* objectNewNoArgs(BoxedClass* cls) noexcept;
 extern "C" Box* createFunctionFromMetadata(BoxedCode* code, BoxedClosure* closure, Box* globals,
                                            std::initializer_list<Box*> defaults) noexcept;
 extern "C" Box* createUserClass(BoxedString* name, Box* base, Box* body_func, Box* kwargs);

@@ -71,6 +71,7 @@ extern "C" Box* callattr(Box*, BoxedString*, CallattrFlags, Box*, Box*, Box*, Bo
 extern "C" Box* callattrCapi(Box*, BoxedString*, CallattrFlags, Box*, Box*, Box*, Box**,
                              const std::vector<BoxedString*>*) noexcept __attribute__((noinline));
 int assign_version_tag(PyTypeObject* type) noexcept;
+extern "C" Box* binopAfterUserOp(STOLEN(Box*) rtn, Box* lhs, Box* rhs, int op_type);
 extern "C" bool hclsLacksAttr(Box* obj, BoxedString* attr, HiddenClass** cache) noexcept;
 extern "C" BoxedString* str(Box* obj) __attribute__((noinline));
 extern "C" BoxedString* repr(Box* obj) __attribute__((noinline));

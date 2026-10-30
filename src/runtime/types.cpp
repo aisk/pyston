@@ -637,7 +637,7 @@ static PyObject* cpythonTypeCall(BoxedClass* type, PyObject* args, PyObject* kwd
     return r;
 }
 
-static Box* objectNewNoArgs(BoxedClass* cls) noexcept {
+extern "C" Box* objectNewNoArgs(BoxedClass* cls) noexcept {
     assert(PyType_Check(cls));
 #ifndef NDEBUG
     static BoxedString* new_str = getStaticString("__new__");

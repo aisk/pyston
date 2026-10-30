@@ -229,7 +229,17 @@ RewriterVar* JitFragmentWriter::imm(const void* val) {
     return loadConst((uint64_t)val);
 }
 
+// Records the class of the object of a method call or the left operand of an operator, so that the LLVM tier can
+// inline the method.
+void JitFragmentWriter::recordReceiverClass(BST_stmt* node, RewriterVar* obj) {
+    type_recorders.emplace_back(new NodeTypeRecorder(node, true /* receiver */));
+    TypeRecorder* type_recorder = type_recorders.back().get();
+    RewriterVar* obj_cls_var = obj->getAttr(offsetof(Box, cls));
+    addAction([=]() { _emitRecordType(obj_cls_var, type_recorder); }, { obj_cls_var }, ActionType::NORMAL);
+}
+
 RewriterVar* JitFragmentWriter::emitAugbinop(BST_stmt* node, RewriterVar* lhs, RewriterVar* rhs, int op_type) {
+    recordReceiverClass(node, lhs);
     return emitPPCall((void*)augbinop, { lhs, rhs, imm(op_type) }, 2 * 320, true /* record type */, node)
         .first->setType(RefType::OWNED);
 }
@@ -243,6 +253,7 @@ RewriterVar* JitFragmentWriter::emitApplySlice(RewriterVar* target, RewriterVar*
 }
 
 RewriterVar* JitFragmentWriter::emitBinop(BST_stmt* node, RewriterVar* lhs, RewriterVar* rhs, int op_type) {
+    recordReceiverClass(node, lhs);
     return emitPPCall((void*)binop, { lhs, rhs, imm(op_type) }, 2 * 240, true /* record type */, node)
         .first->setType(RefType::OWNED);
 }
@@ -250,13 +261,8 @@ RewriterVar* JitFragmentWriter::emitBinop(BST_stmt* node, RewriterVar* lhs, Rewr
 RewriterVar* JitFragmentWriter::emitCallattr(BST_stmt* node, RewriterVar* obj, BoxedString* attr, CallattrFlags flags,
                                              const llvm::ArrayRef<RewriterVar*> args,
                                              const std::vector<BoxedString*>* keyword_names) {
-    // Record the class of the object, so that the LLVM tier can inline the method.
-    if (!flags.cls_only) {
-        type_recorders.emplace_back(new NodeTypeRecorder(node, true /* receiver */));
-        TypeRecorder* type_recorder = type_recorders.back().get();
-        RewriterVar* obj_cls_var = obj->getAttr(offsetof(Box, cls));
-        addAction([=]() { _emitRecordType(obj_cls_var, type_recorder); }, { obj_cls_var }, ActionType::NORMAL);
-    }
+    if (!flags.cls_only)
+        recordReceiverClass(node, obj);
 
 #if ENABLE_BASELINEJIT_ICS
     RewriterVar* attr_var = imm(attr);

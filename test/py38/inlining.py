@@ -325,3 +325,211 @@ try:
     method_raise(3000)
 except ValueError as e:
     print(e, [(f.name, f.line) for f in traceback.extract_tb(e.__traceback__)])
+
+# Class calls inline __init__ when the class has object.__new__.
+class V:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def __add__(self, o):
+        return V(self.x + o.x, self.y + o.y)
+
+    def __mul__(self, k):
+        return V(self.x * k, self.y * k)
+
+    def __repr__(self):
+        return "V(%r, %r)" % (self.x, self.y)
+
+def make(cls, n):
+    out = None
+    for i in range(n):
+        out = cls(i, i + 1)
+    return out
+
+print(make(V, 3000), type(make(V, 3000)).__name__)
+
+class BadInit:
+    def __init__(self):
+        if self.flag:
+            return 5
+
+def bad_init(n):
+    BadInit.flag = False
+    out = []
+    for i in range(n):
+        if i == 2990:
+            BadInit.flag = True
+        try:
+            out.append(type(BadInit()).__name__)
+        except TypeError as e:
+            out.append(str(e))
+    return out[-1], len(out)
+
+print(bad_init(3000))
+
+class W:
+    def __init__(self, x):
+        self.x = x
+
+def ctor_changes(n):
+    out = []
+    for i in range(n):
+        w = W(i)
+        out.append(w if type(w) is int else w.x)
+        if i == 2990:
+            W.__init__ = lambda self, x: setattr(self, "x", -x)
+        if i == 2994:
+            W.__new__ = lambda cls, x: 7
+        if i == 2997:
+            W.__new__ = lambda cls, x: object.__new__(cls)
+            W.__init__ = (lambda self, x: setattr(self, "x", x * 10))
+    return out[-12:]
+
+print(ctor_changes(3000))
+
+class U:
+    def __init__(self, a, b):
+        self.a = a
+
+def ctor_rebind(n):
+    global U
+    out = []
+    old = U
+    for i in range(n):
+        out.append(type(U(i, i)).__name__)
+        if i == 2990:
+            U = V
+    U = old
+    return out[-3:]
+
+print(ctor_rebind(3000))
+
+class Abstract:
+    def __init__(self):
+        pass
+
+def abstract(n):
+    out = []
+    for i in range(n):
+        if i == 2995:
+            Abstract.__abstractmethods__ = frozenset(["f"])
+        try:
+            out.append(type(Abstract()).__name__)
+        except TypeError as e:
+            out.append(str(e))
+    return out[-6:]
+
+print(abstract(3000))
+
+class CtorRaise:
+    def __init__(self, x):
+        if x > 2995:
+            raise ValueError("ctor %d" % x)
+
+def ctor_raise(n):
+    for i in range(n):
+        CtorRaise(i)
+
+try:
+    ctor_raise(3000)
+except ValueError as e:
+    print(e, [(f.name, f.line) for f in traceback.extract_tb(e.__traceback__)])
+
+# Operator methods of user classes get inlined too.
+def vec_sum(n):
+    s = V(0, 0)
+    for i in range(n):
+        s = s + V(i, 1) * 2
+        s += V(1, 1)
+    return s
+
+print(vec_sum(3000))
+
+class A:
+    def __init__(self, v):
+        self.v = v
+
+    def __add__(self, o):
+        if isinstance(o, A):
+            return A(self.v + o.v)
+        return NotImplemented
+
+    def __sub__(self, o):
+        return self.v - o
+
+    def __repr__(self):
+        return "A(%r)" % self.v
+
+class B:
+    def __radd__(self, o):
+        return "B.radd"
+
+class SubA(A):
+    def __radd__(self, o):
+        return "SubA.radd"
+
+class IA(A):
+    def __iadd__(self, o):
+        self.v += 100
+        return self
+
+def operands(n, others):
+    out = []
+    for i in range(n):
+        a = A(i)
+        o = others[i * len(others) // n]
+        try:
+            out.append(a + o)
+        except TypeError as e:
+            out.append(str(e))
+    return out[-1]
+
+print(operands(3000, [A(1)]), operands(3000, [A(1), B()]), operands(3000, [A(1), SubA(2)]),
+      operands(3000, [A(1), 5]))
+
+def inplace(n, cls):
+    out = []
+    for i in range(n):
+        a = cls(i)
+        a += A(1)
+        out.append(a)
+    return out[-1]
+
+print(inplace(3000, A), inplace(3000, IA))
+
+def sub_types(n, others):
+    out = []
+    for i in range(n):
+        out.append(A(i) - others[i * len(others) // n])
+    return out[-3:], len(set(map(type, out)))
+
+print(sub_types(3000, [1]), sub_types(3000, [1, 1.5, 2 ** 70]))
+
+def replace_op(n):
+    out = []
+    for i in range(n):
+        out.append(A(i) - 1)
+        if i == 2990:
+            A.__sub__ = lambda self, o: "replaced"
+    return out[-12:]
+
+print(replace_op(3000))
+
+class OpRaise:
+    def __mul__(self, o):
+        if o > 2995:
+            raise ValueError("op %d" % o)
+        return o
+
+def op_raise(n):
+    s = 0
+    x = OpRaise()
+    for i in range(n):
+        s += x * i
+    return s
+
+try:
+    op_raise(3000)
+except ValueError as e:
+    print(e, [(f.name, f.line) for f in traceback.extract_tb(e.__traceback__)])

@@ -1182,6 +1182,8 @@ private:
 
         assert(node->op_type != AST_TYPE::Is && node->op_type != AST_TYPE::IsNot && "not tested yet");
 
+        if (CompilerVariable* rtn = tryInlineBinop(node, left, right, node->op_type, BinOp, unw_info))
+            return inlined_call_result = rtn;
         return this->_evalBinExp(node, left, right, node->op_type, BinOp, unw_info);
     }
 
@@ -1191,6 +1193,8 @@ private:
 
         assert(node->op_type != AST_TYPE::Is && node->op_type != AST_TYPE::IsNot && "not tested yet");
 
+        if (CompilerVariable* rtn = tryInlineBinop(node, left, right, node->op_type, AugBinOp, unw_info))
+            return inlined_call_result = rtn;
         return this->_evalBinExp(node, left, right, node->op_type, AugBinOp, unw_info);
     }
 
@@ -1243,9 +1247,21 @@ private:
         return code;
     }
 
+    // Whether every return of the code returns None, like __init__ has to.
+    static bool returnsOnlyNone(BoxedCode* code) {
+        for (CFGBlock* b : code->source->cfg->blocks) {
+            for (BST_stmt* stmt : *b) {
+                if (stmt->type() == BST_TYPE::Return && bst_cast<BST_Return>(stmt)->vreg_value != VREG_UNDEFINED)
+                    return false;
+            }
+        }
+        return true;
+    }
+
     // Returns the code of the function a call can inline, if any.  For now, these are functions that come from
-    // globals, called with just positional arguments.
-    BoxedCode* getCodeToInline(BST_CallFunc* node) {
+    // globals, called with just positional arguments.  For a class, this is the code of its __init__ (in *ctor_cls
+    // and *init), if it gets constructed by object.__new__.
+    BoxedCode* getCodeToInline(BST_CallFunc* node, BoxedClass** ctor_cls, BoxedFunction** init) {
         if (!canInline())
             return NULL;
         if (node->num_keywords || node->vreg_starargs != VREG_UNDEFINED || node->vreg_kwargs != VREG_UNDEFINED)
@@ -1274,10 +1290,28 @@ private:
             return NULL;
         BoxedString* name = irstate->getCodeConstants().getInternedString(load->index_id).getBox();
         Box* f = irstate->getSourceInfo()->parent_module->getattr(name);
-        if (!f || f->cls != function_cls)
+        if (!f)
             return NULL;
+        if (f->cls == function_cls)
+            return getInlinableCode(static_cast<BoxedFunction*>(f), node->num_args);
 
-        return getInlinableCode(static_cast<BoxedFunction*>(f), node->num_args);
+        // (The class of the class has to be type, for type.__call__.)
+        if (f->cls != type_cls)
+            return NULL;
+        BoxedClass* cls = static_cast<BoxedClass*>(f);
+        static BoxedString* init_str = getStaticString("__init__");
+        if (!(cls->tp_flags & Py_TPFLAGS_HEAPTYPE) || (cls->tp_flags & Py_TPFLAGS_IS_ABSTRACT)
+            || cls->tp_new != object_cls->tp_new || cls->tp_init == object_cls->tp_init || !assign_version_tag(cls))
+            return NULL;
+        Box* init_attr = typeLookup(cls, init_str);
+        if (!init_attr || init_attr->cls != function_cls)
+            return NULL;
+        BoxedCode* code = getInlinableCode(static_cast<BoxedFunction*>(init_attr), node->num_args + 1);
+        if (!code || !returnsOnlyNone(code))
+            return NULL;
+        *ctor_cls = cls;
+        *init = static_cast<BoxedFunction*>(init_attr);
+        return code;
     }
 
     // Returns the code of the method that a call of it on obj can inline, if any, and the class of obj that it has to
@@ -1322,23 +1356,56 @@ private:
         return b->CreateLoad(type, b->CreateConstInBoundsGEP1_64(g.i8, obj, offset));
     }
 
+    // Emits the checks that obj (if any) has the class cls, that cls didn't change (which keeps its attribute func
+    // alive), that it has none of extra_flags, and that func still has the code.
+    void emitClassGuards(llvm::Value* obj, BoxedClass* cls, BoxedFunction* func, BoxedCode* code,
+                         llvm::BasicBlock* fallback_bb, int64_t extra_flags = 0) {
+        // The compiled code refers to it.
+        Py_INCREF(cls);
+
+        auto b = emitter.getBuilder();
+        llvm::Value* cls_value = embedRelocatablePtr(cls, g.llvm_class_type_ptr);
+        if (obj)
+            emitInlineGuard(b->CreateICmpEQ(loadField(obj, offsetof(Box, cls), g.llvm_class_type_ptr), cls_value),
+                            fallback_bb);
+        static_assert(sizeof(cls->tp_flags) == 8 && sizeof(cls->tp_version_tag) == 8, "");
+        llvm::Value* flags = loadField(cls_value, offsetof(BoxedClass, tp_flags), g.i64);
+        emitInlineGuard(b->CreateICmpEQ(b->CreateAnd(flags, Py_TPFLAGS_VALID_VERSION_TAG | extra_flags),
+                                        getConstantInt(Py_TPFLAGS_VALID_VERSION_TAG, g.i64)),
+                        fallback_bb);
+        emitInlineGuard(b->CreateICmpEQ(loadField(cls_value, offsetof(BoxedClass, tp_version_tag), g.i64),
+                                        getConstantInt(cls->tp_version_tag, g.i64)),
+                        fallback_bb);
+        emitInlineGuard(
+            b->CreateICmpEQ(loadField(embedRelocatablePtr(func, g.i8_ptr), offsetof(BoxedFunction, code), g.i8_ptr),
+                            embedRelocatablePtr(code, g.i8_ptr)),
+            fallback_bb);
+    }
+
     CompilerVariable* tryInlineCall(BST_CallFunc* node, CompilerVariable* func,
                                     const std::vector<CompilerVariable*>& args, ArgPassSpec argspec,
                                     const UnwindInfo& unw_info) {
-        BoxedCode* code = getCodeToInline(node);
+        BoxedClass* ctor_cls = NULL;
+        BoxedFunction* init = NULL;
+        BoxedCode* code = getCodeToInline(node, &ctor_cls, &init);
         if (!code)
             return NULL;
 
-        // Check that this calls a function with the code.
+        // Check that this calls a function with the code, or the class.
         auto b = emitter.getBuilder();
         llvm::BasicBlock* fallback_bb = emitter.createBasicBlock("inline_fallback");
         llvm::Value* f = func->makeConverted(emitter, UNKNOWN)->getValue();
-        emitInlineGuard(b->CreateICmpEQ(loadField(f, offsetof(Box, cls), g.llvm_class_type_ptr),
-                                        embedRelocatablePtr(function_cls, g.llvm_class_type_ptr)),
-                        fallback_bb);
-        emitInlineGuard(
-            b->CreateICmpEQ(loadField(f, offsetof(BoxedFunction, code), g.i8_ptr), embedRelocatablePtr(code, g.i8_ptr)),
-            fallback_bb);
+        if (ctor_cls) {
+            emitInlineGuard(b->CreateICmpEQ(f, embedRelocatablePtr(ctor_cls, g.llvm_value_type_ptr)), fallback_bb);
+            emitClassGuards(NULL, ctor_cls, init, code, fallback_bb, Py_TPFLAGS_IS_ABSTRACT);
+        } else {
+            emitInlineGuard(b->CreateICmpEQ(loadField(f, offsetof(Box, cls), g.llvm_class_type_ptr),
+                                            embedRelocatablePtr(function_cls, g.llvm_class_type_ptr)),
+                            fallback_bb);
+            emitInlineGuard(b->CreateICmpEQ(loadField(f, offsetof(BoxedFunction, code), g.i8_ptr),
+                                            embedRelocatablePtr(code, g.i8_ptr)),
+                            fallback_bb);
+        }
         llvm::BasicBlock* inline_bb = emitter.currentBasicBlock();
 
         // Otherwise, make the call.  (The paths use copies of the arguments, since an int or float variable
@@ -1352,7 +1419,21 @@ private:
         llvm::BasicBlock* fallback_end = emitter.currentBasicBlock();
 
         emitter.setCurrentBasicBlock(inline_bb);
-        return emitInlinedCall(node, code, args, unw_info, fallback_end, called);
+        if (!ctor_cls)
+            return emitInlinedCall(node, code, args, unw_info, fallback_end, called);
+
+        // Make the object like object.__new__, then call __init__ (which returns None) on it.
+        static llvm::FunctionCallee object_new
+            = llvm::FunctionCallee(llvm::FunctionType::get(g.llvm_value_type_ptr, { g.llvm_class_type_ptr }, false),
+                                   embedConstantPtr((void*)objectNewNoArgs, g.i8_ptr));
+        llvm::Value* made = b->CreateCall(object_new, { embedRelocatablePtr(ctor_cls, g.llvm_class_type_ptr) });
+        emitter.setType(made, RefType::OWNED);
+        ConcreteCompilerVariable* obj = new ConcreteCompilerVariable(UNKNOWN, made);
+        std::vector<CompilerVariable*> init_args;
+        init_args.push_back(obj);
+        init_args.insert(init_args.end(), args.begin(), args.end());
+        return emitInlinedCall(node, code, init_args, unw_info, fallback_end, called,
+                               [&](CompilerVariable* rtn) { return obj; });
     }
 
     CompilerVariable* tryInlineMethodCall(BST_CallAttr* node, CompilerVariable* obj, BoxedString* attr,
@@ -1363,28 +1444,12 @@ private:
         BoxedCode* code = getMethodToInline(node, &cls, &func);
         if (!code)
             return NULL;
-        // The compiled code refers to it.
-        Py_INCREF(cls);
 
-        // Check the class of obj, that the class didn't change since (which keeps func alive), the code of func, and
-        // that obj doesn't have the attribute.
+        // Also check that obj doesn't have the attribute.
         auto b = emitter.getBuilder();
         llvm::BasicBlock* fallback_bb = emitter.createBasicBlock("inline_fallback");
         llvm::Value* o = obj->makeConverted(emitter, UNKNOWN)->getValue();
-        llvm::Value* cls_value = embedRelocatablePtr(cls, g.llvm_class_type_ptr);
-        emitInlineGuard(b->CreateICmpEQ(loadField(o, offsetof(Box, cls), g.llvm_class_type_ptr), cls_value),
-                        fallback_bb);
-        static_assert(sizeof(cls->tp_flags) == 8 && sizeof(cls->tp_version_tag) == 8, "");
-        llvm::Value* flags = loadField(cls_value, offsetof(BoxedClass, tp_flags), g.i64);
-        emitInlineGuard(b->CreateICmpNE(b->CreateAnd(flags, Py_TPFLAGS_VALID_VERSION_TAG), getConstantInt(0, g.i64)),
-                        fallback_bb);
-        emitInlineGuard(b->CreateICmpEQ(loadField(cls_value, offsetof(BoxedClass, tp_version_tag), g.i64),
-                                        getConstantInt(cls->tp_version_tag, g.i64)),
-                        fallback_bb);
-        emitInlineGuard(
-            b->CreateICmpEQ(loadField(embedRelocatablePtr(func, g.i8_ptr), offsetof(BoxedFunction, code), g.i8_ptr),
-                            embedRelocatablePtr(code, g.i8_ptr)),
-            fallback_bb);
+        emitClassGuards(o, cls, func, code, fallback_bb);
         if (cls->instancesHaveHCAttrs()) {
             // The hidden class of the last object that lacked the attribute, else ask hclsLacksAttr().
             HiddenClass** cached = new HiddenClass*(NULL);
@@ -1423,11 +1488,106 @@ private:
         return emitInlinedCall(node, code, inline_args, unw_info, fallback_end, called);
     }
 
+    // Inlines the operator method of the class of the left operand, if it's a user class, like binopInternal() calls
+    // it: a NotImplemented result goes on in binopAfterUserOp().  The right operand can't be of a subclass of it
+    // though, which would get to try its reflected method first.  (An in-place operator works like this if the class
+    // doesn't have the in-place method.)
+    CompilerVariable* tryInlineBinop(BST_stmt* node, CompilerVariable* left, CompilerVariable* right, int op_type,
+                                     BinExpType exp_type, const UnwindInfo& unw_info) {
+        ConcreteCompilerType* left_type = left->getConcreteType();
+        if (!canInline() || left_type->getBoxType() != left_type)
+            return NULL;
+        BoxedClass* cls = predictReceiverClassFor(node);
+        if (!cls || !cls->is_user_defined || !cls->hasGenericGetattr() || !assign_version_tag(cls))
+            return NULL;
+        if (exp_type == AugBinOp) {
+            BoxedString* iop_name = getInplaceOpName(op_type);
+            AUTO_DECREF(iop_name);
+            if (typeLookup(cls, iop_name))
+                return NULL;
+        }
+        Box* f = typeLookup(cls, getOpName(op_type));
+        if (!f || f->cls != function_cls)
+            return NULL;
+        BoxedFunction* func = static_cast<BoxedFunction*>(f);
+        BoxedCode* code = getInlinableCode(func, 2);
+        if (!code)
+            return NULL;
+
+        auto b = emitter.getBuilder();
+        llvm::BasicBlock* fallback_bb = emitter.createBasicBlock("inline_fallback");
+        llvm::Value* l = left->makeConverted(emitter, UNKNOWN)->getValue();
+        emitClassGuards(l, cls, func, code, fallback_bb);
+        ConcreteCompilerType* right_type = right->getConcreteType();
+        bool right_is_builtin = right_type == UNBOXED_INT_PHI || right_type == UNBOXED_INT || right_type == BOXED_INT
+                                || right_type == UNBOXED_FLOAT_PHI || right_type == UNBOXED_FLOAT
+                                || right_type == BOXED_FLOAT || right_type == BOOL || right_type == BOXED_BOOL;
+        if (!right_is_builtin) {
+            // (No builtin class is a subclass of a user class.)
+            llvm::Value* r = right->makeConverted(emitter, UNKNOWN)->getValue();
+            llvm::Value* r_cls = loadField(r, offsetof(Box, cls), g.llvm_class_type_ptr);
+            llvm::Value* r_user = loadField(r_cls, offsetof(BoxedClass, is_user_defined), g.i8);
+            emitInlineGuard(b->CreateOr(b->CreateICmpEQ(r_cls, embedRelocatablePtr(cls, g.llvm_class_type_ptr)),
+                                        b->CreateICmpEQ(r_user, getConstantInt(0, g.i8))),
+                            fallback_bb);
+        }
+        llvm::BasicBlock* inline_bb = emitter.currentBasicBlock();
+
+        emitter.setCurrentBasicBlock(fallback_bb);
+        DupCache cache;
+        CompilerVariable* called
+            = _evalBinExp(node, left->dup(cache), right->dup(cache), (AST_TYPE::AST_TYPE)op_type, exp_type, unw_info);
+        llvm::BasicBlock* fallback_end = emitter.currentBasicBlock();
+
+        emitter.setCurrentBasicBlock(inline_bb);
+        auto get_result = [&](CompilerVariable* rtn) -> CompilerVariable* {
+            if (rtn->getConcreteType() != UNKNOWN)
+                return rtn;
+            llvm::Value* v = rtn->makeConverted(emitter, UNKNOWN)->getValue();
+            llvm::BasicBlock* fast_bb = emitter.createBasicBlock("inline_implemented");
+            llvm::BasicBlock* slow_bb = emitter.createBasicBlock("inline_not_implemented");
+            llvm::BasicBlock* done_bb = emitter.createBasicBlock("inline_binop_done");
+            llvm::Metadata* md_vals[]
+                = { llvm::MDString::get(g.context, "branch_weights"), llvm::ConstantAsMetadata::get(getConstantInt(1)),
+                    llvm::ConstantAsMetadata::get(getConstantInt(1000)) };
+            b->CreateCondBr(b->CreateICmpEQ(v, embedRelocatablePtr(NotImplemented, g.llvm_value_type_ptr)), slow_bb,
+                            fast_bb, llvm::MDNode::get(g.context, md_vals));
+            emitter.setCurrentBasicBlock(fast_bb);
+            emitter.refConsumed(v, b->CreateBr(done_bb));
+
+            emitter.setCurrentBasicBlock(slow_bb);
+            static llvm::FunctionCallee after_user_op = llvm::FunctionCallee(
+                llvm::FunctionType::get(g.llvm_value_type_ptr,
+                                        { g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32 },
+                                        false),
+                embedConstantPtr((void*)binopAfterUserOp, g.i8_ptr));
+            DupCache slow_cache;
+            llvm::Value* r = right->dup(slow_cache)->makeConverted(emitter, UNKNOWN)->getValue();
+            llvm::CallBase* call
+                = emitter.createCall(unw_info, after_user_op, { v, l, r, getConstantInt(op_type, g.i32) }, CXX);
+            emitter.setType(call, RefType::OWNED);
+            emitter.refConsumed(v, call);
+            llvm::BasicBlock* slow_end = emitter.currentBasicBlock();
+            auto slow_br = b->CreateBr(done_bb);
+            emitter.refConsumed(call, slow_br);
+
+            emitter.setCurrentBasicBlock(done_bb);
+            llvm::PHINode* phi = b->CreatePHI(g.llvm_value_type_ptr, 2);
+            phi->addIncoming(v, fast_bb);
+            phi->addIncoming(call, slow_end);
+            emitter.setType(phi, RefType::OWNED);
+            return new ConcreteCompilerVariable(UNKNOWN, phi);
+        };
+        return emitInlinedCall(node, code, { left, right }, unw_info, fallback_end, called, get_result);
+    }
+
     // Emits the inlined call of code with args, in the current block.  The result joins the one of the normal call,
-    // which ends the current block of the fallback.
+    // which ends the current block of the fallback.  get_result can make the result of the call from the value that
+    // the callee returns (with this frame as the current one again).
     CompilerVariable* emitInlinedCall(BST_stmt* node, BoxedCode* code, const std::vector<CompilerVariable*>& args,
                                       const UnwindInfo& unw_info, llvm::BasicBlock* fallback_end,
-                                      CompilerVariable* fallback_result) {
+                                      CompilerVariable* fallback_result,
+                                      std::function<CompilerVariable*(CompilerVariable*)> get_result = nullptr) {
         // The compiled code refers to it.
         Py_INCREF(code);
 
@@ -1476,6 +1636,14 @@ private:
 
         auto&& returns = inline_info.returns;
         RELEASE_ASSERT(returns.size(), "");
+        if (get_result) {
+            for (auto&& p : returns) {
+                emitter.setCurrentBasicBlock(p.first);
+                restore_frame();
+                p.second = get_result(p.second);
+                p.first = emitter.currentBasicBlock();
+            }
+        }
         ConcreteCompilerType* rtn_type = returns[0].second->getConcreteType();
         for (auto&& p : returns) {
             if (p.second->getConcreteType() != rtn_type)
